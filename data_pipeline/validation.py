@@ -588,6 +588,14 @@ def _to_utc_time(values: pd.Series, *, timeframe: str) -> pd.Series:
     if pd.api.types.is_numeric_dtype(values.dtype):
         converted = _numeric_time_to_utc(values, timeframe=timeframe)
     else:
+        if pd.api.types.is_object_dtype(values.dtype) and any(
+            pd.api.types.is_number(value)
+            or isinstance(value, (bool, np.bool_))
+            for value in values.to_numpy(copy=False)
+        ):
+            raise DataValidationError(
+                "object time values cannot contain numeric values"
+            )
         try:
             converted = pd.Series(
                 pd.to_datetime(values, utc=True, errors="coerce")
@@ -641,6 +649,11 @@ def float32_ohlcv_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
         if np.any((source != 0.0) & (values == 0.0)):
             raise DataValidationError(
                 "OHLCV values must remain non-zero after float32 conversion: "
+                f"field={field}"
+            )
+        if not np.equal(values.astype(np.float64), source).all():
+            raise DataValidationError(
+                "OHLCV values must round-trip exactly through float32 conversion: "
                 f"field={field}"
             )
         converted[field] = values
@@ -701,7 +714,7 @@ def canonicalize_ohlcv(
         raise DataValidationError(f"missing columns: {missing}")
 
     result = result.loc[:, _CANONICAL_COLUMNS].copy()
-    for column in _CANONICAL_COLUMNS:
+    for column in _VALUE_COLUMNS:
         if _contains_complex(result[column]):
             raise DataValidationError(f"complex OHLCV value: field={column}")
 

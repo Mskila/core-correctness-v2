@@ -47,6 +47,30 @@ def _write_parquet(path: Path, frame: pd.DataFrame) -> Path:
     return path
 
 
+def _make_float32_round_trip_frame(*, lossy_open: bool) -> pd.DataFrame:
+    opens = np.array(
+        (
+            [16_777_216.0, 16_777_217.0, 16_777_218.0, 16_777_220.0]
+            if lossy_open
+            else [16_777_216.0, 16_777_218.0, 16_777_220.0, 16_777_222.0]
+        ),
+        dtype=np.float64,
+    )
+    return pd.DataFrame(
+        {
+            "time": pd.date_range("2026-01-01", periods=4, freq="1h", tz="UTC"),
+            "open": opens,
+            "high": np.full(4, 16_777_224.0, dtype=np.float64),
+            "low": np.full(4, 16_777_214.0, dtype=np.float64),
+            "close": np.array(
+                [16_777_216.0, 16_777_218.0, 16_777_220.0, 16_777_222.0],
+                dtype=np.float64,
+            ),
+            "tick_volume": np.array([100.0, 102.0, 104.0, 106.0], dtype=np.float64),
+        }
+    )
+
+
 def _assert_public_tensors_are_defensive_copies(manager) -> None:
     expected_raw = {key: value.clone() for key, value in manager.raw_dict.items()}
     expected_target = manager.target_ret.clone()
@@ -580,6 +604,52 @@ def test_nonzero_volume_float32_underflow_is_rejected_everywhere(
     mt5 = MT5DataManager(_make_mock_fetcher({"EURUSD": underflow}))
     with pytest.raises(DataValidationError, match=r"float32.*field=volume"):
         mt5.load(["EURUSD"])
+
+
+def test_lossy_finite_float32_inputs_fail_closed_in_consumer_loads(
+    tmp_path: Path,
+) -> None:
+    frame = _make_float32_round_trip_frame(lossy_open=True)
+    path = _write_parquet(tmp_path / "LOSSY_H1.parquet", frame)
+    parquet = ParquetDataManager(path)
+    mt5 = MT5DataManager(_make_mock_fetcher({"LOSSY": frame}))
+
+    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+        parquet.load()
+    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+        mt5.load(["LOSSY"])
+
+    for manager in (parquet, mt5):
+        for property_name in (
+            "raw_dict",
+            "feat_tensor",
+            "target_ret",
+            "target_valid",
+            "bar_time",
+            "data_identities",
+        ):
+            with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
+                getattr(manager, property_name)
+
+
+def test_exact_float32_inputs_reach_consumer_label_paths(tmp_path: Path) -> None:
+    frame = _make_float32_round_trip_frame(lossy_open=False)
+    path = _write_parquet(tmp_path / "EXACT_H1.parquet", frame)
+    parquet = ParquetDataManager(path)
+    mt5 = MT5DataManager(_make_mock_fetcher({"EXACT": frame}))
+
+    parquet.load()
+    mt5.load(["EXACT"])
+
+    expected_open = torch.tensor(
+        [[16_777_216.0, 16_777_218.0, 16_777_220.0, 16_777_222.0]],
+        dtype=torch.float32,
+    )
+    for manager in (parquet, mt5):
+        assert torch.equal(manager.raw_dict["open"], expected_open)
+        assert manager.target_ret.shape == (1, 4)
+        assert manager.target_valid.tolist() == [[True, True, False, False]]
+        assert torch.isfinite(manager.target_ret[manager.target_valid]).all()
 
 
 def test_parquet_inspection_uses_timestamp_span_not_h1_bar_constant(

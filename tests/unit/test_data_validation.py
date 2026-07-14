@@ -705,6 +705,108 @@ def test_out_of_range_integer_numeric_timestamps_are_rejected() -> None:
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
+@pytest.mark.parametrize(
+    ("case", "timestamps"),
+    [
+        ("python-seconds", [1_700_000_000, 1_700_003_600, 1_700_007_200]),
+        (
+            "python-milliseconds",
+            [1_700_000_000_000, 1_700_003_600_000, 1_700_007_200_000],
+        ),
+        (
+            "python-microseconds",
+            [
+                1_700_000_000_000_000,
+                1_700_003_600_000_000,
+                1_700_007_200_000_000,
+            ],
+        ),
+        (
+            "python-nanoseconds",
+            [
+                1_700_000_000_000_000_000,
+                1_700_003_600_000_000_000,
+                1_700_007_200_000_000_000,
+            ],
+        ),
+        (
+            "mixed-units",
+            [1_700_000_000, 1_700_003_600_000, 1_700_007_200_000_000_000],
+        ),
+        (
+            "numpy-integer",
+            [np.int64(1_700_000_000), np.int64(1_700_003_600), np.int64(1_700_007_200)],
+        ),
+        (
+            "numpy-floating",
+            [np.float64(1_700_000_000), np.float64(1_700_003_600), np.float64(1_700_007_200)],
+        ),
+        ("boolean", [True, False, True]),
+        ("numpy-boolean", [np.bool_(True), np.bool_(False), np.bool_(True)]),
+        ("complex", [1_700_000_000 + 0j, 1_700_003_600 + 0j, 1_700_007_200 + 0j]),
+        (
+            "mixed-datetime-and-numeric",
+            [
+                pd.Timestamp("2026-01-01T00:00:00Z"),
+                1_767_226_800_000_000_000,
+                "2026-01-01T02:00:00Z",
+            ],
+        ),
+    ],
+)
+def test_object_time_rejects_numeric_boolean_and_complex_values(
+    case: str,
+    timestamps: list[object],
+) -> None:
+    del case
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = pd.Series(timestamps, dtype="object")
+
+    with pytest.raises(
+        DataValidationError,
+        match=r"object.*time.*numeric|numeric.*object.*time",
+    ):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@pytest.mark.parametrize(
+    "timestamps",
+    [
+        pd.Series(
+            [
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+                "2026-01-01T02:00:00Z",
+            ],
+            dtype="object",
+        ),
+        pd.Series(
+            pd.date_range("2026-01-01", periods=3, freq="1h", tz="UTC").tolist(),
+            dtype="object",
+        ),
+        pd.Series(
+            np.array(
+                [
+                    "2026-01-01T00:00:00",
+                    "2026-01-01T01:00:00",
+                    "2026-01-01T02:00:00",
+                ],
+                dtype="datetime64[s]",
+            )
+        ),
+    ],
+    ids=["datetime-strings", "timestamp-objects", "datetime64"],
+)
+def test_datetime_like_time_values_remain_valid(timestamps: pd.Series) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = timestamps
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected = pd.date_range("2026-01-01", periods=3, freq="1h", tz="UTC")
+    assert result.frame["time"].tolist() == expected.tolist()
+
+
 def test_extreme_in_range_ns_gap_does_not_overflow_spacing_check() -> None:
     frame = valid_frame().iloc[:2].copy()
     timestamps = [pd.Timestamp.min.value, pd.Timestamp.max.value]
@@ -876,12 +978,19 @@ def test_unsafe_object_values_raise_domain_error(invalid: object) -> None:
             canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
-def test_zero_and_negative_zero_volume_remain_valid_float32() -> None:
+def _float32_exact_canonical_frame() -> pd.DataFrame:
     frame = valid_frame()
-    frame["volume"] = [0.0, -0.0, 0.0, -0.0, 0.0, -0.0]
+    frame["close"] = frame["open"] + 0.25
+    return canonicalize_ohlcv(
+        frame, symbol="EURUSD", timeframe="H1"
+    ).frame
 
-    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-    volume = float32_ohlcv_arrays(dataset.frame)["volume"]
+
+def test_zero_and_negative_zero_volume_remain_valid_float32() -> None:
+    canonical = _float32_exact_canonical_frame()
+    canonical["volume"] = [0.0, -0.0, 0.0, -0.0, 0.0, -0.0]
+
+    volume = float32_ohlcv_arrays(canonical)["volume"]
 
     assert np.equal(volume, 0.0).all()
     assert np.signbit(volume).tolist() == [False, True, False, True, False, True]
@@ -898,9 +1007,7 @@ def test_float32_conversion_rejects_each_field_without_silent_change(
     value: float,
     message: str,
 ) -> None:
-    canonical = canonicalize_ohlcv(
-        valid_frame(), symbol="EURUSD", timeframe="H1"
-    ).frame
+    canonical = _float32_exact_canonical_frame()
     canonical[field] = value
 
     with pytest.raises(
@@ -908,6 +1015,39 @@ def test_float32_conversion_rejects_each_field_without_silent_change(
         match=rf"{message}.*field={field}",
     ):
         float32_ohlcv_arrays(canonical)
+
+
+@pytest.mark.parametrize("field", ["open", "high", "low", "close", "volume"])
+def test_float32_conversion_rejects_each_lossy_finite_round_trip(
+    field: str,
+) -> None:
+    canonical = _float32_exact_canonical_frame()
+    canonical[field] = np.array(
+        [16_777_216.0, 16_777_217.0, 16_777_218.0, 16_777_220.0, 16_777_222.0, 16_777_224.0],
+        dtype=np.float64,
+    )
+
+    with pytest.raises(
+        DataValidationError,
+        match=rf"float32.*field={field}",
+    ):
+        float32_ohlcv_arrays(canonical)
+
+
+@pytest.mark.parametrize("field", ["open", "high", "low", "close", "volume"])
+def test_float32_conversion_accepts_exactly_representable_values(
+    field: str,
+) -> None:
+    canonical = _float32_exact_canonical_frame()
+    expected = np.array(
+        [16_777_216.0, 16_777_218.0, 16_777_220.0, 16_777_222.0, 16_777_224.0, 16_777_226.0],
+        dtype=np.float64,
+    )
+    canonical[field] = expected
+
+    converted = float32_ohlcv_arrays(canonical)[field]
+
+    np.testing.assert_array_equal(converted.astype(np.float64), expected)
 
 
 def test_canonical_dataset_frame_cannot_be_mutated_out_of_identity() -> None:

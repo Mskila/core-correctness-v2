@@ -43,7 +43,10 @@ def _make_symbol_df(
     timestamps: list[int], base_price: float = 100.0
 ) -> pd.DataFrame:
     n = len(timestamps)
-    opens = base_price + np.arange(n, dtype=np.float64) / 10.0
+    # Alignment is the property under test; keep generated training values
+    # exactly representable in float32 so the canonical downcast gate is not
+    # the competing behavior under test.
+    opens = base_price + np.arange(n, dtype=np.float64) / 8.0
     return pd.DataFrame(
         {
             "time": np.array(timestamps, dtype=np.int64),
