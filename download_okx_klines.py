@@ -37,8 +37,6 @@ from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import Config
-
 OKX_BASE = "https://www.okx.com"
 DEFAULT_OUT = Path(r"D:\OKX_K线数据")
 REQUEST_SLEEP = 0.21
@@ -268,10 +266,6 @@ def run(
                 logger.success(
                     f"  {out_path.name}: {len(df):,} bars  {fmt_range(df)}  ({time.time() - t0:.1f}s)"
                 )
-                if len(df) < Config.MIN_BARS:
-                    logger.warning(
-                        f"  {out_path.name}: 仅 {len(df)} 根，低于训练最低要求 {Config.MIN_BARS}"
-                    )
             except Exception as exc:
                 failed += 1
                 logger.error(f"  {out_path.name}: 失败 — {exc}")

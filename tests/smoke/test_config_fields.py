@@ -3,7 +3,7 @@
 
 断言：
 - FEATURE_NAMES 不含 LIQ_SCORE / FOMO（旧 Solana 特有因子）
-- Config.INPUT_DIM == 6
+- 根 Config 不再提供 INPUT_DIM；ModelConfig 从 V2 词表派生该维度
 
 注意：task 5.1 会将 vocab.py 更新为新的 MT5 特征名称。
       此测试使用 try/except 优雅处理旧版 vocab.py 中仍含旧字段的情形。
@@ -17,18 +17,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import pytest
 from config import Config
+from model_core.config import ModelConfig
+from model_core.vocab import FEATURE_NAMES, FORMULA_VOCAB
 
 
 def _get_feature_names():
-    """
-    尝试从 model_core.vocab 获取 FEATURE_NAMES。
-    若模块不存在或属性不存在，返回 None。
-    """
-    try:
-        from model_core.vocab import FEATURE_NAMES
-        return FEATURE_NAMES
-    except (ImportError, AttributeError):
-        return None
+    return FEATURE_NAMES
 
 
 def _is_mt5_feature_names_updated():
@@ -45,9 +39,9 @@ def _is_mt5_feature_names_updated():
 
 
 class TestConfigInputDimSmoke:
-    def test_input_dim_equals_10(self):
-        """Config.INPUT_DIM must equal 20 (expanded from 10 to 20 features)."""
-        assert Config.INPUT_DIM == 20
+    def test_only_model_config_exposes_vocab_derived_input_dim(self):
+        assert not hasattr(Config, "INPUT_DIM")
+        assert ModelConfig.INPUT_DIM == FORMULA_VOCAB.feature_count
 
 
 class TestFeatureNamesSmoke:
@@ -95,7 +89,7 @@ class TestFeatureNamesSmoke:
         )
 
     def test_feature_names_length_matches_input_dim(self):
-        """FEATURE_NAMES 的长度应等于 Config.INPUT_DIM（20）"""
+        """FEATURE_NAMES 的长度应等于 ModelConfig.INPUT_DIM。"""
         feature_names = _get_feature_names()
         if feature_names is None:
             pytest.skip("model_core.vocab.FEATURE_NAMES not available yet (pending task 5.1)")
@@ -104,7 +98,7 @@ class TestFeatureNamesSmoke:
                 "vocab.py still contains old Solana features — "
                 "pending task 5.1 (MT5FeatureEngineer implementation)"
             )
-        assert len(feature_names) == Config.INPUT_DIM, (
-            f"Expected len(FEATURE_NAMES) == {Config.INPUT_DIM}, "
+        assert len(feature_names) == ModelConfig.INPUT_DIM, (
+            f"Expected len(FEATURE_NAMES) == {ModelConfig.INPUT_DIM}, "
             f"got {len(feature_names)}: {feature_names}"
         )

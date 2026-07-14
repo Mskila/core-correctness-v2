@@ -90,10 +90,7 @@ class Config:
         "index":          ["US30.cash", "US100.cash", "US500.cash", "US2000.cash", "JP225.cash"],
     }
 
-    # FEATURE_SYMBOLS：用于计算截面特征的宽品种集
-    # 包含主要外汇、贵金属、大宗商品、主流指数，时间与 SYMBOLS 高度对齐
-    # REL_RET5/REL_RET20/REL_VOL 等跨资产特征将基于这 40 个品种计算截面均值
-    # 若设为 None，则退化为只用 SYMBOLS（5品种截面）
+    # FEATURE_SYMBOLS：旧数据收集入口使用的宽品种集；V2 单标特征不消费该字段。
     FEATURE_SYMBOLS = [
         # 主要外汇（26个）
         "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF",
@@ -117,13 +114,11 @@ class Config:
     # 每品种拉取的历史 K 线上限。设为极大值以使用 MT5 全部可用历史；
     # 本地缓存优先：若 D:\K线数据 已有数据，fetcher 会返回本地全部历史（不截断）。
     BARS_COUNT            = 10_000_000
-    MIN_BARS              = 3000   # 低于此值的品种被排除
     DATA_REFRESH_INTERVAL = 300    # 秒，实盘数据刷新间隔
     KLINE_CACHE_DIR       = os.getenv("KLINE_CACHE_DIR", r"D:\K线数据")  # 本地 K 线缓存目录
 
     # ── 模型参数（仅供参考，训练实际使用 model_core.config.ModelConfig）────
     # 训练参数的权威来源是 model_core/config.py，这里的值不生效
-    INPUT_DIM       = 20           # 特征数（与 MT5FeatureEngineer.INPUT_DIM 一致）
     BATCH_SIZE      = 128          # 参见 ModelConfig.BATCH_SIZE
     TRAIN_STEPS     = 300          # 参见 ModelConfig.TRAIN_STEPS
     MAX_FORMULA_LEN = 8            # 参见 ModelConfig.MAX_FORMULA_LEN
