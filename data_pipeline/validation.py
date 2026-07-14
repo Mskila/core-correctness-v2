@@ -292,6 +292,100 @@ def _has_better_single_row_mixed_lattice(
     return False
 
 
+def _has_compact_isolated_mixed_lattice(
+    candidates_by_row: dict[int, list[tuple[int, int]]],
+    *,
+    selected_span: int,
+    unit_count: int,
+) -> bool:
+    """Find a tighter lattice obtained by changing at most two isolated rows."""
+    for unit_index in range(unit_count):
+        dominant_unit = 1 << unit_index
+        fixed_by_row: dict[int, int] = {}
+        alternatives_by_row: dict[int, list[tuple[int, int]]] = {}
+        optional_alternatives_by_row: dict[int, list[tuple[int, int]]] = {}
+        dominant_rows = 0
+        for row, options in candidates_by_row.items():
+            preferred = {
+                quotient
+                for quotient, unit_bit in options
+                if unit_bit in (0, dominant_unit)
+            }
+            if preferred:
+                if len(preferred) != 1:
+                    break
+                fixed_by_row[row] = preferred.pop()
+                dominant_rows += int(
+                    any(unit_bit == dominant_unit for _quotient, unit_bit in options)
+                )
+                optional_alternatives = sorted(
+                    {
+                        (quotient, unit_bit)
+                        for quotient, unit_bit in options
+                        if unit_bit not in (0, dominant_unit)
+                    }
+                )
+                if optional_alternatives:
+                    optional_alternatives_by_row[row] = optional_alternatives
+            else:
+                alternatives_by_row[row] = sorted(
+                    {
+                        (quotient, unit_bit)
+                        for quotient, unit_bit in options
+                        if unit_bit
+                    }
+                )
+        else:
+            isolated_rows = len(alternatives_by_row)
+            if not 1 <= isolated_rows <= 2:
+                continue
+            if dominant_rows < len(candidates_by_row) - 2:
+                continue
+
+            assignments: list[tuple[tuple[int, int], ...]] = [()]
+            for row in sorted(alternatives_by_row):
+                assignments = [
+                    existing + (option,)
+                    for existing in assignments
+                    for option in alternatives_by_row[row]
+                ]
+            candidate_assignments = [
+                (assignment, None, None)
+                for assignment in assignments
+            ]
+            if isolated_rows == 1:
+                candidate_assignments.extend(
+                    (assignment, row, option)
+                    for assignment in assignments
+                    for row, options in optional_alternatives_by_row.items()
+                    for option in options
+                )
+            for assignment, optional_row, optional_option in candidate_assignments:
+                quotients = [
+                    quotient
+                    for row, quotient in fixed_by_row.items()
+                    if row != optional_row
+                ]
+                quotients.extend(
+                    quotient for quotient, _unit_bit in assignment
+                )
+                if optional_option is not None:
+                    quotients.append(optional_option[0])
+                if len(set(quotients)) != len(quotients):
+                    continue
+                unit_mask = dominant_unit
+                for _quotient, unit_bit in assignment:
+                    unit_mask |= unit_bit
+                if optional_option is not None:
+                    unit_mask |= optional_option[1]
+                if unit_mask.bit_count() <= 1:
+                    continue
+                compact_span = max(quotients) - min(quotients)
+                if compact_span * 2 < selected_span:
+                    return True
+    return False
+
+
 def _has_mixed_unit_lattice_evidence(
     values: list[int],
     *,
@@ -300,6 +394,26 @@ def _has_mixed_unit_lattice_evidence(
 ) -> bool:
     """Detect mixed-unit evidence across each complete cadence lattice."""
     units = tuple(_TIME_UNIT_NS)
+    selected_span: int | None = None
+    if selected_unit is not None:
+        selected_ns = [
+            _scaled_time_ns(value, selected_unit)
+            for value in values
+        ]
+        if all(timestamp_ns is not None for timestamp_ns in selected_ns):
+            complete_selected_ns = [
+                int(timestamp_ns)
+                for timestamp_ns in selected_ns
+                if timestamp_ns is not None
+            ]
+            if len(
+                {timestamp_ns % nominal_ns for timestamp_ns in complete_selected_ns}
+            ) > 1:
+                selected_quotients = [
+                    timestamp_ns // nominal_ns
+                    for timestamp_ns in complete_selected_ns
+                ]
+                selected_span = max(selected_quotients) - min(selected_quotients)
     lattice: dict[int, dict[int, list[tuple[int, int]]]] = {}
     for row_index, value in enumerate(values):
         for unit_index, unit in enumerate(units):
@@ -338,6 +452,12 @@ def _has_mixed_unit_lattice_evidence(
             ):
                 return True
             continue
+        if selected_span is not None and _has_compact_isolated_mixed_lattice(
+            candidates_by_row,
+            selected_span=selected_span,
+            unit_count=len(units),
+        ):
+            return True
         quotient_candidates = {
             row: {quotient for quotient, _unit_bit in options}
             for row, options in candidates_by_row.items()

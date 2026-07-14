@@ -312,6 +312,116 @@ def test_mixed_numeric_timestamp_units_with_lattice_insertion_are_rejected() -> 
         )
 
 
+def test_isolated_leading_mixed_numeric_timestamp_unit_is_rejected() -> None:
+    timestamps = [
+        1_700_000_000,
+        1_700_010_800_000_000,
+        1_700_014_400_000_000,
+        1_700_028_800_000_000,
+        1_700_039_600_000_000,
+    ]
+
+    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+        canonicalize_ohlcv(
+            _frame_with_numeric_times(timestamps),
+            symbol="EURUSD",
+            timeframe="H1",
+        )
+
+
+_ISOLATED_MIXED_UNIT_PAIRS = [
+    (isolated, dominant)
+    for isolated in _TEST_TIME_UNIT_NS
+    for dominant in _TEST_TIME_UNIT_NS
+    if isolated != dominant
+]
+
+
+@pytest.mark.parametrize(
+    ("isolated_unit", "dominant_unit"),
+    _ISOLATED_MIXED_UNIT_PAIRS,
+    ids=[
+        f"{isolated}-into-{dominant}"
+        for isolated, dominant in _ISOLATED_MIXED_UNIT_PAIRS
+    ],
+)
+@pytest.mark.parametrize(
+    "isolated_position",
+    [0, 2, 4],
+    ids=["leading", "middle", "trailing"],
+)
+def test_isolated_mixed_unit_pair_positions_are_rejected(
+    isolated_unit: str,
+    dominant_unit: str,
+    isolated_position: int,
+) -> None:
+    units = [dominant_unit] * 5
+    units[isolated_position] = isolated_unit
+    timestamps = _encode_semantic_times([0, 3, 4, 8, 11], units)
+
+    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+        canonicalize_ohlcv(
+            _frame_with_numeric_times(timestamps),
+            symbol="EURUSD",
+            timeframe="H1",
+        )
+
+
+def test_isolated_mixed_unit_rejection_is_input_order_independent() -> None:
+    timestamps = _encode_semantic_times(
+        [0, 3, 4, 8, 11],
+        ["s", "us", "us", "us", "us"],
+    )
+    frame = _frame_with_numeric_times(timestamps).iloc[[3, 0, 4, 1, 2]]
+
+    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+def test_two_isolated_mixed_unit_rows_are_rejected() -> None:
+    timestamps = _encode_semantic_times(
+        [0, 3, 4, 8, 11],
+        ["s", "us", "us", "us", "ms"],
+    )
+
+    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+        canonicalize_ohlcv(
+            _frame_with_numeric_times(timestamps),
+            symbol="EURUSD",
+            timeframe="H1",
+        )
+
+
+@pytest.mark.parametrize("unit", list(_TEST_TIME_UNIT_NS))
+@pytest.mark.parametrize(
+    "base_ns",
+    [
+        1_700_000_000_000_000_000,
+        -24 * _TEST_H1_NS,
+        0,
+    ],
+    ids=["modern", "negative", "epoch-zero"],
+)
+def test_pure_units_keep_irregular_cadence_across_epoch_origins(
+    unit: str,
+    base_ns: int,
+) -> None:
+    semantic_ns = [
+        base_ns + offset * _TEST_H1_NS
+        for offset in [0, 3, 4, 8, 11]
+    ]
+    timestamps = [
+        timestamp_ns // _TEST_TIME_UNIT_NS[unit]
+        for timestamp_ns in semantic_ns
+    ]
+    frame = _frame_with_numeric_times(timestamps).iloc[[3, 0, 4, 1, 2]]
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    assert result.frame["time"].astype("int64").tolist() == semantic_ns
+    assert result.gap_count == 3
+
+
 def test_mixed_epoch_unit_lattice_insertion_matrix_is_rejected() -> None:
     units = tuple(_TEST_TIME_UNIT_NS)
     accepted: list[tuple[object, ...]] = []
