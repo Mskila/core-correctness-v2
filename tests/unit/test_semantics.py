@@ -8,6 +8,7 @@ from model_core.semantics import (
     LABEL_SEMANTICS_VERSION,
     ArtifactCompatibilityError,
     BacktestModeError,
+    CoreCorrectnessError,
     DataValidationError,
     DatasetAlignmentError,
     InsufficientWalkForwardDataError,
@@ -33,4 +34,6 @@ def test_v2_semantics_constants_are_explicit() -> None:
     ],
 )
 def test_core_errors_are_runtime_errors(error_type: type[Exception]) -> None:
+    assert CoreCorrectnessError.__bases__ == (RuntimeError,)
+    assert error_type.__bases__ == (CoreCorrectnessError,)
     assert issubclass(error_type, RuntimeError)
