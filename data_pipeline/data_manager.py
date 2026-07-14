@@ -106,7 +106,6 @@ class MT5DataManager:
             raise DataValidationError("symbols must be unique non-empty strings")
         if len(set(symbol_list)) != len(symbol_list):
             raise DataValidationError("duplicate symbols are not allowed")
-        self._requested_symbols = list(symbol_list)
         timeframe = normalize_timeframe_name(Config.TIMEFRAME)
         logger.info(f"Loading data for {len(symbol_list)} symbols: {symbol_list}")
 
@@ -148,6 +147,7 @@ class MT5DataManager:
         self._target_ret = target_ret
         self._target_valid = target_valid
         self._data_identities = data_identities
+        self._requested_symbols = None if symbols is None else list(symbol_list)
         logger.info(
             f"Data loaded. raw_dict shape: N={len(self._symbols)}, "
             f"T={self._raw_dict['open'].shape[1]}"

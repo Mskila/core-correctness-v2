@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 import torch
 
+from config import Config
 from data_pipeline.data_manager import MT5DataManager, compute_forward_open_returns
 from data_pipeline.parquet_manager import ParquetDataManager, inspect_parquet_file
 from data_pipeline.single_symbol_manager import SingleSymbolDataManager
@@ -304,6 +305,117 @@ def test_mt5_duplicate_symbols_fail_before_fetch_and_clear_loaded_state() -> Non
     assert manager.symbols == ["OK"]
 
 
+def test_mt5_default_reload_resolves_current_config_symbols(monkeypatch) -> None:
+    fetcher = _make_mock_fetcher(
+        {
+            "A": _make_ohlcv_df(periods=4, base_price=100.0),
+            "B": _make_ohlcv_df(periods=4, base_price=200.0),
+        }
+    )
+    manager = MT5DataManager(fetcher)
+    monkeypatch.setattr(Config, "SYMBOLS", ["A"])
+    manager.load()
+
+    monkeypatch.setattr(Config, "SYMBOLS", ["B"])
+    fetcher.fetch.reset_mock()
+    manager.reload()
+
+    assert manager.symbols == ["B"]
+    assert manager.raw_dict["open"][0, 0].item() == 200.0
+    assert fetcher.fetch.call_args.args[0] == "B"
+
+
+def test_mt5_explicit_reload_ignores_later_config_changes(monkeypatch) -> None:
+    fetcher = _make_mock_fetcher(
+        {
+            "A": _make_ohlcv_df(periods=4, base_price=100.0),
+            "B": _make_ohlcv_df(periods=4, base_price=200.0),
+        }
+    )
+    manager = MT5DataManager(fetcher)
+    monkeypatch.setattr(Config, "SYMBOLS", ["B"])
+    manager.load(["A"])
+
+    fetcher.fetch.reset_mock()
+    manager.reload()
+
+    assert manager.symbols == ["A"]
+    assert fetcher.fetch.call_args.args[0] == "A"
+
+
+def test_mt5_failed_explicit_selection_is_not_committed(monkeypatch) -> None:
+    invalid = pd.concat(
+        [_make_ohlcv_df(periods=4), _make_ohlcv_df(periods=4).iloc[[0]]],
+        ignore_index=True,
+    )
+    frames = {
+        "DEFAULT": _make_ohlcv_df(periods=4, base_price=300.0),
+        "GOOD": _make_ohlcv_df(periods=4, base_price=100.0),
+        "BAD": invalid,
+    }
+    monkeypatch.setattr(Config, "SYMBOLS", ["DEFAULT"])
+    manager = MT5DataManager(_make_mock_fetcher(frames))
+    manager.load(["GOOD"])
+
+    with pytest.raises(DataValidationError, match="duplicate timestamp"):
+        manager.load(["BAD"])
+    assert manager.symbols == []
+
+    frames["BAD"] = _make_ohlcv_df(periods=4, base_price=200.0)
+    manager.reload()
+    assert manager.symbols == ["GOOD"]
+
+    first_failure = MT5DataManager(_make_mock_fetcher(frames))
+    frames["BAD"] = invalid
+    with pytest.raises(DataValidationError, match="duplicate timestamp"):
+        first_failure.load(["BAD"])
+    first_failure.reload()
+    assert first_failure.symbols == ["DEFAULT"]
+
+
+def test_mt5_failed_default_selection_does_not_replace_explicit_request(
+    monkeypatch,
+) -> None:
+    invalid = pd.concat(
+        [_make_ohlcv_df(periods=4), _make_ohlcv_df(periods=4).iloc[[0]]],
+        ignore_index=True,
+    )
+    frames = {
+        "GOOD": _make_ohlcv_df(periods=4, base_price=100.0),
+        "BAD": invalid,
+        "DEFAULT": _make_ohlcv_df(periods=4, base_price=300.0),
+    }
+    manager = MT5DataManager(_make_mock_fetcher(frames))
+    manager.load(["GOOD"])
+    monkeypatch.setattr(Config, "SYMBOLS", ["BAD"])
+
+    with pytest.raises(DataValidationError, match="duplicate timestamp"):
+        manager.load()
+    assert manager.symbols == []
+
+    monkeypatch.setattr(Config, "SYMBOLS", ["DEFAULT"])
+    manager.reload()
+    assert manager.symbols == ["GOOD"]
+
+
+def test_mt5_boolean_data_failure_clears_state_without_replacing_request() -> None:
+    bad = _make_ohlcv_df(periods=4)
+    bad["tick_volume"] = True
+    frames = {
+        "GOOD": _make_ohlcv_df(periods=4),
+        "BAD": bad,
+    }
+    manager = MT5DataManager(_make_mock_fetcher(frames))
+    manager.load(["GOOD"])
+
+    with pytest.raises(DataValidationError, match=r"boolean.*field=volume"):
+        manager.load(["BAD"])
+    assert manager.symbols == []
+
+    manager.reload()
+    assert manager.symbols == ["GOOD"]
+
+
 @pytest.mark.parametrize(
     "property_name",
     ["raw_dict", "feat_tensor", "target_ret", "target_valid", "bar_time", "data_identities"],
@@ -450,6 +562,23 @@ def test_float32_underflow_is_rejected_by_inspect_and_managers(
 
     mt5 = MT5DataManager(_make_mock_fetcher({"EURUSD": underflow}))
     with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+        mt5.load(["EURUSD"])
+
+
+def test_nonzero_volume_float32_underflow_is_rejected_everywhere(
+    tmp_path: Path,
+) -> None:
+    underflow = _make_ohlcv_df(periods=4)
+    underflow["tick_volume"] = np.full(4, 1.0e-50, dtype=np.float64)
+    path = _write_parquet(tmp_path / "EURUSD_H1.parquet", underflow)
+
+    with pytest.raises(DataValidationError, match=r"float32.*field=volume"):
+        inspect_parquet_file(path)
+    with pytest.raises(DataValidationError, match=r"float32.*field=volume"):
+        ParquetDataManager(path).load()
+
+    mt5 = MT5DataManager(_make_mock_fetcher({"EURUSD": underflow}))
+    with pytest.raises(DataValidationError, match=r"float32.*field=volume"):
         mt5.load(["EURUSD"])
 
 

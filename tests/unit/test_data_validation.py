@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from decimal import Decimal
 import warnings
 
 import numpy as np
@@ -11,6 +12,7 @@ from data_pipeline.validation import (
     DatasetIdentity,
     assert_minimum_bars,
     canonicalize_ohlcv,
+    float32_ohlcv_arrays,
     normalize_timeframe_name,
 )
 from model_core.semantics import DATA_SCHEMA_VERSION, DataValidationError
@@ -210,6 +212,118 @@ def test_numeric_time_unit_preserves_epoch_seconds_with_h1_cadence() -> None:
     assert result.gap_count == 0
 
 
+def test_ambiguous_epoch_numeric_time_unit_is_rejected() -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = [0, 1_800_000, 3_600_000]
+
+    with pytest.raises(DataValidationError, match="ambiguous numeric timestamp"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+def test_consistent_milliseconds_with_long_gap_crossing_threshold_are_valid() -> None:
+    frame = valid_frame().iloc[:3].copy()
+    milliseconds = [1_000_000, 100_000_000_000, 100_003_600_000]
+    frame["time"] = milliseconds
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected_ns = (
+        pd.to_datetime(milliseconds, unit="ms", utc=True)
+        .astype("datetime64[ns, UTC]")
+        .astype("int64")
+        .tolist()
+    )
+    assert result.frame["time"].astype("int64").tolist() == expected_ns
+    assert result.identity.start_time_ns == expected_ns[0]
+    assert result.identity.end_time_ns == expected_ns[-1]
+    assert result.gap_count == 1
+
+
+@pytest.mark.parametrize(
+    "timestamps",
+    [
+        [0.0, 3_600.5, 7_200.0],
+        [1.0e18, 1.0e18 + 3_600_000_000_000, 1.0e18 + 7_200_000_000_000],
+    ],
+    ids=["fractional", "lossy-float-ns"],
+)
+def test_float_numeric_timestamps_must_be_lossless_integers(
+    timestamps: list[float],
+) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = timestamps
+
+    with pytest.raises(DataValidationError, match=r"integer|lossless"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+def test_out_of_range_integer_numeric_timestamps_are_rejected() -> None:
+    frame = valid_frame().iloc[:3].copy()
+    start = pd.Timestamp.max.value + 1
+    frame["time"] = [start, start + 3_600_000_000_000, start + 7_200_000_000_000]
+
+    with pytest.raises(DataValidationError, match="cannot be converted"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+def test_extreme_in_range_ns_gap_does_not_overflow_spacing_check() -> None:
+    frame = valid_frame().iloc[:2].copy()
+    timestamps = [pd.Timestamp.min.value, pd.Timestamp.max.value]
+    frame["time"] = timestamps
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    assert result.frame["time"].astype("int64").tolist() == timestamps
+    assert result.identity.start_time_ns == timestamps[0]
+    assert result.identity.end_time_ns == timestamps[-1]
+    assert result.gap_count == 1
+
+
+@pytest.mark.parametrize(
+    ("unit", "timestamps", "expected_ns"),
+    [
+        ("s", [1_700_000_000, 1_700_003_600, 1_700_007_200], 1_000_000_000),
+        (
+            "ms",
+            [1_700_000_000_000, 1_700_003_600_000, 1_700_007_200_000],
+            1_000_000,
+        ),
+        (
+            "us",
+            [
+                1_700_000_000_000_000,
+                1_700_003_600_000_000,
+                1_700_007_200_000_000,
+            ],
+            1_000,
+        ),
+        (
+            "ns",
+            [
+                1_700_000_000_000_000_000,
+                1_700_003_600_000_000_000,
+                1_700_007_200_000_000_000,
+            ],
+            1,
+        ),
+    ],
+)
+def test_integer_numeric_timestamp_units_have_stable_utc_identity(
+    unit: str,
+    timestamps: list[int],
+    expected_ns: int,
+) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = timestamps[::-1]
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected = [value * expected_ns for value in timestamps]
+    assert result.frame["time"].astype("int64").tolist() == expected
+    assert result.identity.start_time_ns == expected[0]
+    assert result.identity.end_time_ns == expected[-1]
+
+
 def test_long_gap_is_counted_without_synthesizing_bars() -> None:
     frame = valid_frame().drop(index=[2, 3]).reset_index(drop=True)
 
@@ -289,6 +403,98 @@ def test_assert_minimum_bars_reports_expected_and_actual() -> None:
         match=r"unit fixture.*expected.*6.*actual.*5",
     ):
         assert_minimum_bars(5, 6, context="unit fixture")
+
+
+@pytest.mark.parametrize("field", ["open", "volume"])
+def test_boolean_ohlcv_values_are_rejected_before_numeric_coercion(
+    field: str,
+) -> None:
+    frame = valid_frame()
+    frame[field] = True
+
+    with pytest.raises(
+        DataValidationError,
+        match=rf"boolean.*field={field}",
+    ):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [Decimal("sNaN"), object(), "not-a-number"],
+    ids=["signaling-decimal", "object", "text"],
+)
+def test_unsafe_object_values_raise_domain_error(invalid: object) -> None:
+    frame = valid_frame()
+    frame["volume"] = pd.Series([invalid] * len(frame), dtype="object")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(
+            DataValidationError,
+            match=r"invalid numeric OHLCV value: field=volume",
+        ):
+            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+def test_zero_and_negative_zero_volume_remain_valid_float32() -> None:
+    frame = valid_frame()
+    frame["volume"] = [0.0, -0.0, 0.0, -0.0, 0.0, -0.0]
+
+    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    volume = float32_ohlcv_arrays(dataset.frame)["volume"]
+
+    assert np.equal(volume, 0.0).all()
+    assert np.signbit(volume).tolist() == [False, True, False, True, False, True]
+
+
+@pytest.mark.parametrize("field", ["open", "high", "low", "close", "volume"])
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [(1.0e-50, "non-zero"), (1.0e40, "finite")],
+    ids=["underflow", "overflow"],
+)
+def test_float32_conversion_rejects_each_field_without_silent_change(
+    field: str,
+    value: float,
+    message: str,
+) -> None:
+    canonical = canonicalize_ohlcv(
+        valid_frame(), symbol="EURUSD", timeframe="H1"
+    ).frame
+    canonical[field] = value
+
+    with pytest.raises(
+        DataValidationError,
+        match=rf"{message}.*field={field}",
+    ):
+        float32_ohlcv_arrays(canonical)
+
+
+def test_canonical_dataset_frame_cannot_be_mutated_out_of_identity() -> None:
+    source = valid_frame()
+    dataset = canonicalize_ohlcv(source, symbol="EURUSD", timeframe="H1")
+    expected = dataset.frame.copy(deep=True)
+    identity = dataset.identity
+
+    source.loc[0, "close"] += 10.0
+    exposed = dataset.frame
+    exposed.loc[0, "close"] += 1.0
+    column = dataset.frame["close"]
+    column.iloc[1] += 1.0
+    for array, index in (
+        (dataset.frame["close"].values, 2),
+        (dataset.frame["close"].to_numpy(copy=False), 3),
+    ):
+        try:
+            array[index] += 1.0
+        except ValueError as exc:
+            assert "read-only" in str(exc)
+    sliced = dataset.frame.iloc[:2]
+    sliced.loc[sliced.index[0], "close"] += 1.0
+
+    pd.testing.assert_frame_equal(dataset.frame, expected)
+    assert dataset.identity == identity
 
 
 def test_complex_ohlcv_is_rejected_before_float_coercion() -> None:

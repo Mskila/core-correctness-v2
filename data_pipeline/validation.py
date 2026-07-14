@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from typing import Mapping
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,12 @@ from model_core.semantics import DATA_SCHEMA_VERSION, DataValidationError
 
 _CANONICAL_COLUMNS = ("time", "open", "high", "low", "close", "volume")
 _VALUE_COLUMNS = ("open", "high", "low", "close", "volume")
+_TIME_UNIT_NS = {
+    "s": 1_000_000_000,
+    "ms": 1_000_000,
+    "us": 1_000,
+    "ns": 1,
+}
 _TIMEFRAME_BY_MT5_VALUE = {
     1: "M1",
     5: "M5",
@@ -78,11 +85,26 @@ class DatasetIdentity:
             raise DataValidationError(f"invalid dataset identity: {exc}") from exc
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class CanonicalDataset:
-    frame: pd.DataFrame
+    _frame: pd.DataFrame = field(repr=False, compare=False)
     identity: DatasetIdentity
     gap_count: int
+
+    def __init__(
+        self,
+        frame: pd.DataFrame,
+        identity: DatasetIdentity,
+        gap_count: int,
+    ) -> None:
+        object.__setattr__(self, "_frame", frame.copy(deep=True))
+        object.__setattr__(self, "identity", identity)
+        object.__setattr__(self, "gap_count", gap_count)
+
+    @property
+    def frame(self) -> pd.DataFrame:
+        """Return a defensive copy so content cannot diverge from identity."""
+        return self._frame.copy(deep=True)
 
 
 def normalize_timeframe_name(value: str | int) -> str:
@@ -106,20 +128,93 @@ def assert_minimum_bars(actual: int, required: int, *, context: str) -> None:
         )
 
 
-def _convert_numeric_time(
-    numeric: pd.Series,
-    *,
-    unit: str,
-) -> pd.Series | None:
+def _contains_bool(values: pd.Series) -> bool:
+    return any(
+        isinstance(value, (bool, np.bool_))
+        for value in values.to_numpy(copy=False)
+    )
+
+
+def _integer_numeric_timestamps(values: pd.Series) -> list[int]:
+    if _contains_bool(values):
+        raise DataValidationError("numeric timestamps cannot contain boolean values")
     try:
-        converted = pd.Series(
-            pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
-        )
-        if converted.isna().any():
-            return None
-        return converted.astype("datetime64[ns, UTC]")
-    except (OverflowError, ValueError, pd.errors.OutOfBoundsDatetime):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            numeric = pd.to_numeric(values, errors="raise")
+    except Exception as exc:
+        raise DataValidationError(f"invalid numeric timestamp: {exc}") from exc
+
+    array = numeric.to_numpy(copy=False)
+    if np.iscomplexobj(array):
+        raise DataValidationError("numeric timestamps must be real integers")
+    if np.issubdtype(array.dtype, np.floating):
+        if not np.isfinite(array).all():
+            raise DataValidationError("invalid time: non-finite timestamp")
+        if not np.equal(array, np.trunc(array)).all():
+            raise DataValidationError("numeric timestamps must be integer values")
+        if (np.abs(array) > 2**53).any():
+            raise DataValidationError(
+                "floating numeric timestamps must be lossless integers"
+            )
+    try:
+        return [int(value) for value in array]
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise DataValidationError(f"invalid numeric timestamp: {exc}") from exc
+
+
+def _scaled_time_ns(value: int, unit: str) -> int | None:
+    scaled = value * _TIME_UNIT_NS[unit]
+    if scaled < pd.Timestamp.min.value or scaled > pd.Timestamp.max.value:
         return None
+    return scaled
+
+
+def _best_mixed_unit_cadence(
+    sorted_values: list[int],
+    *,
+    nominal_ns: int,
+) -> int:
+    units = tuple(_TIME_UNIT_NS)
+    scaled = [
+        [_scaled_time_ns(value, unit) for unit in units]
+        for value in sorted_values
+    ]
+    states: dict[tuple[int, int], int] = {}
+    for unit_index, timestamp_ns in enumerate(scaled[0]):
+        if timestamp_ns is None:
+            continue
+        mask = 0 if sorted_values[0] == 0 else 1 << unit_index
+        states[(unit_index, mask)] = 0
+
+    for row_index in range(1, len(sorted_values)):
+        next_states: dict[tuple[int, int], int] = {}
+        for unit_index, timestamp_ns in enumerate(scaled[row_index]):
+            if timestamp_ns is None:
+                continue
+            unit_bit = 0 if sorted_values[row_index] == 0 else 1 << unit_index
+            for (previous_unit, mask), exact_count in states.items():
+                previous_ns = scaled[row_index - 1][previous_unit]
+                if previous_ns is None:
+                    continue
+                delta = timestamp_ns - previous_ns
+                if delta < nominal_ns:
+                    continue
+                key = (unit_index, mask | unit_bit)
+                score = exact_count + int(delta == nominal_ns)
+                next_states[key] = max(next_states.get(key, -1), score)
+        states = next_states
+        if not states:
+            return -1
+
+    return max(
+        (
+            score
+            for (_unit, mask), score in states.items()
+            if mask.bit_count() > 1
+        ),
+        default=-1,
+    )
 
 
 def _numeric_time_to_utc(
@@ -127,86 +222,87 @@ def _numeric_time_to_utc(
     *,
     timeframe: str,
 ) -> pd.Series:
-    numeric = pd.to_numeric(values, errors="coerce")
-    numeric_array = numeric.to_numpy(dtype=np.float64, copy=False)
-    if not np.isfinite(numeric_array).all():
-        raise DataValidationError("invalid time: non-finite timestamp")
+    integers = _integer_numeric_timestamps(values)
+    if not integers:
+        return pd.Series(pd.to_datetime([], utc=True)).astype(
+            "datetime64[ns, UTC]"
+        )
+    if len(set(integers)) != len(integers):
+        raise DataValidationError("duplicate timestamp")
 
-    absolute = np.abs(numeric_array)
-    max_abs = float(np.max(absolute)) if len(numeric_array) else 0.0
-    inferred = np.select(
-        [
-            absolute < 100_000_000_000,
-            absolute < 100_000_000_000_000,
-            absolute < 100_000_000_000_000_000,
-        ],
-        ["s", "ms", "us"],
-        default="ns",
-    )
-    nonzero = absolute > 0
-    inferred_units = set(inferred[nonzero].tolist())
-    positive = absolute[nonzero]
-    crosses_near_boundary = (
-        len(positive) == 0
-        or float(np.max(positive) / np.min(positive)) <= 10.0
-    )
-    if len(inferred_units) > 1 and not crosses_near_boundary:
-        counts = {
-            unit: int(np.count_nonzero(inferred[nonzero] == unit))
-            for unit in sorted(inferred_units)
-        }
-        raise DataValidationError(
-            "mixed numeric timestamp units: "
-            f"inferred {counts}; values must use one epoch unit"
+    sorted_values = sorted(integers)
+    nominal_ns = _TIMEFRAME_NS.get(timeframe)
+    candidates: list[tuple[str, list[int], int, bool, bool]] = []
+    for unit in _TIME_UNIT_NS:
+        scaled = [_scaled_time_ns(value, unit) for value in integers]
+        if any(value is None for value in scaled):
+            continue
+        scaled_ns = [int(value) for value in scaled if value is not None]
+        ordered_ns = sorted(scaled_ns)
+        deltas = [
+            current - previous
+            for previous, current in zip(ordered_ns, ordered_ns[1:])
+        ]
+        exact_count = (
+            sum(delta == nominal_ns for delta in deltas)
+            if nominal_ns is not None
+            else 0
+        )
+        spacing_valid = nominal_ns is not None and bool(
+            all(delta >= nominal_ns for delta in deltas)
+        )
+        span_aligned = (
+            nominal_ns is not None
+            and len(ordered_ns) > 1
+            and ordered_ns[-1] - ordered_ns[0] >= nominal_ns
+            and (ordered_ns[-1] - ordered_ns[0]) % nominal_ns == 0
+        )
+        candidates.append(
+            (unit, scaled_ns, exact_count, spacing_valid, span_aligned)
         )
 
-    nominal_ns = _TIMEFRAME_NS.get(timeframe)
-    if nominal_ns is not None and len(numeric_array) > 1:
-        candidates: list[tuple[str, pd.Series, int]] = []
-        for unit in ("s", "ms", "us", "ns"):
-            converted = _convert_numeric_time(numeric, unit=unit)
-            if converted is None:
-                continue
-            converted_ns = np.sort(
-                converted.astype("int64").to_numpy(dtype=np.int64, copy=False)
-            )
-            deltas = np.diff(converted_ns)
-            if (deltas <= 0).any() or (deltas < nominal_ns).any():
-                continue
-            exact_cadence = int(np.count_nonzero(deltas == nominal_ns))
-            candidates.append((unit, converted, exact_cadence))
-
-        if candidates:
-            best_score = max(candidate[2] for candidate in candidates)
-            best = [candidate for candidate in candidates if candidate[2] == best_score]
-            if best_score > 0 and len(best) == 1:
-                return best[0][1]
-            if len(candidates) == 1:
-                return candidates[0][1]
-            raise DataValidationError(
-                "ambiguous numeric timestamp unit: cadence does not uniquely "
-                f"identify one epoch unit for timeframe {timeframe}"
-            )
-
-    if max_abs < 100_000_000_000:
-        unit = "s"
-    elif max_abs < 100_000_000_000_000:
-        unit = "ms"
-    elif max_abs < 100_000_000_000_000_000:
-        unit = "us"
-    else:
-        unit = "ns"
-    converted = _convert_numeric_time(numeric, unit=unit)
-    if converted is None:
+    if not candidates:
         raise DataValidationError("invalid time: timestamp cannot be converted to UTC")
-    return converted
+    best_exact = max(candidate[2] for candidate in candidates)
+    if best_exact > 0:
+        plausible = [candidate for candidate in candidates if candidate[2] == best_exact]
+    else:
+        plausible = [
+            candidate for candidate in candidates if candidate[3] or candidate[4]
+        ]
+    if len(plausible) != 1:
+        raise DataValidationError(
+            "ambiguous numeric timestamp unit: cadence does not uniquely "
+            f"identify one epoch unit for timeframe {timeframe}"
+        )
+
+    selected = plausible[0]
+    if nominal_ns is not None and len(sorted_values) > 1:
+        mixed_exact = _best_mixed_unit_cadence(
+            sorted_values,
+            nominal_ns=nominal_ns,
+        )
+        if mixed_exact > selected[2]:
+            raise DataValidationError(
+                "mixed numeric timestamp units: values align better under "
+                "multiple epoch units"
+            )
+
+    return pd.Series(pd.to_datetime(selected[1], unit="ns", utc=True)).astype(
+        "datetime64[ns, UTC]"
+    )
 
 
 def _to_utc_time(values: pd.Series, *, timeframe: str) -> pd.Series:
     if pd.api.types.is_numeric_dtype(values.dtype):
         converted = _numeric_time_to_utc(values, timeframe=timeframe)
     else:
-        converted = pd.Series(pd.to_datetime(values, utc=True, errors="coerce"))
+        try:
+            converted = pd.Series(
+                pd.to_datetime(values, utc=True, errors="coerce")
+            )
+        except Exception as exc:
+            raise DataValidationError(f"invalid time: {exc}") from exc
     if converted.isna().any():
         raise DataValidationError("invalid time: timestamp cannot be converted to UTC")
     return converted.astype("datetime64[ns, UTC]")
@@ -221,6 +317,24 @@ def _contains_complex(values: pd.Series) -> bool:
     )
 
 
+def _coerce_value_column(values: pd.Series, *, field: str) -> pd.Series:
+    if _contains_bool(values):
+        raise DataValidationError(f"boolean OHLCV value: field={field}")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            numeric = pd.to_numeric(values, errors="raise")
+            converted = numeric.astype("float64")
+    except Exception as exc:
+        raise DataValidationError(
+            f"invalid numeric OHLCV value: field={field}"
+        ) from exc
+    array = converted.to_numpy(dtype=np.float64, copy=False)
+    if not np.isfinite(array).all():
+        raise DataValidationError(f"non-finite OHLCV value: field={field}")
+    return converted
+
+
 def float32_ohlcv_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
     """Convert canonical OHLCV values to float32 without silent value loss."""
     converted: dict[str, np.ndarray] = {}
@@ -233,7 +347,7 @@ def float32_ohlcv_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
                 "OHLCV values must remain finite after float32 conversion: "
                 f"field={field}"
             )
-        if field != "volume" and np.any((source != 0.0) & (values == 0.0)):
+        if np.any((source != 0.0) & (values == 0.0)):
             raise DataValidationError(
                 "OHLCV values must remain non-zero after float32 conversion: "
                 f"field={field}"
@@ -312,9 +426,7 @@ def canonicalize_ohlcv(
         raise DataValidationError("OHLCV data has no bars")
 
     for column in _VALUE_COLUMNS:
-        result[column] = pd.to_numeric(result[column], errors="coerce").astype(
-            "float64"
-        )
+        result[column] = _coerce_value_column(result[column], field=column)
     values = result.loc[:, _VALUE_COLUMNS].to_numpy(dtype=np.float64, copy=False)
     if not np.isfinite(values).all():
         raise DataValidationError("non-finite OHLCV value")
@@ -332,19 +444,22 @@ def canonicalize_ohlcv(
         raise DataValidationError("invalid OHLC containment")
 
     time_ns = result["time"].astype("int64").to_numpy(dtype=np.int64, copy=False)
-    deltas = np.diff(time_ns)
-    if (deltas <= 0).any():
+    deltas = [
+        int(current) - int(previous)
+        for previous, current in zip(time_ns, time_ns[1:])
+    ]
+    if any(delta <= 0 for delta in deltas):
         raise DataValidationError("time must be strictly increasing")
 
     nominal_ns = _TIMEFRAME_NS.get(canonical_timeframe)
     if nominal_ns is None:
         gap_count = 0
     else:
-        if (deltas < nominal_ns).any():
+        if any(delta < nominal_ns for delta in deltas):
             raise DataValidationError(
                 f"bar spacing is shorter than timeframe {canonical_timeframe}"
             )
-        gap_count = int(np.count_nonzero(deltas > nominal_ns))
+        gap_count = sum(delta > nominal_ns for delta in deltas)
 
     data_fingerprint, time_fingerprint, time_ns = _fingerprints(
         frame=result,

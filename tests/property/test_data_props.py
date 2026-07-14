@@ -215,3 +215,39 @@ def test_duplicate_and_non_finite_inputs_raise_domain_errors(
 
     with pytest.raises(DataValidationError):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@settings(max_examples=40)
+@given(
+    unit=st.sampled_from(
+        [
+            ("s", 1_700_000_000, 3_600, 1_000_000_000),
+            ("ms", 1_700_000_000_000, 3_600_000, 1_000_000),
+            ("us", 1_700_000_000_000_000, 3_600_000_000, 1_000),
+            ("ns", 1_700_000_000_000_000_000, 3_600_000_000_000, 1),
+        ]
+    ),
+    gaps=st.lists(
+        st.integers(min_value=1, max_value=24),
+        min_size=2,
+        max_size=12,
+    ),
+)
+def test_integer_epoch_units_preserve_exact_identity_with_long_gaps(
+    unit: tuple[str, int, int, int],
+    gaps: list[int],
+) -> None:
+    _name, base, cadence, ns_factor = unit
+    offsets = [0]
+    for gap in gaps:
+        offsets.append(offsets[-1] + gap)
+    timestamps = [base + offset * cadence for offset in offsets]
+    frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=23)
+
+    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected_ns = [timestamp * ns_factor for timestamp in timestamps]
+    assert dataset.frame["time"].astype("int64").tolist() == expected_ns
+    assert dataset.identity.start_time_ns == expected_ns[0]
+    assert dataset.identity.end_time_ns == expected_ns[-1]
+    assert dataset.gap_count == sum(gap > 1 for gap in gaps)
