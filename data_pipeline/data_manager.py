@@ -64,11 +64,11 @@ class MT5DataManager:
 
     def load(self, symbols: list[str] | None = None) -> None:
         """Fetch, validate and strictly align requested symbols."""
+        self._clear_loaded_state()
         symbol_list = list(symbols) if symbols is not None else list(Config.SYMBOLS)
         if not symbol_list:
             raise DataValidationError("at least one symbol is required")
         self._requested_symbols = list(symbol_list)
-        self._clear_loaded_state()
         timeframe = normalize_timeframe_name(Config.TIMEFRAME)
         logger.info(f"Loading data for {len(symbol_list)} symbols: {symbol_list}")
 

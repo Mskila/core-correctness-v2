@@ -148,6 +148,26 @@ def test_consistent_early_milliseconds_can_cross_inference_boundary() -> None:
     assert result.gap_count == 0
 
 
+def test_epoch_zero_is_unit_neutral_for_consistent_early_milliseconds() -> None:
+    frame = valid_frame().iloc[:3].copy()
+    milliseconds = [0, 99_999_999_000, 100_003_599_000]
+    frame["time"] = milliseconds
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected = pd.to_datetime(milliseconds, unit="ms", utc=True).astype(
+        "datetime64[ns, UTC]"
+    )
+    assert str(result.frame["time"].dtype) == "datetime64[ns, UTC]"
+    assert result.frame["time"].astype("int64").tolist() == expected.astype(
+        "int64"
+    ).tolist()
+    assert result.identity.start_time_ns == 0
+    assert result.identity.end_time_ns == int(expected.astype("int64")[-1])
+    assert result.gap_count == 1
+    assert len(result.frame) == 3
+
+
 def test_long_gap_is_counted_without_synthesizing_bars() -> None:
     frame = valid_frame().drop(index=[2, 3]).reset_index(drop=True)
 

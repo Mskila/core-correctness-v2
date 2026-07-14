@@ -185,6 +185,31 @@ def test_mt5_load_failure_after_tensor_conversion_leaves_manager_unloaded() -> N
             getattr(manager, property_name)
 
 
+def test_mt5_empty_load_invalidates_previously_loaded_state() -> None:
+    manager = MT5DataManager(
+        _make_mock_fetcher({"OK": _make_ohlcv_df(periods=4)})
+    )
+    manager.load(["OK"])
+
+    with pytest.raises(DataValidationError, match="at least one symbol"):
+        manager.load([])
+
+    assert manager.symbols == []
+    for property_name in (
+        "raw_dict",
+        "feat_tensor",
+        "target_ret",
+        "target_valid",
+        "bar_time",
+        "data_identities",
+    ):
+        with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
+            getattr(manager, property_name)
+
+    manager.reload()
+    assert manager.symbols == ["OK"]
+
+
 @pytest.mark.parametrize(
     "property_name",
     ["raw_dict", "feat_tensor", "target_ret", "target_valid", "bar_time", "data_identities"],

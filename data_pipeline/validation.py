@@ -123,15 +123,16 @@ def _numeric_time_to_utc(values: pd.Series) -> pd.Series:
         ["s", "ms", "us"],
         default="ns",
     )
-    inferred_units = set(inferred.tolist())
-    positive = absolute[absolute > 0]
+    nonzero = absolute > 0
+    inferred_units = set(inferred[nonzero].tolist())
+    positive = absolute[nonzero]
     crosses_near_boundary = (
-        len(positive) == len(absolute)
-        and float(np.max(positive) / np.min(positive)) <= 10.0
+        len(positive) == 0
+        or float(np.max(positive) / np.min(positive)) <= 10.0
     )
     if len(inferred_units) > 1 and not crosses_near_boundary:
         counts = {
-            unit: int(np.count_nonzero(inferred == unit))
+            unit: int(np.count_nonzero(inferred[nonzero] == unit))
             for unit in sorted(inferred_units)
         }
         raise DataValidationError(
