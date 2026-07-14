@@ -536,6 +536,175 @@ def test_execution_accepts_representable_small_turnover_with_large_liquidation()
     assert result.cost[0, 1] > result.final_liquidation_cost[0]
 
 
+def test_execution_rejects_cost_absorbed_from_published_net_pnl() -> None:
+    factors = torch.tensor([[1_000.0, 0.0, 0.0]], dtype=torch.float32)
+
+    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
+        run_execution(
+            factors=factors,
+            target_ret=torch.tensor([[1e8, 0.0, 0.0]], dtype=torch.float32),
+            target_valid=torch.tensor([[True, False, False]]),
+            bar_time_ns=_hourly_times(3),
+            cost_rate=1e-8,
+            min_exposure=0.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "cost_rate"),
+    [
+        (torch.float16, 1e-4),
+        (torch.bfloat16, 5e-4),
+        (torch.float32, 1e-8),
+        (torch.float64, math.ulp(0.0)),
+    ],
+    ids=["float16", "bfloat16", "float32", "float64-subnormal"],
+)
+@pytest.mark.parametrize("gross_sign", [1.0, -1.0], ids=["gross-long", "gross-short"])
+@pytest.mark.parametrize(
+    "position_sign",
+    [1.0, -1.0],
+    ids=["position-long", "position-short"],
+)
+@pytest.mark.parametrize("final_index", [0, 1, 2])
+def test_execution_rejects_absorbed_net_component_across_domain(
+    dtype: torch.dtype,
+    cost_rate: float,
+    gross_sign: float,
+    position_sign: float,
+    final_index: int,
+) -> None:
+    time_length = final_index + 3
+    factors = torch.zeros((1, time_length), dtype=dtype)
+    factors[0, final_index] = position_sign * 1_000.0
+    target_ret = torch.zeros_like(factors)
+    target_ret[0, final_index] = gross_sign * position_sign
+    target_valid = torch.arange(time_length).unsqueeze(0) <= final_index
+
+    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
+        run_execution(
+            factors=factors,
+            target_ret=target_ret,
+            target_valid=target_valid,
+            bar_time_ns=_hourly_times(time_length),
+            cost_rate=cost_rate,
+            min_exposure=0.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("positions", "valid", "target_ret"),
+    [
+        (
+            [0.5, 0.0, 0.0, 0.0],
+            [True, True, False, False],
+            [2.0, 0.0, 0.0, 0.0],
+        ),
+        (
+            [0.5, 0.5, 0.0, 0.0],
+            [True, True, False, False],
+            [0.0, 2.0, 0.0, 0.0],
+        ),
+        (
+            [0.5, 0.0, 0.0],
+            [True, False, False],
+            [2.0, 0.0, 0.0],
+        ),
+    ],
+    ids=["turnover-only", "liquidation-only", "both-components"],
+)
+def test_execution_rejects_absorbed_net_for_each_cost_composition(
+    positions: list[float],
+    valid: list[bool],
+    target_ret: list[float],
+) -> None:
+    position_tensor = torch.tensor([positions], dtype=torch.float32)
+
+    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
+        run_execution(
+            factors=torch.atanh(position_tensor),
+            target_ret=torch.tensor([target_ret], dtype=torch.float32),
+            target_valid=torch.tensor([valid]),
+            bar_time_ns=_hourly_times(len(positions)),
+            cost_rate=1e-8,
+            min_exposure=0.0,
+        )
+
+
+def test_execution_allows_exact_gross_cost_cancellation() -> None:
+    result = run_execution(
+        factors=torch.atanh(torch.tensor([[0.5, 0.0, 0.0]])),
+        target_ret=torch.tensor([[0.5, 0.0, 0.0]]),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=0.25,
+        min_exposure=0.0,
+    )
+
+    assert result.gross_pnl[0, 0] == result.cost[0, 0]
+    assert result.net_pnl[0, 0] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("target_return", "cost_rate", "expected_net"),
+    [
+        (2.0, 0.1, 0.9),
+        (-2.0, 0.1, -1.1),
+        (2.0, 0.0, 1.0),
+        (0.0, 0.1, -0.1),
+    ],
+    ids=["opposite-sign", "same-sign", "zero-cost", "zero-gross"],
+)
+def test_execution_preserves_normal_net_addition_cases(
+    target_return: float,
+    cost_rate: float,
+    expected_net: float,
+) -> None:
+    result = run_execution(
+        factors=torch.atanh(torch.tensor([[0.5, 0.0, 0.0]])),
+        target_ret=torch.tensor([[target_return, 0.0, 0.0]]),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=cost_rate,
+        min_exposure=0.0,
+    )
+
+    assert result.net_pnl[0, 0].item() == pytest.approx(expected_net)
+
+
+@pytest.mark.parametrize("cost_ulps", [4.0, 5.0], ids=["four-ulp", "five-ulp"])
+def test_execution_accepts_representable_net_cost_ulps(cost_ulps: float) -> None:
+    one = torch.tensor(1.0, dtype=torch.float32)
+    one_ulp = torch.nextafter(one, torch.tensor(float("inf"))) - one
+    result = run_execution(
+        factors=torch.tensor([[1_000.0, 0.0, 0.0]], dtype=torch.float32),
+        target_ret=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=float(one_ulp * (cost_ulps / 2.0)),
+        min_exposure=0.0,
+    )
+
+    assert result.net_pnl[0, 0] != result.gross_pnl[0, 0]
+    assert result.gross_pnl[0, 0] - result.net_pnl[0, 0] == pytest.approx(
+        float(one_ulp * cost_ulps)
+    )
+
+
+def test_execution_rejects_absorbed_net_cost_before_gradient_is_published() -> None:
+    factor = torch.atanh(torch.tensor([[0.5, 0.0, 0.0]])).requires_grad_()
+
+    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
+        run_execution(
+            factors=factor,
+            target_ret=torch.tensor([[2.0, 0.0, 0.0]]),
+            target_valid=torch.tensor([[True, False, False]]),
+            bar_time_ns=_hourly_times(3),
+            cost_rate=1e-8,
+            min_exposure=0.0,
+        )
+
+
 @pytest.mark.parametrize(
     "dtype",
     [torch.float16, torch.bfloat16, torch.float32, torch.float64],

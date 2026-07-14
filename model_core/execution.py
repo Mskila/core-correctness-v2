@@ -136,21 +136,24 @@ def _validate_cost_component_product(
         )
 
 
-def _validate_cost_component_preservation(
-    turnover_component: Tensor,
-    liquidation_component: Tensor,
+def _validate_additive_component_preservation(
+    first_component: Tensor,
+    second_component: Tensor,
     combined_value: Tensor,
+    *,
+    context: str,
 ) -> None:
-    """Reject arithmetic that completely absorbs either non-zero cost component."""
-    turnover_absorbed = (turnover_component != 0) & (
-        combined_value - liquidation_component == 0
+    """Reject arithmetic that completely absorbs either non-zero addend."""
+    first_absorbed = (first_component != 0) & (
+        combined_value == second_component
     )
-    liquidation_absorbed = (liquidation_component != 0) & (
-        combined_value - turnover_component == 0
+    second_absorbed = (second_component != 0) & (
+        combined_value == first_component
     )
-    if bool((turnover_absorbed | liquidation_absorbed).any()):
+    if bool((first_absorbed | second_absorbed).any()):
         raise DataValidationError(
-            "each non-zero execution cost component must be preserved by arithmetic"
+            f"each non-zero {context} component must be representable "
+            "and preserved by arithmetic"
         )
 
 
@@ -281,10 +284,11 @@ def run_execution(
     )
     final_liquidation_cost_work = liquidation_cost_by_time_work.sum(dim=1)
     combined_cost_work = turnover_cost_work + liquidation_cost_by_time_work
-    _validate_cost_component_preservation(
+    _validate_additive_component_preservation(
         turnover_cost_work,
         liquidation_cost_by_time_work,
         combined_cost_work,
+        context="execution cost",
     )
     cost_work = torch.where(
         target_valid,
@@ -295,10 +299,11 @@ def run_execution(
     cost = cost_work.to(position.dtype)
     _validate_cost_publication(final_liquidation_cost_work, final_liquidation_cost)
     _validate_cost_publication(cost_work, cost)
-    _validate_cost_component_preservation(
+    _validate_additive_component_preservation(
         turnover_cost_work,
         liquidation_cost_by_time_work,
         cost.to(cost_work_dtype),
+        context="execution cost",
     )
     valid_target_ret = torch.where(
         target_valid,
@@ -310,10 +315,29 @@ def run_execution(
         position * valid_target_ret,
         torch.zeros_like(position),
     )
+    gross_pnl_work = gross_pnl.to(cost_work_dtype)
+    negative_cost_work = -cost.to(cost_work_dtype)
+    net_pnl_work = torch.where(
+        target_valid,
+        gross_pnl_work + negative_cost_work,
+        torch.zeros_like(gross_pnl_work),
+    )
+    _validate_additive_component_preservation(
+        gross_pnl_work,
+        negative_cost_work,
+        net_pnl_work,
+        context="net PnL cost",
+    )
     net_pnl = torch.where(
         target_valid,
-        gross_pnl - cost,
+        net_pnl_work.to(position.dtype),
         torch.zeros_like(position),
+    )
+    _validate_additive_component_preservation(
+        gross_pnl_work,
+        negative_cost_work,
+        net_pnl.to(cost_work_dtype),
+        context="net PnL cost",
     )
     floating_fields = (
         position,
