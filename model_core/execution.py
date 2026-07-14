@@ -136,6 +136,24 @@ def _validate_cost_component_product(
         )
 
 
+def _validate_cost_component_preservation(
+    turnover_component: Tensor,
+    liquidation_component: Tensor,
+    combined_value: Tensor,
+) -> None:
+    """Reject arithmetic that completely absorbs either non-zero cost component."""
+    turnover_absorbed = (turnover_component != 0) & (
+        combined_value - liquidation_component == 0
+    )
+    liquidation_absorbed = (liquidation_component != 0) & (
+        combined_value - turnover_component == 0
+    )
+    if bool((turnover_absorbed | liquidation_absorbed).any()):
+        raise DataValidationError(
+            "each non-zero execution cost component must be preserved by arithmetic"
+        )
+
+
 def factor_to_position(factors: Tensor, *, min_exposure: float) -> Tensor:
     """Convert finite factors to continuous positions with a neutral band."""
     if not math.isfinite(min_exposure) or min_exposure < 0.0:
@@ -262,15 +280,26 @@ def run_execution(
         liquidation_cost_by_time_work,
     )
     final_liquidation_cost_work = liquidation_cost_by_time_work.sum(dim=1)
+    combined_cost_work = turnover_cost_work + liquidation_cost_by_time_work
+    _validate_cost_component_preservation(
+        turnover_cost_work,
+        liquidation_cost_by_time_work,
+        combined_cost_work,
+    )
     cost_work = torch.where(
         target_valid,
-        turnover_cost_work + liquidation_cost_by_time_work,
+        combined_cost_work,
         torch.zeros_like(position_for_cost),
     )
     final_liquidation_cost = final_liquidation_cost_work.to(position.dtype)
     cost = cost_work.to(position.dtype)
     _validate_cost_publication(final_liquidation_cost_work, final_liquidation_cost)
     _validate_cost_publication(cost_work, cost)
+    _validate_cost_component_preservation(
+        turnover_cost_work,
+        liquidation_cost_by_time_work,
+        cost.to(cost_work_dtype),
+    )
     valid_target_ret = torch.where(
         target_valid,
         target_ret,
@@ -575,36 +604,43 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
         )
 
     symbol_max_drawdowns: list[Tensor] = []
+    symbol_validation_flags: list[Tensor] = []
     for symbol_index in range(net_pnl_by_symbol.shape[0]):
         symbol_net_pnl = net_pnl_by_symbol[
             symbol_index,
             target_valid[symbol_index],
         ].to(torch.float64)
         cumulative_log_return = torch.cumsum(symbol_net_pnl, dim=0)
-        if not bool(torch.isfinite(cumulative_log_return).all()):
-            raise DataValidationError("cumulative net log return must be finite")
+        cumulative_invalid = ~torch.isfinite(cumulative_log_return).all()
         log_equity = torch.cat(
             [torch.zeros_like(cumulative_log_return[:1]), cumulative_log_return],
             dim=0,
         )
-        if bool(
-            (
-                (log_equity < _MIN_LOG_FLOAT64)
-                | (log_equity > _MAX_LOG_FLOAT64)
-            ).any()
-        ):
-            raise DataValidationError(
-                "unable to derive finite performance metrics from an "
-                "unrepresentable equity path"
-            )
+        equity_path_invalid = (
+            (log_equity < _MIN_LOG_FLOAT64)
+            | (log_equity > _MAX_LOG_FLOAT64)
+        ).any()
         running_peak_log = torch.cummax(log_equity, dim=0).values
         drawdown_log = log_equity - running_peak_log
-        if bool((drawdown_log < _MIN_LOG_FLOAT64).any()):
-            raise DataValidationError(
-                "unable to derive finite performance metrics from an "
-                "unrepresentable equity drawdown"
+        drawdown_invalid = (drawdown_log < _MIN_LOG_FLOAT64).any()
+        symbol_validation_flags.append(
+            torch.stack(
+                [cumulative_invalid, equity_path_invalid, drawdown_invalid]
             )
+        )
         symbol_max_drawdowns.append((-torch.expm1(drawdown_log)).max())
+    validation_flags = torch.stack(symbol_validation_flags).reshape(-1)
+    invalid_indices = torch.nonzero(validation_flags, as_tuple=False)
+    if invalid_indices.numel() != 0:
+        error_kind = int(invalid_indices[0, 0].detach().cpu()) % 3
+        error_messages = (
+            "cumulative net log return must be finite",
+            "unable to derive finite performance metrics from an "
+            "unrepresentable equity path",
+            "unable to derive finite performance metrics from an "
+            "unrepresentable equity drawdown",
+        )
+        raise DataValidationError(error_messages[error_kind])
     max_drawdown_tensor = torch.stack(symbol_max_drawdowns).max()
 
     total_return_tensor = torch.expm1(total_log_return)
@@ -718,6 +754,27 @@ def build_execution_ledger(
     gross_pnl_values = gross_pnl.detach().cpu().tolist()
     cost_values = cost.detach().cpu().tolist()
     net_pnl_values = net_pnl.detach().cpu().tolist()
+
+    # Ledger rows are Python floats in symbol-major order.  The shared result
+    # rule promotes valid published values to float64 before reduction, matching
+    # Python's working precision without changing any published row value.
+    ledger_net_total = sum(
+        float(net_pnl_values[symbol_index][time_index])
+        for symbol_index, valid_count in enumerate(valid_count_values)
+        for time_index in range(valid_count)
+    )
+    result_net_total = float(
+        net_pnl[target_valid].to(torch.float64).sum().detach().cpu()
+    )
+    if (
+        not math.isfinite(ledger_net_total)
+        or not math.isfinite(result_net_total)
+        or abs(ledger_net_total - result_net_total) > 1e-8
+    ):
+        raise DataValidationError(
+            "ledger net_pnl aggregate must reconcile with the shared result "
+            "within 1e-8"
+        )
 
     ledger: list[LedgerEntry] = []
     for symbol_index, symbol in enumerate(symbols):

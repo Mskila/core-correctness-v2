@@ -1,3 +1,4 @@
+import ast
 from dataclasses import FrozenInstanceError, fields, replace
 import inspect
 import math
@@ -37,6 +38,7 @@ class _CloneStatsMode(TorchDispatchMode):
         super().__init__()
         self.calls = 0
         self.elements = 0
+        self.local_scalar_calls = 0
 
     def __torch_dispatch__(
         self,
@@ -50,6 +52,8 @@ class _CloneStatsMode(TorchDispatchMode):
             assert isinstance(tensor, torch.Tensor)
             self.calls += 1
             self.elements += tensor.numel()
+        if func is torch.ops.aten._local_scalar_dense.default:
+            self.local_scalar_calls += 1
         return func(*args, **(kwargs or {}))  # type: ignore[operator]
 
 
@@ -465,6 +469,71 @@ def test_execution_accepts_float32_cost_rate_below_property_old_floor() -> None:
 
     assert result.cost[0, 0] > 0
     assert result.final_liquidation_cost[0] > 0
+
+
+@pytest.mark.parametrize(
+    ("dtype", "small_position"),
+    [
+        (torch.float16, 1e-4),
+        (torch.bfloat16, 1e-3),
+        (torch.float32, 1e-8),
+        (torch.float64, 1e-17),
+    ],
+    ids=["float16", "bfloat16", "float32", "float64"],
+)
+@pytest.mark.parametrize("position_sign", [1.0, -1.0], ids=["long", "short"])
+def test_execution_rejects_absorbed_final_liquidation_component(
+    dtype: torch.dtype,
+    small_position: float,
+    position_sign: float,
+) -> None:
+    factors = torch.tensor(
+        [[position_sign * 1_000.0, position_sign * small_position, 0.0, 0.0]],
+        dtype=dtype,
+    )
+
+    with pytest.raises(DataValidationError, match="cost component.*preserv"):
+        run_execution(
+            factors=factors,
+            target_ret=torch.zeros_like(factors),
+            target_valid=torch.tensor([[True, True, False, False]]),
+            bar_time_ns=_hourly_times(4),
+            cost_rate=1.0,
+            min_exposure=0.0,
+        )
+
+
+def test_execution_rejects_absorbed_component_at_later_final_index() -> None:
+    factors = torch.tensor(
+        [[0.25, 1_000.0, 1e-8, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+
+    with pytest.raises(DataValidationError, match="cost component.*preserv"):
+        run_execution(
+            factors=factors,
+            target_ret=torch.zeros_like(factors),
+            target_valid=torch.tensor([[True, True, True, False, False]]),
+            bar_time_ns=_hourly_times(5),
+            cost_rate=0.5,
+            min_exposure=0.0,
+        )
+
+
+def test_execution_accepts_representable_small_turnover_with_large_liquidation() -> None:
+    positions = torch.tensor([[0.5, 0.50000006, 0.0, 0.0]], dtype=torch.float32)
+    result = run_execution(
+        factors=torch.atanh(positions),
+        target_ret=torch.zeros_like(positions),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=1.0,
+        min_exposure=0.0,
+    )
+
+    assert result.turnover[0, 1] > 0
+    assert result.final_liquidation_cost[0] > result.turnover[0, 1]
+    assert result.cost[0, 1] > result.final_liquidation_cost[0]
 
 
 @pytest.mark.parametrize(
@@ -1454,6 +1523,143 @@ def test_execution_ledger_accepts_legal_execution_pnl_by_dtype(
     )
 
 
+def _cancelling_execution_result(
+    target_returns: torch.Tensor,
+    target_valid: torch.Tensor | None = None,
+) -> ExecutionResult:
+    if target_valid is None:
+        target_valid = torch.zeros_like(target_returns, dtype=torch.bool)
+        target_valid[:, :3] = True
+    return run_execution(
+        factors=torch.full_like(target_returns, 1_000.0),
+        target_ret=target_returns,
+        target_valid=target_valid,
+        bar_time_ns=_hourly_times(target_returns.shape[1])
+        .expand(target_returns.shape[0], -1)
+        .clone(),
+        cost_rate=0.0,
+        min_exposure=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "valid_returns",
+    [
+        [1.0, 2e-8, -1.0],
+        [-1.0, -2e-8, 1.0],
+    ],
+    ids=["positive-residual", "negative-residual"],
+)
+def test_execution_ledger_reconciles_float32_with_shared_float64_reduction(
+    valid_returns: list[float],
+) -> None:
+    result = _cancelling_execution_result(
+        torch.tensor([[*valid_returns, 0.0, 0.0]], dtype=torch.float32)
+    )
+    default_tensor_total = result.net_pnl[result.target_valid].sum().item()
+    ledger = build_execution_ledger(result, ["EURUSD"])
+    row_total = sum(row.net_pnl for row in ledger)
+    shared_tensor_total = (
+        result.net_pnl[result.target_valid].to(torch.float64).sum().item()
+    )
+
+    assert abs(row_total - default_tensor_total) > 1e-8
+    assert row_total == pytest.approx(shared_tensor_total, abs=1e-8)
+    assert [row.net_pnl for row in ledger] == result.net_pnl[0, :3].tolist()
+
+
+def test_execution_ledger_reconciles_multisymbol_reduction_in_any_order(
+) -> None:
+    target_returns = torch.tensor(
+        [
+            [1.0, 2e-8, -1.0, 0.0, 0.0, 0.0],
+            [1.0, 2e-8, -1.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    target_valid = torch.tensor(
+        [
+            [True, True, True, False, False, False],
+            [True, True, True, True, False, False],
+        ]
+    )
+    result = _cancelling_execution_result(target_returns, target_valid)
+
+    for order in (torch.tensor([0, 1]), torch.tensor([1, 0])):
+        permuted = replace(
+            result,
+            position=result.position[order],
+            turnover=result.turnover[order],
+            gross_pnl=result.gross_pnl[order],
+            cost=result.cost[order],
+            net_pnl=result.net_pnl[order],
+            target_valid=result.target_valid[order],
+            bar_time_ns=result.bar_time_ns[order],
+            final_liquidation_cost=result.final_liquidation_cost[order],
+        )
+        ledger = build_execution_ledger(permuted, ["A", "B"])
+        row_total = sum(row.net_pnl for row in ledger)
+        shared_tensor_total = (
+            permuted.net_pnl[permuted.target_valid]
+            .to(torch.float64)
+            .sum()
+            .item()
+        )
+        assert row_total == pytest.approx(shared_tensor_total, abs=1e-8)
+        assert [row.net_pnl for row in ledger] == [
+            float(permuted.net_pnl[symbol_index, time_index])
+            for symbol_index in range(2)
+            for time_index in range(int(permuted.target_valid[symbol_index].sum()))
+        ]
+
+
+def test_execution_ledger_fails_closed_when_shared_reduction_cannot_reconcile(
+) -> None:
+    result = _cancelling_execution_result(
+        torch.tensor(
+            [[1e16, -1.0, -1e-6, -1e16, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        torch.tensor([[True, True, True, True, False, False]]),
+    )
+    row_total = sum(result.net_pnl[0, :4].tolist())
+    shared_tensor_total = (
+        result.net_pnl[result.target_valid].to(torch.float64).sum().item()
+    )
+    assert abs(row_total - shared_tensor_total) > 1e-8
+
+    with pytest.raises(DataValidationError, match="ledger.*aggregate"):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+@pytest.mark.parametrize(
+    ("dtype", "residual"),
+    [
+        (torch.float16, 2e-4),
+        (torch.bfloat16, 1e-3),
+        (torch.float32, 2e-8),
+        (torch.float64, 2e-16),
+    ],
+    ids=["float16", "bfloat16", "float32", "float64"],
+)
+def test_execution_ledger_preserves_rows_when_reduction_reconciles(
+    dtype: torch.dtype,
+    residual: float,
+) -> None:
+    result = _cancelling_execution_result(
+        torch.tensor([[1.0, -1.0, residual, 0.0, 0.0]], dtype=dtype)
+    )
+
+    ledger = build_execution_ledger(result, ["EURUSD"])
+
+    expected_rows = result.net_pnl[0, :3].tolist()
+    assert [row.net_pnl for row in ledger] == expected_rows
+    assert sum(row.net_pnl for row in ledger) == pytest.approx(
+        result.net_pnl[result.target_valid].sum().item(),
+        abs=1e-8,
+    )
+
+
 @pytest.mark.parametrize("invalid_symbol", [None, 7, ""])
 def test_execution_ledger_rejects_invalid_symbol(invalid_symbol: object) -> None:
     with pytest.raises(DataValidationError, match="non-empty strings"):
@@ -1828,6 +2034,22 @@ def test_execution_ledger_snapshots_fields_once_and_scales_linearly() -> None:
     assert stats[1][2] <= stats[0][2] * 2.1, stats
 
 
+def test_execution_ledger_local_scalar_syncs_are_constant() -> None:
+    local_scalar_counts: list[int] = []
+    for valid_count in (64, 128, 256):
+        stats = _CloneStatsMode()
+        with stats:
+            ledger = build_execution_ledger(
+                _ledger_scale_result(valid_count),
+                ["X"],
+            )
+
+        assert ledger == _expected_zero_ledger(valid_count)
+        local_scalar_counts.append(stats.local_scalar_calls)
+
+    assert len(set(local_scalar_counts)) == 1, local_scalar_counts
+
+
 def _performance_scale_result(symbol_count: int) -> ExecutionResult:
     net_pnl = torch.tensor(
         [[-0.01, 0.02, 0.0, 0.0]],
@@ -1870,6 +2092,20 @@ def test_performance_metrics_snapshots_fields_once_and_scales_linearly() -> None
     assert stats[1][2] <= stats[0][2] * 2.1, stats
 
 
+def test_performance_metrics_local_scalar_syncs_are_constant_per_call() -> None:
+    local_scalar_counts: list[int] = []
+    for symbol_count in (32, 64, 128, 256):
+        stats = _CloneStatsMode()
+        with stats:
+            metrics = performance_metrics(_performance_scale_result(symbol_count))
+
+        assert metrics.observations == 2 * symbol_count
+        local_scalar_counts.append(stats.local_scalar_calls)
+
+    assert len(set(local_scalar_counts)) == 1, local_scalar_counts
+    assert local_scalar_counts[0] <= 32, local_scalar_counts
+
+
 def test_execution_ledger_inner_loop_uses_bulk_materialized_values() -> None:
     source = inspect.getsource(build_execution_ledger)
     inner_loop = source[source.index("    for symbol_index, symbol") :]
@@ -1880,6 +2116,19 @@ def test_execution_ledger_inner_loop_uses_bulk_materialized_values() -> None:
 
 def test_performance_metrics_symbol_loop_reuses_snapshots() -> None:
     source = inspect.getsource(performance_metrics)
-    symbol_loop = source[source.index("    for symbol_index") :]
+    syntax_tree = ast.parse(source)
+    symbol_loop_node = next(
+        node
+        for node in ast.walk(syntax_tree)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "symbol_index"
+    )
+    symbol_loop = ast.get_source_segment(source, symbol_loop_node)
+    assert symbol_loop is not None
 
     assert "result." not in symbol_loop
+    assert "bool(" not in symbol_loop
+    assert ".item(" not in symbol_loop
+    assert ".cpu(" not in symbol_loop
+    assert "_local_scalar_dense" not in symbol_loop
