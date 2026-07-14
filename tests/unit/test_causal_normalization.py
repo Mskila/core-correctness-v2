@@ -150,3 +150,217 @@ def test_amihud_illiq_does_not_collapse_representable_variation() -> None:
 
     assert torch.isfinite(actual).all()
     assert torch.count_nonzero(actual).item() > 0
+
+
+_FLOAT64_MIN_SUBNORMAL = torch.nextafter(
+    torch.tensor(0.0, dtype=torch.float64),
+    torch.tensor(1.0, dtype=torch.float64),
+).item()
+_FLOAT64_SCALE_CASES = [
+    _FLOAT64_MIN_SUBNORMAL,
+    1.0e-320,
+    1.0e-310,
+    1.0e-308,
+    torch.finfo(torch.float64).smallest_normal,
+    3.0e-308,
+    1.0e-200,
+    1.0,
+    1.0e200,
+]
+_SUBNORMAL_PATTERN = torch.tensor(
+    [[0.0, 1.0, 2.0, -1.0]], dtype=torch.float64
+)
+_ASYMMETRIC_WEIGHTS = torch.tensor(
+    [[1.0, -2.0, 3.0, 0.5]], dtype=torch.float64
+)
+
+
+def _apply_loss(output: torch.Tensor, loss_name: str) -> torch.Tensor:
+    if loss_name == "sum":
+        return output.sum()
+    if loss_name == "square_sum":
+        return output.square().sum()
+    if loss_name == "weighted_sum":
+        return (output * _ASYMMETRIC_WEIGHTS.to(output)).sum()
+    raise AssertionError(f"unknown test loss: {loss_name}")
+
+
+def _direct_prefix_zscore(x: torch.Tensor, window: int) -> torch.Tensor:
+    """Small ordinary-scale reference independent of production scaling."""
+    outputs = []
+    for end in range(x.shape[1]):
+        prefix = x[:, max(0, end - window + 1):end + 1]
+        mean = prefix.mean(dim=1)
+        variance = (prefix - mean.unsqueeze(1)).square().mean(dim=1)
+        safe_variance = torch.where(
+            variance > 0, variance, torch.ones_like(variance)
+        )
+        value = (x[:, end] - mean) / safe_variance.sqrt()
+        outputs.append(torch.where(variance > 0, value, torch.zeros_like(value)))
+    return torch.stack(outputs, dim=1)
+
+
+def test_float64_min_subnormal_square_loss_backward_is_finite() -> None:
+    x = (_SUBNORMAL_PATTERN * _FLOAT64_MIN_SUBNORMAL).requires_grad_()
+
+    output = causal_rolling_zscore(x, window=200)
+
+    expected = torch.tensor(
+        [[0.0, 1.0, 1.224744871391589, -1.3416407864998738]],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    output.square().sum().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.parametrize(
+    "scale",
+    _FLOAT64_SCALE_CASES,
+    ids=[
+        "min-subnormal",
+        "1e-320",
+        "1e-310",
+        "1e-308",
+        "min-normal",
+        "3e-308",
+        "1e-200",
+        "unit",
+        "1e200",
+    ],
+)
+@pytest.mark.parametrize("loss_name", ["sum", "square_sum", "weighted_sum"])
+def test_float64_scale_matrix_preserves_forward_and_gradient_direction(
+    scale: float, loss_name: str
+) -> None:
+    unit = _SUBNORMAL_PATTERN.clone().requires_grad_()
+    scaled = (_SUBNORMAL_PATTERN * scale).requires_grad_()
+
+    unit_output = causal_rolling_zscore(unit, window=200)
+    scaled_output = causal_rolling_zscore(scaled, window=200)
+    torch.testing.assert_close(scaled_output, unit_output, rtol=0, atol=1e-12)
+
+    _apply_loss(unit_output, loss_name).backward()
+    _apply_loss(scaled_output, loss_name).backward()
+    assert unit.grad is not None and scaled.grad is not None
+    assert torch.isfinite(scaled.grad).all()
+    assert torch.count_nonzero(scaled.grad).item() > 0
+
+    active = unit.grad != 0
+    assert torch.equal(
+        torch.sign(scaled.grad[active]),
+        torch.sign(unit.grad[active]),
+    )
+
+
+@pytest.mark.parametrize("loss_name", ["sum", "square_sum", "weighted_sum"])
+def test_ordinary_scale_gradient_matches_direct_prefix_reference(
+    loss_name: str,
+) -> None:
+    values = torch.tensor(
+        [[0.25, 1.0, 2.0, -1.0]], dtype=torch.float64
+    )
+    actual_input = values.clone().requires_grad_()
+    reference_input = values.clone().requires_grad_()
+
+    actual = causal_rolling_zscore(actual_input, window=200)
+    reference = _direct_prefix_zscore(reference_input, window=200)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=1e-12)
+    _apply_loss(actual, loss_name).backward()
+    _apply_loss(reference, loss_name).backward()
+
+    torch.testing.assert_close(
+        actual_input.grad,
+        reference_input.grad,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_signed_zero_and_true_zero_variance_have_finite_zero_gradients() -> None:
+    x = torch.tensor(
+        [[0.0, -0.0, 0.0], [7.0, 7.0, 7.0]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    output = causal_rolling_zscore(x, window=200)
+    output.square().sum().backward()
+
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, torch.zeros_like(x), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("window", [1, 200, 500])
+def test_noncontiguous_backward_is_finite_for_short_and_long_windows(
+    window: int,
+) -> None:
+    leaf = torch.arange(16.0, dtype=torch.float64, requires_grad=True)
+    x = leaf.reshape(2, 8)[:, ::2]
+    assert not x.is_contiguous()
+
+    output = causal_rolling_zscore(x, window=window)
+    (output * torch.tensor([[1.0, -2.0, 3.0, 0.5]])).sum().backward()
+
+    assert output.shape == x.shape
+    assert leaf.grad is not None
+    assert torch.isfinite(leaf.grad).all()
+
+
+def test_rows_are_isolated_in_forward_and_backward() -> None:
+    left = torch.tensor(
+        [[0.25, 1.0, 2.0, -1.0], [3.0, -4.0, 5.0, 6.0]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    changed = left.detach().clone()
+    changed[1] = changed[1] * -1000.0 + 17.0
+    changed.requires_grad_()
+
+    left_output = causal_rolling_zscore(left, window=3)
+    changed_output = causal_rolling_zscore(changed, window=3)
+    left_output[0].square().sum().backward()
+    changed_output[0].square().sum().backward()
+
+    torch.testing.assert_close(
+        left_output[0], changed_output[0], rtol=0, atol=0
+    )
+    torch.testing.assert_close(left.grad[0], changed.grad[0], rtol=0, atol=0)
+
+
+def test_backward_does_not_pollute_unrelated_caller_branch() -> None:
+    values = torch.tensor(
+        [[0.25, 1.0, 2.0, -1.0]], dtype=torch.float64
+    )
+    branch_weights = torch.tensor(
+        [[0.125, -0.25, 0.5, 1.0]], dtype=torch.float64
+    )
+    combined_input = values.clone().requires_grad_()
+    zscore_only_input = values.clone().requires_grad_()
+
+    combined = causal_rolling_zscore(combined_input, window=200)
+    zscore_only = causal_rolling_zscore(zscore_only_input, window=200)
+    (_apply_loss(combined, "weighted_sum") +
+     (combined_input * branch_weights).sum()).backward()
+    _apply_loss(zscore_only, "weighted_sum").backward()
+
+    torch.testing.assert_close(
+        combined_input.grad - zscore_only_input.grad,
+        branch_weights,
+        rtol=0,
+        atol=1e-15,
+    )
+
+
+def test_window_one_keeps_unrelated_subnormal_branch_gradient() -> None:
+    x = (_SUBNORMAL_PATTERN * _FLOAT64_MIN_SUBNORMAL).requires_grad_()
+    branch_weights = torch.tensor(
+        [[0.125, -0.25, 0.5, 1.0]], dtype=torch.float64
+    )
+
+    output = causal_rolling_zscore(x, window=1)
+    (output.sum() + (x * branch_weights).sum()).backward()
+
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, branch_weights, rtol=0, atol=0)
