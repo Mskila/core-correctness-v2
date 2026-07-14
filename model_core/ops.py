@@ -524,7 +524,7 @@ assert len(OPERATOR_REGISTRY.operator_specs) == _EXPECTED_T33_COUNT, (
 # ── Task 3.4 追加：归一化与条件/逻辑算子 ─────────────────────────────────
 #
 # 新增 11 个算子（TS_ZSCORE_10/20、WINSORIZE、CLIP、SIGMOID、TANH_SQUASH、
-# GT、LT、AND、OR、IF_GT），追加在既有 55 个算子之后，保持既有顺序不变。
+# GT、LT、AND、OR、IF_GT），追加在既有 52 个 V2 单标算子之后，保持既有顺序不变。
 # 全部因果、NaN-safe（R2.6, R2.7, R2.9, R2.10, R8.2, R8.6）。
 #
 # 归一化算子均为 arity 1，因果；条件/逻辑算子 arity 2 或 3，形状校验。
@@ -628,7 +628,7 @@ def _register_task34_operators(registry: Registry) -> None:
     """注册 Task 3.4 新增算子（归一化与条件/逻辑，R2.6, R2.7）。
 
     二元/三元算子经 `_with_shape_check` 包装；一元算子直接注册。
-    追加在既有 55 个算子之后，保持既有算子顺序在前（R2.9, R2.10）。
+    追加在既有 52 个 V2 单标算子之后，保持既有算子顺序在前（R2.9, R2.10）。
     """
     for name, transform, arity, lookback in _TASK34_OPERATORS:
         fn = _with_shape_check(name, transform) if arity >= 2 else transform
