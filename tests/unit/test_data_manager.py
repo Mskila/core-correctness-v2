@@ -1,224 +1,249 @@
-"""
-tests/unit/test_data_manager.py — MT5DataManager 单元测试
+from __future__ import annotations
 
-验证需求：
-  - Req 3.5: 少于 MIN_BARS 的品种应被排除并记录 WARNING
+from pathlib import Path
+from unittest.mock import MagicMock
 
-注意：测试使用较小的数据量（100/2000 bars），需同时 patch Config.MIN_BARS=100
-以避免受全局配置（3000）影响。
-"""
-
-import pytest
-import pandas as pd
 import numpy as np
-from unittest.mock import MagicMock, patch
+import pandas as pd
+import pytest
+import torch
 
-# 测试用的 MIN_BARS 值（与测试数据大小匹配）
-_TEST_MIN_BARS = 100
-
-
-# ── 辅助函数 ──────────────────────────────────────────────────────────────────
-
-def _make_ohlcv_df(n_rows: int, start_time: int = 1_000_000) -> pd.DataFrame:
-    """构造含 n_rows 行的标准 OHLCV DataFrame。
-
-    列：time, open, high, low, close, tick_volume
-    time 为唯一递增整数（Unix 时间戳风格）。
-    """
-    times = np.arange(start_time, start_time + n_rows, dtype=np.int64)
-    opens = np.random.uniform(100.0, 200.0, size=n_rows)
-    highs = opens + np.random.uniform(0.1, 5.0, size=n_rows)
-    lows  = opens - np.random.uniform(0.1, 5.0, size=n_rows)
-    closes = opens + np.random.uniform(-2.0, 2.0, size=n_rows)
-    volumes = np.random.randint(100, 10_000, size=n_rows).astype(np.int64)
-
-    return pd.DataFrame({
-        "time":        times,
-        "open":        opens,
-        "high":        highs,
-        "low":         lows,
-        "close":       closes,
-        "tick_volume": volumes,
-    })
+from data_pipeline.data_manager import MT5DataManager, compute_forward_open_returns
+from data_pipeline.parquet_manager import ParquetDataManager, inspect_parquet_file
+from data_pipeline.single_symbol_manager import SingleSymbolDataManager
+from model_core.semantics import DataValidationError, DatasetAlignmentError
 
 
-def _make_mock_fetcher(return_map: dict) -> MagicMock:
-    """构造 MT5DataFetcher mock，根据 symbol 返回不同 DataFrame。
+def _make_ohlcv_df(
+    *,
+    start: str = "2026-01-01 00:00:00",
+    periods: int = 6,
+    base_price: float = 100.0,
+) -> pd.DataFrame:
+    opens = base_price + np.arange(periods, dtype=np.float64)
+    return pd.DataFrame(
+        {
+            "time": pd.date_range(start, periods=periods, freq="1h", tz="UTC"),
+            "open": opens,
+            "high": opens + 1.0,
+            "low": opens - 1.0,
+            "close": opens + 0.25,
+            "tick_volume": 1_000.0 + np.arange(periods, dtype=np.float64),
+        }
+    )
 
-    Args:
-        return_map: {symbol: pd.DataFrame}
-    """
+
+def _make_mock_fetcher(return_map: dict[str, pd.DataFrame]) -> MagicMock:
     fetcher = MagicMock()
-
-    def _fetch_side_effect(symbol, timeframe, count):
-        if symbol in return_map:
-            return return_map[symbol]
-        # 默认返回空 DataFrame
-        return pd.DataFrame(
-            columns=["time", "open", "high", "low", "close", "tick_volume"]
-        )
-
-    fetcher.fetch.side_effect = _fetch_side_effect
+    fetcher.fetch.side_effect = lambda symbol, timeframe, count: return_map[symbol].copy()
     return fetcher
 
 
-# ── 测试 1：少于 100 bars 的品种被排除 ────────────────────────────────────────
-
-class TestSymbolExcludedWhenBelowMinBars:
-    """Req 3.5: 数据不足 MIN_BARS(100) 的品种必须被排除。"""
-
-    def test_symbol_with_fewer_than_100_bars_is_excluded(self):
-        """US500 只有 50 行，应被排除；XAUUSD 和 EURUSD 各有 2000 行，应保留。"""
-        fetch_map = {
-            "XAUUSD": _make_ohlcv_df(2000, start_time=1_000_000),
-            "US500":  _make_ohlcv_df(50,   start_time=2_000_000),   # < 100
-            "EURUSD": _make_ohlcv_df(2000, start_time=1_000_000),
-        }
-        mock_fetcher = _make_mock_fetcher(fetch_map)
-
-        from data_pipeline.data_manager import MT5DataManager
-        from config import Config
-
-        manager = MT5DataManager(mock_fetcher)
-
-        with patch.object(Config, "MIN_BARS", _TEST_MIN_BARS), patch.object(Config, "SYMBOLS", ["XAUUSD", "US500", "EURUSD"]):
-            manager.load()
-
-        assert "US500"  not in manager.symbols, "US500 应因 bars < 100 被排除"
-        assert "XAUUSD" in manager.symbols,     "XAUUSD 有 2000 bars，应保留"
-        assert "EURUSD" in manager.symbols,     "EURUSD 有 2000 bars，应保留"
-
-    def test_excluded_symbol_fetch_was_called(self):
-        """即使 US500 被排除，fetcher.fetch() 也应被调用过（先获取后过滤）。"""
-        fetch_map = {
-            "XAUUSD": _make_ohlcv_df(2000),
-            "US500":  _make_ohlcv_df(50),
-            "EURUSD": _make_ohlcv_df(2000),
-        }
-        mock_fetcher = _make_mock_fetcher(fetch_map)
-
-        from data_pipeline.data_manager import MT5DataManager
-        from config import Config
-
-        manager = MT5DataManager(mock_fetcher)
-
-        with patch.object(Config, "MIN_BARS", _TEST_MIN_BARS), patch.object(Config, "SYMBOLS", ["XAUUSD", "US500", "EURUSD"]):
-            manager.load()
-
-        # fetch 应被调用 3 次（每个品种一次）
-        assert mock_fetcher.fetch.call_count == 3
-
-    def test_valid_symbols_count_after_exclusion(self):
-        """排除 US500 后，manager.symbols 应只有 2 个有效品种。"""
-        fetch_map = {
-            "XAUUSD": _make_ohlcv_df(2000),
-            "US500":  _make_ohlcv_df(10),   # 远低于 100
-            "EURUSD": _make_ohlcv_df(500),
-        }
-        mock_fetcher = _make_mock_fetcher(fetch_map)
-
-        from data_pipeline.data_manager import MT5DataManager
-        from config import Config
-
-        manager = MT5DataManager(mock_fetcher)
-
-        with patch.object(Config, "MIN_BARS", _TEST_MIN_BARS), patch.object(Config, "SYMBOLS", ["XAUUSD", "US500", "EURUSD"]):
-            manager.load()
-
-        assert len(manager.symbols) == 2
+def _write_parquet(path: Path, frame: pd.DataFrame) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path, index=False)
+    return path
 
 
-# ── 测试 2：所有品种都不足 100 bars 时抛出 ValueError ─────────────────────────
+def test_forward_open_returns_use_t1_to_t2_and_mask_tail() -> None:
+    opens = torch.tensor([[10.0, 11.0, 12.0, 15.0, 18.0]])
 
-class TestAllSymbolsBelowMinBarsRaisesError:
-    """Req 3.5: 若所有品种均不满足 MIN_BARS，应抛出 ValueError。"""
+    returns, valid = compute_forward_open_returns(opens)
 
-    def test_raises_value_error_when_all_symbols_below_min_bars(self):
-        """所有品种返回 < 100 行数据时，load() 必须抛出 ValueError。"""
-        fetch_map = {
-            "XAUUSD": _make_ohlcv_df(50),
-            "US500":  _make_ohlcv_df(30),
-            "EURUSD": _make_ohlcv_df(1),
-        }
-        mock_fetcher = _make_mock_fetcher(fetch_map)
-
-        from data_pipeline.data_manager import MT5DataManager
-        from config import Config
-
-        manager = MT5DataManager(mock_fetcher)
-
-        with patch.object(Config, "MIN_BARS", _TEST_MIN_BARS), patch.object(Config, "SYMBOLS", ["XAUUSD", "US500", "EURUSD"]):
-            with pytest.raises(ValueError) as exc_info:
-                manager.load()
-
-        # 错误消息应提示无可用品种
-        assert "No valid symbols" in str(exc_info.value) or \
-               "fewer than" in str(exc_info.value) or \
-               "MIN_BARS" in str(exc_info.value)
-
-    def test_raises_value_error_with_empty_dataframes(self):
-        """所有品种返回空 DataFrame（0 行）时，load() 也应抛出 ValueError。"""
-        empty_df = pd.DataFrame(
-            columns=["time", "open", "high", "low", "close", "tick_volume"]
-        )
-        fetch_map = {
-            "XAUUSD": empty_df,
-            "EURUSD": empty_df,
-        }
-        mock_fetcher = _make_mock_fetcher(fetch_map)
-
-        from data_pipeline.data_manager import MT5DataManager
-        from config import Config
-
-        manager = MT5DataManager(mock_fetcher)
-
-        with patch.object(Config, "MIN_BARS", _TEST_MIN_BARS), patch.object(Config, "SYMBOLS", ["XAUUSD", "EURUSD"]):
-            with pytest.raises(ValueError):
-                manager.load()
+    expected = torch.tensor(
+        [[
+            torch.log(torch.tensor(12.0 / 11.0)),
+            torch.log(torch.tensor(15.0 / 12.0)),
+            torch.log(torch.tensor(18.0 / 15.0)),
+            0.0,
+            0.0,
+        ]]
+    )
+    assert torch.allclose(returns, expected)
+    assert valid.dtype == torch.bool
+    assert valid.tolist() == [[True, True, True, False, False]]
+    assert torch.equal(returns[:, -2:], torch.zeros((1, 2)))
 
 
-# ── 测试 3：恰好 100 bars 的品种应被保留（边界值）────────────────────────────
+@pytest.mark.parametrize(
+    "opens",
+    [
+        torch.tensor([10.0, 11.0, 12.0]),
+        torch.tensor([[10.0, 11.0]]),
+        torch.tensor([[10.0, 0.0, 12.0]]),
+        torch.tensor([[10.0, float("nan"), 12.0]]),
+        torch.tensor([[10, 11, 12]]),
+    ],
+)
+def test_forward_open_returns_reject_invalid_input(opens: torch.Tensor) -> None:
+    with pytest.raises(DataValidationError):
+        compute_forward_open_returns(opens)
 
-class TestExactlyMinBarsIsAccepted:
-    """Req 3.5: MIN_BARS = 100，恰好 100 bars 的品种不应被排除。"""
 
-    def test_exactly_100_bars_is_included(self):
-        """品种返回恰好 100 行（= MIN_BARS）时，应被包含在 manager.symbols 中。"""
-        fetch_map = {
-            "XAUUSD": _make_ohlcv_df(100),  # 恰好等于 MIN_BARS
-            "EURUSD": _make_ohlcv_df(2000),
-        }
-        mock_fetcher = _make_mock_fetcher(fetch_map)
+def test_mt5_manager_uses_only_real_intersection_and_exposes_v2_shapes() -> None:
+    frames = {
+        "LEFT": _make_ohlcv_df(start="2026-01-01 00:00:00", base_price=100.0),
+        "RIGHT": _make_ohlcv_df(start="2026-01-01 02:00:00", base_price=200.0),
+    }
+    manager = MT5DataManager(_make_mock_fetcher(frames))
 
-        from data_pipeline.data_manager import MT5DataManager
-        from config import Config
+    manager.load(["LEFT", "RIGHT"])
 
-        manager = MT5DataManager(mock_fetcher)
+    expected_time = pd.date_range(
+        "2026-01-01 02:00:00", periods=4, freq="1h", tz="UTC"
+    ).astype("datetime64[ns, UTC]").astype("int64")
+    assert manager.raw_dict["open"].shape == (2, 4)
+    assert manager.raw_dict["open"][0].tolist() == [102.0, 103.0, 104.0, 105.0]
+    assert manager.raw_dict["open"][1].tolist() == [200.0, 201.0, 202.0, 203.0]
+    assert manager.bar_time.shape == manager.target_ret.shape == (2, 4)
+    assert manager.bar_time.dtype == torch.int64
+    assert manager.target_valid.dtype == torch.bool
+    assert torch.equal(
+        manager.bar_time,
+        torch.tensor(np.tile(expected_time, (2, 1)), dtype=torch.int64),
+    )
+    assert manager.target_valid[:, :-2].all()
+    assert not manager.target_valid[:, -2:].any()
+    assert len(manager.data_identities) == 2
+    assert [identity.symbol for identity in manager.data_identities] == manager.symbols
+    assert all(identity.bars == 4 for identity in manager.data_identities)
 
-        with patch.object(Config, "MIN_BARS", _TEST_MIN_BARS), patch.object(Config, "SYMBOLS", ["XAUUSD", "EURUSD"]):
-            manager.load()
 
-        assert "XAUUSD" in manager.symbols, \
-            "恰好 100 bars（= MIN_BARS）的品种应被保留，不应被排除"
-        assert "EURUSD" in manager.symbols
+def test_mt5_manager_rejects_insufficient_intersection_with_coverage() -> None:
+    frames = {
+        "LEFT": _make_ohlcv_df(
+            start="2026-01-01 00:00:00", periods=4, base_price=100.0
+        ),
+        "RIGHT": _make_ohlcv_df(
+            start="2026-01-01 02:00:00", periods=4, base_price=200.0
+        ),
+    }
+    manager = MT5DataManager(_make_mock_fetcher(frames))
 
-    def test_99_bars_is_excluded_but_100_is_included(self):
-        """99 bars（< MIN_BARS）应被排除，100 bars（= MIN_BARS）应保留——边界严格区分。"""
-        fetch_map = {
-            "XAUUSD": _make_ohlcv_df(99),   # 比 MIN_BARS 少 1
-            "US500":  _make_ohlcv_df(100),  # 恰好等于 MIN_BARS
-            "EURUSD": _make_ohlcv_df(2000),
-        }
-        mock_fetcher = _make_mock_fetcher(fetch_map)
+    with pytest.raises(DatasetAlignmentError) as exc_info:
+        manager.load(["LEFT", "RIGHT"])
 
-        from data_pipeline.data_manager import MT5DataManager
-        from config import Config
+    message = str(exc_info.value)
+    assert "intersection" in message
+    assert "actual 2" in message
+    assert "LEFT" in message and "bars=4" in message
+    assert "RIGHT" in message and "2026-01-01" in message
 
-        manager = MT5DataManager(mock_fetcher)
 
-        with patch.object(Config, "MIN_BARS", _TEST_MIN_BARS), patch.object(Config, "SYMBOLS", ["XAUUSD", "US500", "EURUSD"]):
-            manager.load()
+def test_mt5_manager_canonicalizes_each_input_before_alignment() -> None:
+    duplicate = pd.concat(
+        [_make_ohlcv_df(periods=4), _make_ohlcv_df(periods=4).iloc[[0]]],
+        ignore_index=True,
+    )
+    manager = MT5DataManager(_make_mock_fetcher({"EURUSD": duplicate}))
 
-        assert "XAUUSD" not in manager.symbols, "99 bars 应被排除"
-        assert "US500"  in manager.symbols,     "100 bars 应被保留"
-        assert "EURUSD" in manager.symbols,     "2000 bars 应被保留"
+    with pytest.raises(DataValidationError, match="duplicate timestamp"):
+        manager.load(["EURUSD"])
+
+
+@pytest.mark.parametrize(
+    "property_name",
+    ["raw_dict", "feat_tensor", "target_ret", "target_valid", "bar_time", "data_identities"],
+)
+def test_mt5_manager_properties_fail_clearly_before_load(property_name: str) -> None:
+    manager = MT5DataManager(MagicMock())
+
+    with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
+        getattr(manager, property_name)
+
+
+def test_mt5_manager_fingerprints_are_stable_across_reload() -> None:
+    frames = {"EURUSD": _make_ohlcv_df()}
+    manager = MT5DataManager(_make_mock_fetcher(frames))
+
+    manager.load(["EURUSD"])
+    first = manager.data_identities
+    manager.load(["EURUSD"])
+
+    assert manager.data_identities == first
+
+
+def test_parquet_manager_exposes_same_v2_contract(tmp_path: Path) -> None:
+    path = _write_parquet(tmp_path / "EURUSD_H1.parquet", _make_ohlcv_df())
+    manager = ParquetDataManager(path, required_bars=6)
+
+    manager.load()
+
+    assert manager.target_ret.shape == (1, 6)
+    assert manager.target_valid.shape == (1, 6)
+    assert manager.target_valid.dtype == torch.bool
+    assert manager.target_valid.tolist() == [[True, True, True, True, False, False]]
+    assert manager.bar_time.shape == (1, 6)
+    assert manager.bar_time.dtype == torch.int64
+    assert len(manager.data_identities) == 1
+    assert manager.data_identities[0].bars == 6
+
+
+def test_parquet_required_bars_is_checked_only_when_explicit(tmp_path: Path) -> None:
+    path = _write_parquet(
+        tmp_path / "EURUSD_H1.parquet", _make_ohlcv_df(periods=3)
+    )
+
+    permissive = ParquetDataManager(path)
+    permissive.load()
+    assert permissive.target_ret.shape == (1, 3)
+
+    strict = ParquetDataManager(path, required_bars=4)
+    with pytest.raises(DataValidationError, match=r"expected.*4.*actual.*3"):
+        strict.load()
+
+
+def test_parquet_validation_precedes_any_row_count_check(tmp_path: Path) -> None:
+    frame = pd.concat(
+        [_make_ohlcv_df(periods=6), _make_ohlcv_df(periods=6).iloc[[0]]],
+        ignore_index=True,
+    )
+    path = _write_parquet(tmp_path / "EURUSD_H1.parquet", frame)
+
+    with pytest.raises(DataValidationError, match="duplicate timestamp"):
+        inspect_parquet_file(path)
+    with pytest.raises(DataValidationError, match="duplicate timestamp"):
+        ParquetDataManager(path, required_bars=7).load()
+
+
+def test_parquet_inspection_uses_timestamp_span_not_h1_bar_constant(
+    tmp_path: Path,
+) -> None:
+    frame = _make_ohlcv_df(periods=2)
+    frame["time"] = pd.to_datetime(
+        ["2025-01-01 00:00:00Z", "2026-01-01 00:00:00Z"], utc=True
+    )
+    path = _write_parquet(tmp_path / "EURUSD_H1.parquet", frame)
+
+    info = inspect_parquet_file(path)
+
+    assert info["bars"] == 2
+    assert info["years_h1"] == pytest.approx(365 / 365.2425, abs=0.01)
+
+
+def test_parquet_fingerprint_is_path_independent(tmp_path: Path) -> None:
+    frame = _make_ohlcv_df()
+    left_path = _write_parquet(tmp_path / "left" / "EURUSD_H1.parquet", frame)
+    right_path = _write_parquet(tmp_path / "right" / "EURUSD_H1.parquet", frame)
+    left = ParquetDataManager(left_path)
+    right = ParquetDataManager(right_path)
+
+    left.load()
+    right.load()
+
+    assert left.data_identities == right.data_identities
+
+
+def test_single_symbol_manager_forwards_mask_time_and_identity(tmp_path: Path) -> None:
+    path = _write_parquet(tmp_path / "EURUSD_H1.parquet", _make_ohlcv_df())
+    multi = ParquetDataManager(path)
+    multi.load()
+
+    single = SingleSymbolDataManager(multi, "EURUSD")
+
+    assert single.target_ret.shape == (1, 6)
+    assert single.target_valid.shape == (1, 6)
+    assert single.bar_time.shape == (1, 6)
+    assert torch.equal(single.target_valid, multi.target_valid)
+    assert torch.equal(single.bar_time, multi.bar_time)
+    assert single.data_identity == multi.data_identities[0]

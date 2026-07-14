@@ -18,6 +18,7 @@ from __future__ import annotations
 import torch
 from loguru import logger
 
+from data_pipeline.validation import DatasetIdentity
 from model_core.features import MT5FeatureEngineer
 
 
@@ -27,9 +28,11 @@ class SingleSymbolDataManager:
     AlphaEngine 调用的接口：
         .feat_tensor   → [1, F, T]  (N=1)
         .target_ret    → [1, T]
+        .target_valid  → bool [1, T]
         .raw_dict      → {field: [1, T]}
         .symbols       → [symbol]
-        .bar_time      → [1]
+        .bar_time      → UTC ns, int64 [1, T]
+        .data_identity → DatasetIdentity
     """
 
     def __init__(self, multi_manager, symbol: str) -> None:
@@ -72,9 +75,18 @@ class SingleSymbolDataManager:
         return full[self._idx:self._idx+1]   # [1, T]
 
     @property
+    def target_valid(self) -> torch.Tensor:
+        full = self._multi.target_valid
+        return full[self._idx:self._idx+1]   # bool [1, T]
+
+    @property
     def bar_time(self) -> torch.Tensor:
         full = self._multi.bar_time
-        return full[self._idx:self._idx+1]   # [1]
+        return full[self._idx:self._idx+1]   # [1, T]
+
+    @property
+    def data_identity(self) -> DatasetIdentity:
+        return self._multi.data_identities[self._idx]
 
     @property
     def symbol(self) -> str:
