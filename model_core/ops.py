@@ -465,7 +465,7 @@ def _signed_sqrt(x: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# 算子列表（追加在既有 47 个之后）
+# 算子列表（追加在既有 44 个 V2 单标算子之后）
 _TASK33_OPERATORS = [
     # 时序求和（arity 1，因果，R2.3）
     ('TS_SUM_5',    lambda x: torch.nan_to_num(_ts_sum(x, 5),  nan=0.0), 1, 5),
@@ -485,7 +485,7 @@ def _register_task33_operators(registry: Registry) -> None:
     """注册 Task 3.3 新增算子（时序求和/极值与幅度变换，R2.3–2.5）。
 
     二元算子（MIN/MAX）经 `_with_shape_check` 包装；一元算子直接注册。
-    追加在既有 47 个算子之后，保持既有算子顺序在前（R2.9, R2.10）。
+    追加在既有 44 个 V2 单标算子之后，保持既有算子顺序在前（R2.9, R2.10）。
     """
     for name, transform, arity, lookback in _TASK33_OPERATORS:
         fn = _with_shape_check(name, transform) if arity >= 2 else transform
