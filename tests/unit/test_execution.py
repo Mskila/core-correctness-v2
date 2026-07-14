@@ -634,6 +634,90 @@ def test_execution_ledger_rejects_inconsistent_pnl_fields(
         build_execution_ledger(result, ["EURUSD"])
 
 
+def test_execution_ledger_rejects_large_cancellation_residuals() -> None:
+    result = replace(
+        _consumer_result(),
+        gross_pnl=torch.tensor(
+            [[1e8, 1e8, 0.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        ),
+        cost=torch.tensor(
+            [[1e8, 1e8, 0.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        ),
+        net_pnl=torch.tensor(
+            [[10.0, -10.0, 0.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        ),
+    )
+
+    with pytest.raises(
+        DataValidationError,
+        match="net_pnl.*gross_pnl.*cost",
+    ):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+def test_execution_ledger_uses_net_ulp_for_cancellation_tolerance() -> None:
+    gross_pnl = torch.tensor(
+        [[100_000_008.0, 100_000_000.0, 0.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    cost = torch.tensor(
+        [[100_000_000.0, 100_000_008.0, 0.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    expected_net = gross_pnl - cost
+    one_ulp_net = expected_net.clone()
+    one_ulp_net[0, :2] = torch.nextafter(
+        expected_net[0, :2],
+        torch.tensor([float("inf"), -float("inf")]),
+    )
+    near_result = replace(
+        _consumer_result(),
+        gross_pnl=gross_pnl,
+        cost=cost,
+        net_pnl=one_ulp_net,
+    )
+
+    assert len(build_execution_ledger(near_result, ["EURUSD"])) == 2
+
+    invalid_net = expected_net.clone()
+    invalid_net[0, :2] = torch.tensor([8.5, -8.5])
+    invalid_result = replace(near_result, net_pnl=invalid_net)
+    with pytest.raises(
+        DataValidationError,
+        match="net_pnl.*gross_pnl.*cost",
+    ):
+        build_execution_ledger(invalid_result, ["EURUSD"])
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.float64],
+    ids=["float16", "float32", "float64"],
+)
+def test_execution_ledger_accepts_legal_execution_pnl_by_dtype(
+    dtype: torch.dtype,
+) -> None:
+    result = run_execution(
+        factors=torch.tensor([[0.2, -0.3, 0.0, 0.0]], dtype=dtype),
+        target_ret=torch.tensor([[1.0, -0.5, 0.0, 0.0]], dtype=dtype),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.125,
+        min_exposure=0.0,
+    )
+
+    ledger = build_execution_ledger(result, ["EURUSD"])
+
+    assert len(ledger) == 2
+    assert sum(row.net_pnl for row in ledger) == pytest.approx(
+        result.net_pnl[result.target_valid].sum().item(),
+        abs=2e-3 if dtype is torch.float16 else 1e-8,
+    )
+
+
 @pytest.mark.parametrize("invalid_symbol", [None, 7, ""])
 def test_execution_ledger_rejects_invalid_symbol(invalid_symbol: object) -> None:
     with pytest.raises(DataValidationError, match="non-empty strings"):
@@ -802,6 +886,31 @@ def test_execution_ledger_ignores_unread_turnover_field(corruption: str) -> None
     else:
         invalid_turnover = torch.zeros((1, 5), dtype=torch.int64)
     result = replace(result, turnover=invalid_turnover)
+
+    ledger = build_execution_ledger(result, ["EURUSD"])
+
+    assert len(ledger) == 2
+    assert sum(row.net_pnl for row in ledger) == pytest.approx(
+        result.net_pnl[result.target_valid].sum().item(),
+        abs=1e-8,
+    )
+
+
+@pytest.mark.parametrize("corruption", ["non_finite", "shape", "dtype"])
+def test_execution_ledger_ignores_unread_final_liquidation_cost(
+    corruption: str,
+) -> None:
+    result = _consumer_result()
+    if corruption == "non_finite":
+        invalid_liquidation_cost = torch.tensor([float("nan")])
+    elif corruption == "shape":
+        invalid_liquidation_cost = torch.zeros((2, 3))
+    else:
+        invalid_liquidation_cost = torch.zeros(1, dtype=torch.int64)
+    result = replace(
+        result,
+        final_liquidation_cost=invalid_liquidation_cost,
+    )
 
     ledger = build_execution_ledger(result, ["EURUSD"])
 

@@ -383,7 +383,7 @@ def _validate_ledger_result(result: ExecutionResult) -> Tensor:
         for value in (result.gross_pnl, result.cost, result.net_pnl)
     )
     comparison_scale = torch.maximum(
-        torch.maximum(valid_gross.abs(), valid_cost.abs()),
+        expected_net.abs(),
         valid_net.abs(),
     )
     tolerance = comparison_scale * (4.0 * comparison_epsilon)
