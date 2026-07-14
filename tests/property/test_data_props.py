@@ -253,6 +253,66 @@ def test_integer_epoch_units_preserve_exact_identity_with_long_gaps(
     assert dataset.gap_count == sum(gap > 1 for gap in gaps)
 
 
+@st.composite
+def _pure_near_epoch_multiple_case(
+    draw: st.DrawFn,
+) -> tuple[list[int], list[int], list[int], int]:
+    unit_ns = draw(st.sampled_from([1_000_000_000, 1_000_000, 1_000, 1]))
+    length = draw(st.integers(min_value=3, max_value=8))
+    gaps = draw(
+        st.lists(
+            st.integers(min_value=2, max_value=32),
+            min_size=length - 1,
+            max_size=length - 1,
+        )
+    )
+    offsets = [0]
+    for gap in gaps:
+        offsets.append(offsets[-1] + gap)
+    base_mode = draw(
+        st.sampled_from(("negative", "epoch_zero", "cross_epoch", "positive"))
+    )
+    if base_mode == "negative":
+        base_ns = -(offsets[-1] + 5) * 3_600_000_000_000
+    elif base_mode == "epoch_zero":
+        base_ns = 0
+    elif base_mode == "cross_epoch":
+        base_ns = -offsets[length // 2] * 3_600_000_000_000
+    else:
+        base_ns = 1_700_000_000_000_000_000
+    semantic_ns = [
+        base_ns + offset * 3_600_000_000_000 for offset in offsets
+    ]
+    encoded = [timestamp_ns // unit_ns for timestamp_ns in semantic_ns]
+    order_mode = draw(st.sampled_from(("forward", "reverse", "rotate")))
+    order = list(range(length))
+    if order_mode == "reverse":
+        order.reverse()
+    elif order_mode == "rotate":
+        pivot = draw(st.integers(min_value=1, max_value=length - 1))
+        order = order[pivot:] + order[:pivot]
+    return encoded, order, semantic_ns, len(gaps)
+
+
+@settings(max_examples=200)
+@given(case=_pure_near_epoch_multiple_case())
+def test_pure_epoch_units_preserve_identity_when_all_gaps_are_multiples(
+    case: tuple[list[int], list[int], list[int], int],
+) -> None:
+    encoded, order, semantic_ns, gap_count = case
+
+    dataset = canonicalize_ohlcv(
+        _make_symbol_df(encoded).iloc[order],
+        symbol="EURUSD",
+        timeframe="H1",
+    )
+
+    assert dataset.frame["time"].astype("int64").tolist() == semantic_ns
+    assert dataset.identity.start_time_ns == semantic_ns[0]
+    assert dataset.identity.end_time_ns == semantic_ns[-1]
+    assert dataset.gap_count == gap_count
+
+
 @settings(max_examples=100)
 @given(
     base_seconds=st.integers(min_value=946_684_800, max_value=2_000_000_000),

@@ -437,6 +437,40 @@ def _has_mixed_cadence_multiple_run(
     return False
 
 
+def _select_pure_cadence_multiple_candidate(
+    candidates: list[tuple[str, list[int], int, bool, bool]],
+    *,
+    nominal_ns: int,
+) -> tuple[str, list[int], int, bool, bool] | None:
+    """Select the finest internally aligned pure-unit cadence candidate."""
+    aligned: list[tuple[int, tuple[str, list[int], int, bool, bool]]] = []
+    plausible_spans: list[int] = []
+    for candidate in candidates:
+        ordered_ns = sorted(candidate[1])
+        if len(ordered_ns) < 2:
+            continue
+        deltas = [
+            current - previous
+            for previous, current in zip(ordered_ns, ordered_ns[1:])
+        ]
+        span = ordered_ns[-1] - ordered_ns[0]
+        if candidate[3] or candidate[4]:
+            plausible_spans.append(span)
+        if all(
+            delta >= nominal_ns and delta % nominal_ns == 0
+            for delta in deltas
+        ):
+            aligned.append((span, candidate))
+
+    if not aligned:
+        return None
+    aligned.sort(key=lambda item: item[0])
+    selected_span, selected = aligned[0]
+    if any(span < selected_span for span in plausible_spans):
+        return None
+    return selected
+
+
 def _numeric_time_to_utc(
     values: pd.Series,
     *,
@@ -505,12 +539,22 @@ def _numeric_time_to_utc(
                     "mixed numeric timestamp units: values require multiple "
                     "epoch units on one cadence lattice"
                 )
-        raise DataValidationError(
-            "ambiguous numeric timestamp unit: cadence does not uniquely "
-            f"identify one epoch unit for timeframe {timeframe}"
-        )
-
-    selected = plausible[0]
+            if best_exact == 0:
+                pure_candidate = _select_pure_cadence_multiple_candidate(
+                    candidates,
+                    nominal_ns=nominal_ns,
+                )
+                if pure_candidate is not None:
+                    plausible = [pure_candidate]
+        if len(plausible) == 1:
+            selected = plausible[0]
+        else:
+            raise DataValidationError(
+                "ambiguous numeric timestamp unit: cadence does not uniquely "
+                f"identify one epoch unit for timeframe {timeframe}"
+            )
+    else:
+        selected = plausible[0]
     if nominal_ns is not None and len(sorted_values) > 1:
         mixed_exact = _best_mixed_unit_cadence(
             sorted_values,

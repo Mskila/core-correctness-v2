@@ -451,6 +451,106 @@ def test_consistent_numeric_timestamp_units_allow_cadence_multiples(
 
 @pytest.mark.parametrize(
     ("unit", "unit_ns"),
+    [
+        ("milliseconds", 1_000_000),
+        ("microseconds", 1_000),
+        ("nanoseconds", 1),
+    ],
+)
+def test_pure_subsecond_epoch_units_allow_negative_triple_cadence(
+    unit: str,
+    unit_ns: int,
+) -> None:
+    semantic_ns = [-6 * _TEST_H1_NS, -3 * _TEST_H1_NS, 0]
+    encoded = [timestamp_ns // unit_ns for timestamp_ns in semantic_ns]
+
+    dataset = canonicalize_ohlcv(
+        _frame_with_numeric_times(encoded),
+        symbol="EURUSD",
+        timeframe="H1",
+    )
+
+    assert dataset.frame["time"].astype("int64").tolist() == semantic_ns
+    assert dataset.identity.start_time_ns == semantic_ns[0]
+    assert dataset.identity.end_time_ns == semantic_ns[-1]
+    assert dataset.gap_count == 2
+
+
+def test_pure_numeric_units_disambiguate_near_epoch_cadence_multiples() -> None:
+    failures: list[tuple[object, ...]] = []
+    cases = 0
+    for unit, unit_ns in _TEST_TIME_UNIT_NS.items():
+        for length in range(3, 9):
+            gap_patterns = [
+                [multiplier] * (length - 1) for multiplier in (2, 3, 4, 7)
+            ]
+            gap_patterns.append(
+                [(2, 3, 4, 7)[index % 4] for index in range(length - 1)]
+            )
+            for gaps in gap_patterns:
+                offsets = [0]
+                for gap in gaps:
+                    offsets.append(offsets[-1] + gap)
+                bases = {
+                    "negative": -(offsets[-1] + 5) * _TEST_H1_NS,
+                    "epoch_zero": 0,
+                    "cross_epoch": -offsets[length // 2] * _TEST_H1_NS,
+                    "positive": 1_700_000_000_000_000_000,
+                }
+                for base_name, base_ns in bases.items():
+                    semantic_ns = [
+                        base_ns + offset * _TEST_H1_NS for offset in offsets
+                    ]
+                    encoded = [value // unit_ns for value in semantic_ns]
+                    orders = [
+                        list(range(length)),
+                        list(reversed(range(length))),
+                        list(range(1, length)) + [0],
+                    ]
+                    expected_identity = None
+                    for order_name, order in zip(
+                        ("forward", "reverse", "rotate"),
+                        orders,
+                    ):
+                        cases += 1
+                        frame = _frame_with_numeric_times(encoded).iloc[order]
+                        try:
+                            dataset = canonicalize_ohlcv(
+                                frame,
+                                symbol="EURUSD",
+                                timeframe="H1",
+                            )
+                            assert (
+                                dataset.frame["time"].astype("int64").tolist()
+                                == semantic_ns
+                            )
+                            assert dataset.identity.start_time_ns == semantic_ns[0]
+                            assert dataset.identity.end_time_ns == semantic_ns[-1]
+                            assert dataset.gap_count == len(gaps)
+                            if expected_identity is None:
+                                expected_identity = dataset.identity
+                            else:
+                                assert dataset.identity == expected_identity
+                        except (AssertionError, DataValidationError) as exc:
+                            failures.append(
+                                (
+                                    unit,
+                                    length,
+                                    tuple(gaps),
+                                    base_name,
+                                    order_name,
+                                    str(exc),
+                                )
+                            )
+
+    assert cases == 1_440
+    assert not failures, (
+        f"pure-unit failures: {len(failures)}/1440; {failures[:5]}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("unit", "unit_ns"),
     list(_TEST_TIME_UNIT_NS.items()),
 )
 def test_consistent_numeric_units_allow_long_irregular_sequences(
