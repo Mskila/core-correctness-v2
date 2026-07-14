@@ -3,7 +3,7 @@ model_core/features.py -- Core Correctness V2 single-symbol feature library.
 
 Output: [N, F, T], all finite; F is derived from FEATURE_REGISTRY.
 
-注册化重构（task 5.1）：V2 单标的特征以 `FeatureSpec(name, category, compute)`
+注册化重构（task 5.1）：V2 单标的特征以 `FeatureSpec(name, category, compute, lookback)`
 声明条目注册进模块级 `FEATURE_REGISTRY`；`compute_features()` 按注册顺序执行
 每个特征的 compute 并堆叠为 [N, F, T]。计算逻辑与顺序与重构前逐元素一致。
 每个 compute 的签名为 `(raw_dict: dict) -> Tensor[N, T]`。

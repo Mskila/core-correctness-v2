@@ -3,7 +3,7 @@ model_core/ops.py -- 算子库（Operator_Library, R2）
 
 本模块把历史上手工维护的 `OPS_CONFIG` 列表迁移为由声明式注册层
 （`model_core.registry.Registry`）驱动的 `OPERATOR_REGISTRY`。所有算子先以
-`OperatorSpec(name, arity, transform)` 注册进 `OPERATOR_REGISTRY`，`OPS_CONFIG`
+`OperatorSpec(name, arity, transform, lookback)` 注册进 `OPERATOR_REGISTRY`，`OPS_CONFIG`
 随后作为「导出视图」由注册表派生（`[(name, transform, arity), ...]`），保持对
 下游 `vocab.py` / `vm.py` 的 import 兼容与既有元组结构。
 
