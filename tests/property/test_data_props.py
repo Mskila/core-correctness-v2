@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import product
 import math
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,51 @@ import torch
 from data_pipeline.data_manager import MT5DataManager, compute_forward_open_returns
 from data_pipeline.validation import canonicalize_ohlcv
 from model_core.semantics import DataValidationError
+
+
+_H1_NS = 3_600_000_000_000
+_TIME_UNIT_NS = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000, "ns": 1}
+
+
+def _brute_mixed_numeric_interpretation(
+    values: list[int],
+) -> tuple[str, ...] | None:
+    """Exhaust per-row units independently of the production matching DP."""
+    candidates: list[list[tuple[str, int]]] = []
+    for value in values:
+        row = []
+        for unit, scale in _TIME_UNIT_NS.items():
+            timestamp_ns = value * scale
+            if pd.Timestamp.min.value <= timestamp_ns <= pd.Timestamp.max.value:
+                row.append((unit, timestamp_ns))
+        candidates.append(row)
+    common_remainders = set.intersection(
+        *[
+            {timestamp_ns % _H1_NS for _unit, timestamp_ns in row}
+            for row in candidates
+        ]
+    )
+    for remainder in common_remainders:
+        aligned = [
+            [
+                option
+                for option in row
+                if option[1] % _H1_NS == remainder
+            ]
+            for row in candidates
+        ]
+        for assignment in product(*aligned):
+            colors = {
+                unit
+                for value, (unit, _timestamp_ns) in zip(values, assignment)
+                if value != 0
+            }
+            if len(colors) < 2:
+                continue
+            timestamps_ns = [timestamp_ns for _unit, timestamp_ns in assignment]
+            if len(set(timestamps_ns)) == len(timestamps_ns):
+                return tuple(unit for unit, _timestamp_ns in assignment)
+    return None
 
 
 def _make_fake_rates(n: int = 5) -> np.ndarray:
@@ -149,10 +195,12 @@ def multi_symbol_dfs(draw) -> dict[str, pd.DataFrame]:
             base_ts + (common_size + (idx + 1) * 10 + offset) * 3600
             for offset in range(suffix)
         ]
-        frames[f"SYM{idx}"] = _make_symbol_df(
+        frame = _make_symbol_df(
             sorted(unique_prefix + common + unique_suffix),
             base_price=100.0 + idx * 100.0,
         )
+        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        frames[f"SYM{idx}"] = frame
     return frames
 
 
@@ -168,8 +216,8 @@ def test_alignment_keeps_exact_real_intersection_without_future_fill(
     manager.load(list(frames))
 
     source_sets = [set(frame["time"].tolist()) for frame in frames.values()]
-    expected_seconds = set.intersection(*source_sets)
-    expected_ns = {value * 1_000_000_000 for value in expected_seconds}
+    expected_times = set.intersection(*source_sets)
+    expected_ns = {int(value.value) for value in expected_times}
     actual_ns = set(manager.bar_time[0].tolist())
     assert actual_ns == expected_ns
     assert manager.bar_time.shape == manager.target_ret.shape
@@ -189,6 +237,12 @@ def test_alignment_keeps_exact_real_intersection_without_future_fill(
 def test_canonicalization_never_invents_timestamps(offsets: list[int]) -> None:
     timestamps = [1_700_000_000 + offset * 3600 for offset in offsets]
     frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=17)
+    witness = _brute_mixed_numeric_interpretation(timestamps)
+
+    if witness is not None:
+        with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+        return
 
     result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
@@ -246,6 +300,12 @@ def test_integer_epoch_units_preserve_exact_identity_with_long_gaps(
         offsets.append(offsets[-1] + gap)
     timestamps = [base + offset * cadence for offset in offsets]
     frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=23)
+    witness = _brute_mixed_numeric_interpretation(timestamps)
+
+    if witness is not None:
+        with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+        return
 
     dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
@@ -303,9 +363,16 @@ def test_pure_epoch_units_preserve_identity_when_all_gaps_are_multiples(
     case: tuple[list[int], list[int], list[int], int],
 ) -> None:
     encoded, order, semantic_ns, gap_count = case
+    frame = _make_symbol_df(encoded).iloc[order]
+    witness = _brute_mixed_numeric_interpretation(encoded)
+
+    if witness is not None:
+        with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+        return
 
     dataset = canonicalize_ohlcv(
-        _make_symbol_df(encoded).iloc[order],
+        frame,
         symbol="EURUSD",
         timeframe="H1",
     )

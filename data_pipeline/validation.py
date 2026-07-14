@@ -171,249 +171,87 @@ def _scaled_time_ns(value: int, unit: str) -> int | None:
     return scaled
 
 
-def _complete_row_quotient_matching(
-    candidates_by_row: dict[int, set[int]],
-) -> dict[int, int] | None:
-    """Match every row to a distinct cadence quotient, if possible."""
-    matched_row: dict[int, int] = {}
-    matched_quotient: dict[int, int] = {}
-    for start_row in sorted(
-        candidates_by_row,
-        key=lambda row: len(candidates_by_row[row]),
-    ):
-        pending = deque([start_row])
-        seen_rows = {start_row}
+def _mixed_color_masks_for_component(
+    component_rows: list[int],
+    candidates_by_row: dict[int, list[tuple[int, int]]],
+) -> set[int]:
+    """Enumerate all unit-color masks of complete local quotient matchings."""
+    quotients = sorted(
+        {
+            quotient
+            for row in component_rows
+            for quotient, _unit_bit in candidates_by_row[row]
+        }
+    )
+    quotient_bit = {quotient: 1 << index for index, quotient in enumerate(quotients)}
+    states: dict[int, set[int]] = {0: {0}}
+    for row in sorted(component_rows, key=lambda item: len(candidates_by_row[item])):
+        next_states: dict[int, set[int]] = {}
+        for used_right, color_masks in states.items():
+            for quotient, unit_bit in candidates_by_row[row]:
+                right_bit = quotient_bit[quotient]
+                if used_right & right_bit:
+                    continue
+                destination = next_states.setdefault(used_right | right_bit, set())
+                destination.update(mask | unit_bit for mask in color_masks)
+        states = next_states
+        if not states:
+            return set()
+    return {
+        color_mask
+        for color_masks in states.values()
+        for color_mask in color_masks
+    }
+
+
+def _has_complete_mixed_quotient_matching(
+    candidates_by_row: dict[int, list[tuple[int, int]]],
+) -> bool:
+    """Find a full distinct-quotient matching whose nonzero rows mix units."""
+    rows_by_quotient: dict[int, set[int]] = {}
+    for row, options in candidates_by_row.items():
+        for quotient, _unit_bit in options:
+            rows_by_quotient.setdefault(quotient, set()).add(row)
+
+    remaining_rows = set(candidates_by_row)
+    component_masks: list[set[int]] = []
+    while remaining_rows:
+        start = remaining_rows.pop()
+        component_rows = {start}
+        pending = deque([start])
         seen_quotients: set[int] = set()
-        previous_row_by_quotient: dict[int, int] = {}
-        free_quotient: int | None = None
-        while pending and free_quotient is None:
+        while pending:
             row = pending.popleft()
-            for quotient in sorted(candidates_by_row[row]):
+            for quotient, _unit_bit in candidates_by_row[row]:
                 if quotient in seen_quotients:
                     continue
                 seen_quotients.add(quotient)
-                previous_row_by_quotient[quotient] = row
-                owner = matched_quotient.get(quotient)
-                if owner is None:
-                    free_quotient = quotient
-                    break
-                if owner not in seen_rows:
-                    seen_rows.add(owner)
-                    pending.append(owner)
-        if free_quotient is None:
-            return None
+                for connected_row in rows_by_quotient[quotient]:
+                    if connected_row not in component_rows:
+                        component_rows.add(connected_row)
+                        remaining_rows.discard(connected_row)
+                        pending.append(connected_row)
+        masks = _mixed_color_masks_for_component(
+            sorted(component_rows),
+            candidates_by_row,
+        )
+        if not masks:
+            return False
+        component_masks.append(masks)
 
-        quotient = free_quotient
-        while True:
-            row = previous_row_by_quotient[quotient]
-            previous_quotient = matched_row.get(row)
-            matched_row[row] = quotient
-            matched_quotient[quotient] = row
-            if previous_quotient is None:
-                break
-            quotient = previous_quotient
-    return matched_row
-
-
-def _cadence_quotient_score(quotients: list[int]) -> tuple[int, int]:
-    ordered = sorted(quotients)
-    if len(set(ordered)) != len(ordered):
-        return (-1, 0)
-    exact_count = sum(
-        current - previous == 1
-        for previous, current in zip(ordered, ordered[1:])
-    )
-    return exact_count, -(ordered[-1] - ordered[0])
-
-
-def _has_single_unit_regular_run(
-    candidates_by_row: dict[int, list[tuple[int, int]]],
-) -> bool:
-    candidates_by_unit: dict[int, list[tuple[int, int]]] = {}
-    for row, options in candidates_by_row.items():
-        for quotient, unit_bit in options:
-            if unit_bit:
-                candidates_by_unit.setdefault(unit_bit, []).append((quotient, row))
-    for candidates in candidates_by_unit.values():
-        ordered = sorted(candidates)
-        for index in range(1, len(ordered) - 1):
-            previous_quotient, previous_row = ordered[index - 1]
-            current_quotient, current_row = ordered[index]
-            following_quotient, following_row = ordered[index + 1]
-            cadence_multiple = current_quotient - previous_quotient
-            if (
-                cadence_multiple > 0
-                and following_quotient - current_quotient == cadence_multiple
-                and len({previous_row, current_row, following_row}) == 3
-            ):
-                return True
-    return False
-
-
-def _has_better_single_row_mixed_lattice(
-    candidates_by_row: dict[int, list[tuple[int, int]]],
-    *,
-    common_units: int,
-) -> bool:
-    nonzero_rows = sum(
-        any(unit_bit for _quotient, unit_bit in options)
-        for options in candidates_by_row.values()
-    )
-    if nonzero_rows < 2:
-        return False
-    unit_bit = 1
-    while unit_bit <= common_units:
-        if not common_units & unit_bit:
-            unit_bit <<= 1
-            continue
-        baseline_by_row: dict[int, int] = {}
-        for row, options in candidates_by_row.items():
-            matching = {
-                quotient
-                for quotient, option_unit in options
-                if option_unit in (0, unit_bit)
-            }
-            if len(matching) != 1:
-                break
-            baseline_by_row[row] = matching.pop()
-        else:
-            baseline_score = _cadence_quotient_score(list(baseline_by_row.values()))
-            for row, options in candidates_by_row.items():
-                for quotient, option_unit in options:
-                    if option_unit in (0, unit_bit):
-                        continue
-                    alternative = [
-                        quotient if candidate_row == row else baseline
-                        for candidate_row, baseline in baseline_by_row.items()
-                    ]
-                    if _cadence_quotient_score(alternative) > baseline_score:
-                        return True
-        unit_bit <<= 1
-    return False
-
-
-def _has_compact_isolated_mixed_lattice(
-    candidates_by_row: dict[int, list[tuple[int, int]]],
-    *,
-    selected_span: int,
-    unit_count: int,
-) -> bool:
-    """Find a tighter lattice obtained by changing at most two isolated rows."""
-    for unit_index in range(unit_count):
-        dominant_unit = 1 << unit_index
-        fixed_by_row: dict[int, int] = {}
-        alternatives_by_row: dict[int, list[tuple[int, int]]] = {}
-        optional_alternatives_by_row: dict[int, list[tuple[int, int]]] = {}
-        dominant_rows = 0
-        for row, options in candidates_by_row.items():
-            preferred = {
-                quotient
-                for quotient, unit_bit in options
-                if unit_bit in (0, dominant_unit)
-            }
-            if preferred:
-                if len(preferred) != 1:
-                    break
-                fixed_by_row[row] = preferred.pop()
-                dominant_rows += int(
-                    any(unit_bit == dominant_unit for _quotient, unit_bit in options)
-                )
-                optional_alternatives = sorted(
-                    {
-                        (quotient, unit_bit)
-                        for quotient, unit_bit in options
-                        if unit_bit not in (0, dominant_unit)
-                    }
-                )
-                if optional_alternatives:
-                    optional_alternatives_by_row[row] = optional_alternatives
-            else:
-                alternatives_by_row[row] = sorted(
-                    {
-                        (quotient, unit_bit)
-                        for quotient, unit_bit in options
-                        if unit_bit
-                    }
-                )
-        else:
-            isolated_rows = len(alternatives_by_row)
-            if not 1 <= isolated_rows <= 2:
-                continue
-            if dominant_rows < len(candidates_by_row) - 2:
-                continue
-
-            assignments: list[tuple[tuple[int, int], ...]] = [()]
-            for row in sorted(alternatives_by_row):
-                assignments = [
-                    existing + (option,)
-                    for existing in assignments
-                    for option in alternatives_by_row[row]
-                ]
-            candidate_assignments = [
-                (assignment, None, None)
-                for assignment in assignments
-            ]
-            if isolated_rows == 1:
-                candidate_assignments.extend(
-                    (assignment, row, option)
-                    for assignment in assignments
-                    for row, options in optional_alternatives_by_row.items()
-                    for option in options
-                )
-            for assignment, optional_row, optional_option in candidate_assignments:
-                quotients = [
-                    quotient
-                    for row, quotient in fixed_by_row.items()
-                    if row != optional_row
-                ]
-                quotients.extend(
-                    quotient for quotient, _unit_bit in assignment
-                )
-                if optional_option is not None:
-                    quotients.append(optional_option[0])
-                if len(set(quotients)) != len(quotients):
-                    continue
-                unit_mask = dominant_unit
-                for _quotient, unit_bit in assignment:
-                    unit_mask |= unit_bit
-                if optional_option is not None:
-                    unit_mask |= optional_option[1]
-                if unit_mask.bit_count() <= 1:
-                    continue
-                compact_span = max(quotients) - min(quotients)
-                if compact_span * 2 < selected_span:
-                    return True
-    return False
+    combined_masks = {0}
+    for masks in component_masks:
+        combined_masks = {left | right for left in combined_masks for right in masks}
+    return any(mask.bit_count() > 1 for mask in combined_masks)
 
 
 def _has_mixed_unit_lattice_evidence(
     values: list[int],
     *,
     nominal_ns: int,
-    selected_unit: str | None = None,
 ) -> bool:
-    """Detect mixed-unit evidence across each complete cadence lattice."""
+    """Detect any complete mixed-unit interpretation on one cadence lattice."""
     units = tuple(_TIME_UNIT_NS)
-    selected_span: int | None = None
-    if selected_unit is not None:
-        selected_ns = [
-            _scaled_time_ns(value, selected_unit)
-            for value in values
-        ]
-        if all(timestamp_ns is not None for timestamp_ns in selected_ns):
-            complete_selected_ns = [
-                int(timestamp_ns)
-                for timestamp_ns in selected_ns
-                if timestamp_ns is not None
-            ]
-            if len(
-                {timestamp_ns % nominal_ns for timestamp_ns in complete_selected_ns}
-            ) > 1:
-                selected_quotients = [
-                    timestamp_ns // nominal_ns
-                    for timestamp_ns in complete_selected_ns
-                ]
-                selected_span = max(selected_quotients) - min(selected_quotients)
     lattice: dict[int, dict[int, list[tuple[int, int]]]] = {}
     for row_index, value in enumerate(values):
         for unit_index, unit in enumerate(units):
@@ -427,133 +265,11 @@ def _has_mixed_unit_lattice_evidence(
                 (quotient, unit_bit)
             )
 
-    all_units_mask = (1 << len(units)) - 1
     for candidates_by_row in lattice.values():
         if len(candidates_by_row) != len(values):
             continue
-        common_units = all_units_mask
-        has_nonzero_row = False
-        for options in candidates_by_row.values():
-            row_units = 0
-            for _quotient, unit_bit in options:
-                row_units |= unit_bit
-            if row_units:
-                common_units &= row_units
-                has_nonzero_row = True
-        if not has_nonzero_row:
-            continue
-        if common_units:
-            if selected_unit is None:
-                continue
-            selected_bit = 1 << units.index(selected_unit)
-            if common_units & selected_bit and _has_better_single_row_mixed_lattice(
-                candidates_by_row,
-                common_units=selected_bit,
-            ):
-                return True
-            continue
-        if selected_span is not None and _has_compact_isolated_mixed_lattice(
-            candidates_by_row,
-            selected_span=selected_span,
-            unit_count=len(units),
-        ):
+        if _has_complete_mixed_quotient_matching(candidates_by_row):
             return True
-        quotient_candidates = {
-            row: {quotient for quotient, _unit_bit in options}
-            for row, options in candidates_by_row.items()
-        }
-        matching = _complete_row_quotient_matching(quotient_candidates)
-        if matching is not None and _has_single_unit_regular_run(candidates_by_row):
-            return True
-    return False
-
-
-def _best_mixed_unit_cadence(
-    sorted_values: list[int],
-    *,
-    nominal_ns: int,
-) -> int:
-    units = tuple(_TIME_UNIT_NS)
-    scaled = [
-        [_scaled_time_ns(value, unit) for unit in units]
-        for value in sorted_values
-    ]
-    states: dict[tuple[int, int], int] = {}
-    for unit_index, timestamp_ns in enumerate(scaled[0]):
-        if timestamp_ns is None:
-            continue
-        mask = 0 if sorted_values[0] == 0 else 1 << unit_index
-        states[(unit_index, mask)] = 0
-
-    for row_index in range(1, len(sorted_values)):
-        next_states: dict[tuple[int, int], int] = {}
-        for unit_index, timestamp_ns in enumerate(scaled[row_index]):
-            if timestamp_ns is None:
-                continue
-            unit_bit = 0 if sorted_values[row_index] == 0 else 1 << unit_index
-            for (previous_unit, mask), exact_count in states.items():
-                previous_ns = scaled[row_index - 1][previous_unit]
-                if previous_ns is None:
-                    continue
-                delta = timestamp_ns - previous_ns
-                if delta < nominal_ns:
-                    continue
-                key = (unit_index, mask | unit_bit)
-                score = exact_count + int(delta == nominal_ns)
-                next_states[key] = max(next_states.get(key, -1), score)
-        states = next_states
-        if not states:
-            return -1
-
-    return max(
-        (
-            score
-            for (_unit, mask), score in states.items()
-            if mask.bit_count() > 1
-        ),
-        default=-1,
-    )
-
-
-def _has_mixed_cadence_multiple_run(
-    values: list[int],
-    *,
-    nominal_ns: int,
-) -> bool:
-    """Detect a regular three-bar cadence that requires mixed epoch units."""
-    units = tuple(_TIME_UNIT_NS)
-    lattice: dict[int, dict[int, list[tuple[int, int]]]] = {}
-    for row_index, value in enumerate(values):
-        for unit_index, unit in enumerate(units):
-            timestamp_ns = _scaled_time_ns(value, unit)
-            if timestamp_ns is None:
-                continue
-            remainder = timestamp_ns % nominal_ns
-            quotient = (timestamp_ns - remainder) // nominal_ns
-            unit_bit = 0 if value == 0 else 1 << unit_index
-            lattice.setdefault(remainder, {}).setdefault(quotient, []).append(
-                (row_index, unit_bit)
-            )
-
-    for candidates_by_quotient in lattice.values():
-        quotients = sorted(candidates_by_quotient)
-        for index in range(1, len(quotients) - 1):
-            previous = quotients[index - 1]
-            current = quotients[index]
-            following = quotients[index + 1]
-            cadence_multiple = current - previous
-            if cadence_multiple <= 0 or following - current != cadence_multiple:
-                continue
-            for left_row, left_unit in candidates_by_quotient[previous]:
-                for middle_row, middle_unit in candidates_by_quotient[current]:
-                    if middle_row == left_row:
-                        continue
-                    for right_row, right_unit in candidates_by_quotient[following]:
-                        if right_row in (left_row, middle_row):
-                            continue
-                        unit_mask = left_unit | middle_unit | right_unit
-                        if unit_mask.bit_count() > 1:
-                            return True
     return False
 
 
@@ -604,7 +320,6 @@ def _numeric_time_to_utc(
     if len(set(integers)) != len(integers):
         raise DataValidationError("duplicate timestamp")
 
-    sorted_values = sorted(integers)
     nominal_ns = _TIMEFRAME_NS.get(timeframe)
     candidates: list[tuple[str, list[int], int, bool, bool]] = []
     for unit in _TIME_UNIT_NS:
@@ -637,6 +352,18 @@ def _numeric_time_to_utc(
 
     if not candidates:
         raise DataValidationError("invalid time: timestamp cannot be converted to UTC")
+    if (
+        nominal_ns is not None
+        and len(integers) > 1
+        and _has_mixed_unit_lattice_evidence(
+            integers,
+            nominal_ns=nominal_ns,
+        )
+    ):
+        raise DataValidationError(
+            "mixed numeric timestamp units: values admit multiple epoch units "
+            "on one cadence lattice"
+        )
     best_exact = max(candidate[2] for candidate in candidates)
     if best_exact > 0:
         plausible = [candidate for candidate in candidates if candidate[2] == best_exact]
@@ -646,19 +373,6 @@ def _numeric_time_to_utc(
         ]
     if len(plausible) != 1:
         if nominal_ns is not None:
-            mixed_lattice_evidence = _has_mixed_unit_lattice_evidence(
-                integers,
-                nominal_ns=nominal_ns,
-            )
-            mixed_multiple_run = _has_mixed_cadence_multiple_run(
-                integers,
-                nominal_ns=nominal_ns,
-            )
-            if mixed_lattice_evidence or mixed_multiple_run:
-                raise DataValidationError(
-                    "mixed numeric timestamp units: values require multiple "
-                    "epoch units on one cadence lattice"
-                )
             if best_exact == 0:
                 pure_candidate = _select_pure_cadence_multiple_candidate(
                     candidates,
@@ -675,29 +389,6 @@ def _numeric_time_to_utc(
             )
     else:
         selected = plausible[0]
-    if nominal_ns is not None and len(sorted_values) > 1:
-        mixed_exact = _best_mixed_unit_cadence(
-            sorted_values,
-            nominal_ns=nominal_ns,
-        )
-        mixed_multiple_run = _has_mixed_cadence_multiple_run(
-            integers,
-            nominal_ns=nominal_ns,
-        )
-        mixed_lattice_evidence = _has_mixed_unit_lattice_evidence(
-            integers,
-            nominal_ns=nominal_ns,
-            selected_unit=selected[0],
-        )
-        if (
-            mixed_exact > selected[2]
-            or mixed_multiple_run
-            or mixed_lattice_evidence
-        ):
-            raise DataValidationError(
-                "mixed numeric timestamp units: values align better under "
-                "multiple epoch units"
-            )
 
     return pd.Series(pd.to_datetime(selected[1], unit="ns", utc=True)).astype(
         "datetime64[ns, UTC]"
@@ -739,6 +430,7 @@ def _contains_complex(values: pd.Series) -> bool:
 def _coerce_value_column(values: pd.Series, *, field: str) -> pd.Series:
     if _contains_bool(values):
         raise DataValidationError(f"boolean OHLCV value: field={field}")
+    source_values = values.to_numpy(dtype=object, copy=False)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
@@ -751,6 +443,12 @@ def _coerce_value_column(values: pd.Series, *, field: str) -> pd.Series:
     array = converted.to_numpy(dtype=np.float64, copy=False)
     if not np.isfinite(array).all():
         raise DataValidationError(f"non-finite OHLCV value: field={field}")
+    for source, float_value in zip(source_values, array, strict=True):
+        if isinstance(source, (int, np.integer)) and int(float_value) != int(source):
+            raise DataValidationError(
+                "integer OHLCV value must round-trip exactly through float64: "
+                f"field={field}"
+            )
     return converted
 
 
