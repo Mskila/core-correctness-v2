@@ -61,6 +61,14 @@ def test_factor_to_position_rejects_integer_input() -> None:
         )
 
 
+def test_factor_to_position_rejects_meta_input() -> None:
+    with pytest.raises(DataValidationError, match="CPU or CUDA"):
+        factor_to_position(
+            torch.zeros((1, 2), device="meta"),
+            min_exposure=0.05,
+        )
+
+
 def _hourly_times(length: int) -> torch.Tensor:
     return (
         torch.arange(length, dtype=torch.int64).unsqueeze(0)
@@ -351,7 +359,7 @@ def test_performance_metrics_includes_initial_equity_in_drawdown(
         cost=zeros,
         net_pnl=net_pnl,
         target_valid=valid,
-        bar_time_ns=_hourly_times(4),
+        bar_time_ns=_hourly_times(4) * 24,
         final_liquidation_cost=torch.zeros(1),
     )
 
@@ -477,3 +485,224 @@ def test_execution_ledger_rejects_non_int64_bar_time() -> None:
 
     with pytest.raises(DataValidationError, match="bar_time_ns.*int64"):
         build_execution_ledger(invalid_result, ["EURUSD"])
+
+
+def _consumer_result() -> ExecutionResult:
+    return run_execution(
+        factors=torch.zeros((1, 5)),
+        target_ret=torch.zeros((1, 5)),
+        target_valid=torch.tensor([[True, True, False, False, False]]),
+        bar_time_ns=_hourly_times(5),
+        cost_rate=0.0,
+        min_exposure=0.05,
+    )
+
+
+def test_execution_ledger_rejects_non_prefix_result_mask() -> None:
+    result = replace(
+        _consumer_result(),
+        target_valid=torch.tensor([[True, False, True, False, False]]),
+        net_pnl=torch.tensor([[1.0, 100.0, 2.0, 0.0, 0.0]]),
+    )
+
+    with pytest.raises(DataValidationError, match="continuous prefix"):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+def test_performance_metrics_rejects_result_shape_mismatch_before_indexing() -> None:
+    result = replace(
+        _consumer_result(),
+        net_pnl=torch.tensor([[1.0, 1.0]]),
+    )
+
+    with pytest.raises(DataValidationError, match="net_pnl.*shape"):
+        performance_metrics(result)
+
+
+def test_performance_metrics_rejects_non_floating_net_pnl() -> None:
+    result = replace(
+        _consumer_result(),
+        net_pnl=torch.zeros((1, 5), dtype=torch.int64),
+    )
+
+    with pytest.raises(DataValidationError, match="net_pnl.*floating-point"):
+        performance_metrics(result)
+
+
+def test_performance_metrics_rejects_result_device_mismatch() -> None:
+    result = replace(
+        _consumer_result(),
+        net_pnl=torch.zeros((1, 5), device="meta"),
+    )
+
+    with pytest.raises(DataValidationError, match="same device"):
+        performance_metrics(result)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["position", "turnover", "gross_pnl", "cost", "net_pnl"],
+)
+def test_execution_ledger_rejects_result_field_shape_mismatch(
+    field_name: str,
+) -> None:
+    result = replace(
+        _consumer_result(),
+        **{field_name: torch.zeros((1, 2))},
+    )
+
+    with pytest.raises(DataValidationError, match=rf"{field_name}.*shape"):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["position", "turnover", "gross_pnl", "cost", "net_pnl"],
+)
+def test_execution_ledger_rejects_non_floating_result_field(
+    field_name: str,
+) -> None:
+    result = replace(
+        _consumer_result(),
+        **{field_name: torch.zeros((1, 5), dtype=torch.int64)},
+    )
+
+    with pytest.raises(DataValidationError, match=rf"{field_name}.*floating-point"):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["position", "turnover", "gross_pnl", "cost", "net_pnl"],
+)
+def test_execution_ledger_rejects_result_field_device_mismatch(
+    field_name: str,
+) -> None:
+    result = replace(
+        _consumer_result(),
+        **{field_name: torch.zeros((1, 5), device="meta")},
+    )
+
+    with pytest.raises(DataValidationError, match=rf"{field_name}.*same device"):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+def test_performance_metrics_rejects_unrepresentable_equity_path() -> None:
+    seconds_per_year = 365.2425 * 24 * 3_600
+    two_years_ns = round(2 * seconds_per_year * 1_000_000_000)
+    result = replace(
+        _consumer_result(),
+        net_pnl=torch.tensor(
+            [[-8e307, -8e307, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=torch.tensor(
+            [[0, 0, two_years_ns // 2, two_years_ns]],
+            dtype=torch.int64,
+        ),
+    )
+
+    with pytest.raises(DataValidationError, match="representable equity"):
+        performance_metrics(result)
+
+
+def test_derive_periods_per_year_rejects_int64_wraparound_span() -> None:
+    times = torch.tensor(
+        [[0, torch.iinfo(torch.int64).max, 0, torch.iinfo(torch.int64).min]],
+        dtype=torch.int64,
+    )
+
+    with pytest.raises(DataValidationError, match="positive"):
+        derive_periods_per_year(
+            times,
+            torch.tensor([[True, True, False, False]]),
+        )
+
+
+def test_turnover_cost_keeps_factor_gradient_when_returns_are_zero() -> None:
+    factors = torch.tensor([[0.2, 0.4, 0.0, 0.0]], requires_grad=True)
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.zeros((1, 4)),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.1,
+        min_exposure=0.0,
+    )
+
+    result.net_pnl[0, 0].backward()
+
+    assert factors.grad is not None
+    assert factors.grad[0, 0].abs() > 0
+
+
+def test_final_liquidation_cost_keeps_factor_gradient_when_returns_are_zero() -> None:
+    factors = torch.tensor([[0.2, 0.2, 0.0, 0.0]], requires_grad=True)
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.zeros((1, 4)),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.1,
+        min_exposure=0.0,
+    )
+
+    result.net_pnl[0, 1].backward()
+
+    assert factors.grad is not None
+    assert factors.grad[0, 1].abs() > 0
+
+
+def test_execution_rejects_all_meta_inputs() -> None:
+    with pytest.raises(DataValidationError, match="CPU or CUDA"):
+        run_execution(
+            factors=torch.zeros((1, 4), device="meta"),
+            target_ret=torch.zeros((1, 4), device="meta"),
+            target_valid=torch.tensor(
+                [[True, True, False, False]],
+                device="meta",
+            ),
+            bar_time_ns=torch.arange(4, dtype=torch.int64, device="meta")
+            .unsqueeze(0),
+            cost_rate=0.0,
+            min_exposure=0.05,
+        )
+
+
+def test_multi_symbol_prefixes_reconcile_ledger_and_metrics() -> None:
+    factors = torch.tensor(
+        [
+            [0.2, -0.3, 0.0, 0.0, 0.0, 0.0],
+            [0.1, 0.4, -0.2, 0.0, 0.0, 0.0],
+        ]
+    )
+    target_valid = torch.tensor(
+        [
+            [True, True, False, False, False, False],
+            [True, True, True, False, False, False],
+        ]
+    )
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.tensor(
+            [
+                [0.01, -0.02, 0.0, 0.0, 0.0, 0.0],
+                [0.03, -0.01, 0.02, 0.0, 0.0, 0.0],
+            ]
+        ),
+        target_valid=target_valid,
+        bar_time_ns=_hourly_times(6).expand(2, -1).clone(),
+        cost_rate=0.001,
+        min_exposure=0.05,
+    )
+
+    ledger = build_execution_ledger(result, ["EURUSD", "GBPUSD"])
+    metrics = performance_metrics(result)
+
+    assert len(ledger) == 5
+    assert sum(row.net_pnl for row in ledger) == pytest.approx(
+        result.net_pnl[target_valid].sum().item(),
+        abs=1e-8,
+    )
+    assert metrics.observations == 5
