@@ -16,9 +16,9 @@ from data_pipeline.validation import (
     DatasetIdentity,
     assert_minimum_bars,
     canonicalize_ohlcv,
+    float32_ohlcv_arrays,
 )
 from model_core.features import MT5FeatureEngineer
-from model_core.semantics import DataValidationError
 
 
 _TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1")
@@ -54,6 +54,7 @@ def inspect_parquet_file(path: str | Path) -> dict[str, Any]:
         symbol=symbol,
         timeframe=timeframe,
     )
+    float32_ohlcv_arrays(dataset.frame)
     span_seconds = (
         dataset.identity.end_time_ns - dataset.identity.start_time_ns
     ) / 1_000_000_000
@@ -109,19 +110,11 @@ class ParquetDataManager:
             )
 
         frame = dataset.frame
+        converted = float32_ohlcv_arrays(frame)
         raw = {
-            field: torch.tensor(
-                frame[field].to_numpy(dtype=np.float64)[None, :],
-                dtype=torch.float32,
-            )
+            field: torch.from_numpy(converted[field][None, :].copy())
             for field in ("open", "high", "low", "close", "volume")
         }
-        for field in ("open", "high", "low", "close", "volume"):
-            if not torch.isfinite(raw[field]).all():
-                raise DataValidationError(
-                    "OHLCV values must remain finite after float32 conversion: "
-                    f"field={field}"
-                )
         raw["time"] = torch.tensor(
             frame["time"].astype("int64").to_numpy(dtype=np.int64)[None, :],
             dtype=torch.int64,
@@ -153,7 +146,10 @@ class ParquetDataManager:
     @property
     def raw_dict(self) -> dict[str, torch.Tensor]:
         self._ensure_loaded()
-        return self._raw_dict  # type: ignore[return-value]
+        return {
+            field: values.clone()
+            for field, values in self._raw_dict.items()  # type: ignore[union-attr]
+        }
 
     @property
     def feat_tensor(self) -> torch.Tensor:
@@ -162,16 +158,17 @@ class ParquetDataManager:
     @property
     def target_ret(self) -> torch.Tensor:
         self._ensure_loaded()
-        return self._target_ret  # type: ignore[return-value]
+        return self._target_ret.clone()  # type: ignore[union-attr]
 
     @property
     def target_valid(self) -> torch.Tensor:
         self._ensure_loaded()
-        return self._target_valid  # type: ignore[return-value]
+        return self._target_valid.clone()  # type: ignore[union-attr]
 
     @property
     def bar_time(self) -> torch.Tensor:
-        return self.raw_dict["time"]
+        self._ensure_loaded()
+        return self._raw_dict["time"].clone()  # type: ignore[index]
 
     @property
     def data_identities(self) -> tuple[DatasetIdentity, ...]:

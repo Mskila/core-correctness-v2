@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -168,6 +169,47 @@ def test_epoch_zero_is_unit_neutral_for_consistent_early_milliseconds() -> None:
     assert len(result.frame) == 3
 
 
+@pytest.mark.parametrize(
+    "milliseconds",
+    [
+        [0, 3_600_000, 7_200_000],
+        [-7_200_000, -3_600_000, 0],
+    ],
+)
+def test_numeric_time_unit_uses_h1_cadence_for_epoch_milliseconds(
+    milliseconds: list[int],
+) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = milliseconds
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected = pd.to_datetime(milliseconds, unit="ms", utc=True).astype(
+        "datetime64[ns, UTC]"
+    )
+    expected_ns = sorted(expected.astype("int64").tolist())
+    assert result.frame["time"].astype("int64").tolist() == expected_ns
+    assert result.identity.start_time_ns == expected_ns[0]
+    assert result.identity.end_time_ns == expected_ns[-1]
+    assert result.gap_count == 0
+
+
+def test_numeric_time_unit_preserves_epoch_seconds_with_h1_cadence() -> None:
+    frame = valid_frame().iloc[:3].copy()
+    seconds = [0, 3_600, 7_200]
+    frame["time"] = seconds
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected = pd.to_datetime(seconds, unit="s", utc=True).astype(
+        "datetime64[ns, UTC]"
+    )
+    assert result.frame["time"].astype("int64").tolist() == expected.astype(
+        "int64"
+    ).tolist()
+    assert result.gap_count == 0
+
+
 def test_long_gap_is_counted_without_synthesizing_bars() -> None:
     frame = valid_frame().drop(index=[2, 3]).reset_index(drop=True)
 
@@ -247,3 +289,13 @@ def test_assert_minimum_bars_reports_expected_and_actual() -> None:
         match=r"unit fixture.*expected.*6.*actual.*5",
     ):
         assert_minimum_bars(5, 6, context="unit fixture")
+
+
+def test_complex_ohlcv_is_rejected_before_float_coercion() -> None:
+    frame = valid_frame()
+    frame["open"] = frame["open"].astype("complex128") + 1j
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", np.exceptions.ComplexWarning)
+        with pytest.raises(DataValidationError, match=r"complex.*field=open"):
+            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")

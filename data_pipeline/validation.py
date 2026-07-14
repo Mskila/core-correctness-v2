@@ -106,7 +106,27 @@ def assert_minimum_bars(actual: int, required: int, *, context: str) -> None:
         )
 
 
-def _numeric_time_to_utc(values: pd.Series) -> pd.Series:
+def _convert_numeric_time(
+    numeric: pd.Series,
+    *,
+    unit: str,
+) -> pd.Series | None:
+    try:
+        converted = pd.Series(
+            pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
+        )
+        if converted.isna().any():
+            return None
+        return converted.astype("datetime64[ns, UTC]")
+    except (OverflowError, ValueError, pd.errors.OutOfBoundsDatetime):
+        return None
+
+
+def _numeric_time_to_utc(
+    values: pd.Series,
+    *,
+    timeframe: str,
+) -> pd.Series:
     numeric = pd.to_numeric(values, errors="coerce")
     numeric_array = numeric.to_numpy(dtype=np.float64, copy=False)
     if not np.isfinite(numeric_array).all():
@@ -140,6 +160,34 @@ def _numeric_time_to_utc(values: pd.Series) -> pd.Series:
             f"inferred {counts}; values must use one epoch unit"
         )
 
+    nominal_ns = _TIMEFRAME_NS.get(timeframe)
+    if nominal_ns is not None and len(numeric_array) > 1:
+        candidates: list[tuple[str, pd.Series, int]] = []
+        for unit in ("s", "ms", "us", "ns"):
+            converted = _convert_numeric_time(numeric, unit=unit)
+            if converted is None:
+                continue
+            converted_ns = np.sort(
+                converted.astype("int64").to_numpy(dtype=np.int64, copy=False)
+            )
+            deltas = np.diff(converted_ns)
+            if (deltas <= 0).any() or (deltas < nominal_ns).any():
+                continue
+            exact_cadence = int(np.count_nonzero(deltas == nominal_ns))
+            candidates.append((unit, converted, exact_cadence))
+
+        if candidates:
+            best_score = max(candidate[2] for candidate in candidates)
+            best = [candidate for candidate in candidates if candidate[2] == best_score]
+            if best_score > 0 and len(best) == 1:
+                return best[0][1]
+            if len(candidates) == 1:
+                return candidates[0][1]
+            raise DataValidationError(
+                "ambiguous numeric timestamp unit: cadence does not uniquely "
+                f"identify one epoch unit for timeframe {timeframe}"
+            )
+
     if max_abs < 100_000_000_000:
         unit = "s"
     elif max_abs < 100_000_000_000_000:
@@ -148,17 +196,50 @@ def _numeric_time_to_utc(values: pd.Series) -> pd.Series:
         unit = "us"
     else:
         unit = "ns"
-    return pd.Series(pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce"))
+    converted = _convert_numeric_time(numeric, unit=unit)
+    if converted is None:
+        raise DataValidationError("invalid time: timestamp cannot be converted to UTC")
+    return converted
 
 
-def _to_utc_time(values: pd.Series) -> pd.Series:
+def _to_utc_time(values: pd.Series, *, timeframe: str) -> pd.Series:
     if pd.api.types.is_numeric_dtype(values.dtype):
-        converted = _numeric_time_to_utc(values)
+        converted = _numeric_time_to_utc(values, timeframe=timeframe)
     else:
         converted = pd.Series(pd.to_datetime(values, utc=True, errors="coerce"))
     if converted.isna().any():
         raise DataValidationError("invalid time: timestamp cannot be converted to UTC")
     return converted.astype("datetime64[ns, UTC]")
+
+
+def _contains_complex(values: pd.Series) -> bool:
+    array = values.to_numpy(copy=False)
+    if np.iscomplexobj(array):
+        return True
+    return any(
+        isinstance(value, (complex, np.complexfloating)) for value in array
+    )
+
+
+def float32_ohlcv_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Convert canonical OHLCV values to float32 without silent value loss."""
+    converted: dict[str, np.ndarray] = {}
+    for field in _VALUE_COLUMNS:
+        source = frame[field].to_numpy(dtype=np.float64, copy=False)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            values = source.astype(np.float32, copy=True)
+        if not np.isfinite(values).all():
+            raise DataValidationError(
+                "OHLCV values must remain finite after float32 conversion: "
+                f"field={field}"
+            )
+        if field != "volume" and np.any((source != 0.0) & (values == 0.0)):
+            raise DataValidationError(
+                "OHLCV values must remain non-zero after float32 conversion: "
+                f"field={field}"
+            )
+        converted[field] = values
+    return converted
 
 
 def _fingerprints(
@@ -215,7 +296,14 @@ def canonicalize_ohlcv(
         raise DataValidationError(f"missing columns: {missing}")
 
     result = result.loc[:, _CANONICAL_COLUMNS].copy()
-    result["time"] = _to_utc_time(result["time"])
+    for column in _CANONICAL_COLUMNS:
+        if _contains_complex(result[column]):
+            raise DataValidationError(f"complex OHLCV value: field={column}")
+
+    result["time"] = _to_utc_time(
+        result["time"],
+        timeframe=canonical_timeframe,
+    )
     if result["time"].duplicated().any():
         raise DataValidationError("duplicate timestamp")
     result = result.sort_values("time", kind="mergesort").reset_index(drop=True)

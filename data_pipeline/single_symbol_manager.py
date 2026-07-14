@@ -76,7 +76,7 @@ class SingleSymbolDataManager:
     def raw_dict(self) -> dict:
         idx = self._resolve_index()
         full = self._multi.raw_dict
-        return {k: v[idx:idx+1] for k, v in full.items()}  # [1, T]
+        return {k: v[idx:idx+1].clone() for k, v in full.items()}  # [1, T]
 
     @property
     def feat_tensor(self) -> torch.Tensor:
@@ -88,19 +88,19 @@ class SingleSymbolDataManager:
     def target_ret(self) -> torch.Tensor:
         idx = self._resolve_index()
         full = self._multi.target_ret
-        return full[idx:idx+1]   # [1, T]
+        return full[idx:idx+1].clone()   # [1, T]
 
     @property
     def target_valid(self) -> torch.Tensor:
         idx = self._resolve_index()
         full = self._multi.target_valid
-        return full[idx:idx+1]   # bool [1, T]
+        return full[idx:idx+1].clone()   # bool [1, T]
 
     @property
     def bar_time(self) -> torch.Tensor:
         idx = self._resolve_index()
         full = self._multi.bar_time
-        return full[idx:idx+1]   # [1, T]
+        return full[idx:idx+1].clone()   # [1, T]
 
     @property
     def data_identity(self) -> DatasetIdentity:

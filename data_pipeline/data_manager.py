@@ -12,6 +12,7 @@ from data_pipeline.fetcher import MT5DataFetcher
 from data_pipeline.validation import (
     DatasetIdentity,
     canonicalize_ohlcv,
+    float32_ohlcv_arrays,
     normalize_timeframe_name,
 )
 from model_core.semantics import DataValidationError, DatasetAlignmentError
@@ -30,13 +31,43 @@ def compute_forward_open_returns(
     if (open_prices <= 0).any():
         raise DataValidationError("open prices must be positive")
 
-    values = torch.zeros_like(open_prices)
-    valid = torch.zeros_like(open_prices, dtype=torch.bool)
-    forward_returns = torch.log(open_prices[:, 2:]) - torch.log(
-        open_prices[:, 1:-1]
+    work_dtype = (
+        torch.float64
+        if open_prices.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        else open_prices.dtype
     )
+    work = open_prices.to(dtype=work_dtype)
+    local_reciprocals = torch.reciprocal(work[:, 1:])
+    if (
+        not torch.isfinite(local_reciprocals).all()
+        or (local_reciprocals > torch.finfo(open_prices.dtype).max).any()
+    ):
+        raise DataValidationError(
+            "open prices cannot guarantee finite gradient in the input dtype"
+        )
+
+    previous = work[:, 1:-1]
+    following = work[:, 2:]
+    difference = following - previous
+    close_values = torch.abs(difference) <= (
+        torch.maximum(previous, following) * 0.5
+    )
+    forward_work = torch.empty_like(previous)
+    if close_values.any():
+        forward_work[close_values] = torch.log1p(
+            difference[close_values] / previous[close_values]
+        )
+    far_values = ~close_values
+    if far_values.any():
+        forward_work[far_values] = (
+            torch.log(following[far_values]) - torch.log(previous[far_values])
+        )
+    forward_returns = forward_work.to(dtype=open_prices.dtype)
     if not torch.isfinite(forward_returns).all():
         raise DataValidationError("valid forward open returns must be finite")
+
+    values = torch.zeros_like(open_prices)
+    valid = torch.zeros_like(open_prices, dtype=torch.bool)
     values[:, :-2] = forward_returns
     valid[:, :-2] = True
     return values, valid
@@ -68,6 +99,13 @@ class MT5DataManager:
         symbol_list = list(symbols) if symbols is not None else list(Config.SYMBOLS)
         if not symbol_list:
             raise DataValidationError("at least one symbol is required")
+        if any(
+            not isinstance(symbol, str) or not symbol.strip()
+            for symbol in symbol_list
+        ):
+            raise DataValidationError("symbols must be unique non-empty strings")
+        if len(set(symbol_list)) != len(symbol_list):
+            raise DataValidationError("duplicate symbols are not allowed")
         self._requested_symbols = list(symbol_list)
         timeframe = normalize_timeframe_name(Config.TIMEFRAME)
         logger.info(f"Loading data for {len(symbol_list)} symbols: {symbol_list}")
@@ -98,12 +136,6 @@ class MT5DataManager:
             symbol: aligned_datasets[symbol].frame for symbol in symbol_list
         }
         raw_dict = self._build_raw_dict(aligned_frames, symbol_list)
-        for field in ("open", "high", "low", "close", "volume"):
-            if not torch.isfinite(raw_dict[field]).all():
-                raise DataValidationError(
-                    "OHLCV values must remain finite after float32 conversion: "
-                    f"field={field}"
-                )
         target_ret, target_valid = compute_forward_open_returns(
             raw_dict["open"]
         )
@@ -133,7 +165,10 @@ class MT5DataManager:
     @property
     def raw_dict(self) -> dict[str, torch.Tensor]:
         self._ensure_loaded()
-        return self._raw_dict  # type: ignore[return-value]
+        return {
+            field: values.clone()
+            for field, values in self._raw_dict.items()  # type: ignore[union-attr]
+        }
 
     @property
     def feat_tensor(self) -> torch.Tensor:
@@ -145,17 +180,17 @@ class MT5DataManager:
     @property
     def target_ret(self) -> torch.Tensor:
         self._ensure_loaded()
-        return self._target_ret  # type: ignore[return-value]
+        return self._target_ret.clone()  # type: ignore[union-attr]
 
     @property
     def target_valid(self) -> torch.Tensor:
         self._ensure_loaded()
-        return self._target_valid  # type: ignore[return-value]
+        return self._target_valid.clone()  # type: ignore[union-attr]
 
     @property
     def bar_time(self) -> torch.Tensor:
         self._ensure_loaded()
-        return self.raw_dict["time"]
+        return self._raw_dict["time"].clone()  # type: ignore[index]
 
     @property
     def data_identities(self) -> tuple[DatasetIdentity, ...]:
@@ -220,11 +255,12 @@ class MT5DataManager:
     ) -> dict[str, torch.Tensor]:
         """Convert aligned canonical frames to ``{field: Tensor[N, T]}``."""
         fields = ("open", "high", "low", "close", "volume")
+        converted = {
+            symbol: float32_ohlcv_arrays(aligned[symbol]) for symbol in symbols
+        }
         raw_dict = {
             field: torch.tensor(
-                np.stack(
-                    [aligned[symbol][field].to_numpy() for symbol in symbols]
-                ),
+                np.stack([converted[symbol][field] for symbol in symbols]),
                 dtype=torch.float32,
             )
             for field in fields

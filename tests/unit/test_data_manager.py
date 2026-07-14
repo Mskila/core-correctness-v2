@@ -46,6 +46,32 @@ def _write_parquet(path: Path, frame: pd.DataFrame) -> Path:
     return path
 
 
+def _assert_public_tensors_are_defensive_copies(manager) -> None:
+    expected_raw = {key: value.clone() for key, value in manager.raw_dict.items()}
+    expected_target = manager.target_ret.clone()
+    expected_valid = manager.target_valid.clone()
+    expected_time = manager.bar_time.clone()
+    expected_features = manager.feat_tensor.clone()
+
+    for value in manager.raw_dict.values():
+        value.fill_(-123)
+    manager.target_ret.fill_(123)
+    manager.target_valid.logical_not_()
+    manager.bar_time.fill_(0)
+    manager.feat_tensor.fill_(123)
+
+    for key, expected in expected_raw.items():
+        assert torch.equal(manager.raw_dict[key], expected)
+    assert torch.equal(manager.target_ret, expected_target)
+    assert torch.equal(manager.target_valid, expected_valid)
+    assert torch.equal(manager.bar_time, expected_time)
+    torch.testing.assert_close(
+        manager.feat_tensor,
+        expected_features,
+        equal_nan=True,
+    )
+
+
 def test_forward_open_returns_use_t1_to_t2_and_mask_tail() -> None:
     opens = torch.tensor([[10.0, 11.0, 12.0, 15.0, 18.0]])
 
@@ -95,6 +121,44 @@ def test_forward_open_returns_are_stable_and_differentiable_for_extreme_ratio() 
     assert returns.device == opens.device
     assert returns[0, 0].item() == pytest.approx(expected, rel=1.0e-6)
     assert torch.isfinite(returns[valid]).all()
+    returns[valid].sum().backward()
+    assert opens.grad is not None
+    assert torch.isfinite(opens.grad).all()
+
+
+def test_forward_open_returns_preserve_adjacent_large_float32_prices() -> None:
+    opens = torch.tensor(
+        [[1.0, 16_777_215.0, 16_777_216.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    returns, valid = compute_forward_open_returns(opens)
+
+    expected = math.log(16_777_216.0 / 16_777_215.0)
+    assert returns[0, 0].item() == pytest.approx(expected, rel=1.0e-6)
+    returns[valid].sum().backward()
+    assert opens.grad is not None
+    assert torch.isfinite(opens.grad).all()
+
+
+def test_forward_open_returns_never_expose_non_finite_local_gradients() -> None:
+    smallest = torch.nextafter(
+        torch.tensor(0.0, dtype=torch.float32),
+        torch.tensor(1.0, dtype=torch.float32),
+    ).item()
+    opens = torch.tensor(
+        [[1.0, smallest, 1.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    try:
+        returns, valid = compute_forward_open_returns(opens)
+    except DataValidationError as exc:
+        assert "gradient" in str(exc)
+        return
+
     returns[valid].sum().backward()
     assert opens.grad is not None
     assert torch.isfinite(opens.grad).all()
@@ -210,6 +274,36 @@ def test_mt5_empty_load_invalidates_previously_loaded_state() -> None:
     assert manager.symbols == ["OK"]
 
 
+def test_mt5_duplicate_symbols_fail_before_fetch_and_clear_loaded_state() -> None:
+    fetcher = _make_mock_fetcher(
+        {
+            "OK": _make_ohlcv_df(periods=4),
+            "DUP": _make_ohlcv_df(periods=4),
+        }
+    )
+    manager = MT5DataManager(fetcher)
+    manager.load(["OK"])
+    fetcher.fetch.reset_mock()
+
+    with pytest.raises(DataValidationError, match="duplicate symbols"):
+        manager.load(["DUP", "DUP"])
+
+    fetcher.fetch.assert_not_called()
+    assert manager.symbols == []
+    for property_name in (
+        "raw_dict",
+        "feat_tensor",
+        "target_ret",
+        "target_valid",
+        "bar_time",
+        "data_identities",
+    ):
+        with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
+            getattr(manager, property_name)
+    manager.reload()
+    assert manager.symbols == ["OK"]
+
+
 @pytest.mark.parametrize(
     "property_name",
     ["raw_dict", "feat_tensor", "target_ret", "target_valid", "bar_time", "data_identities"],
@@ -230,6 +324,15 @@ def test_mt5_manager_fingerprints_are_stable_across_reload() -> None:
     manager.load(["EURUSD"])
 
     assert manager.data_identities == first
+
+
+def test_mt5_public_tensors_are_defensive_copies() -> None:
+    manager = MT5DataManager(
+        _make_mock_fetcher({"EURUSD": _make_ohlcv_df(periods=64)})
+    )
+    manager.load(["EURUSD"])
+
+    _assert_public_tensors_are_defensive_copies(manager)
 
 
 def test_parquet_manager_exposes_same_v2_contract(tmp_path: Path) -> None:
@@ -316,6 +419,8 @@ def test_parquet_float32_overflow_fails_closed_after_reload(
     _write_parquet(path, overflow)
 
     with pytest.raises(DataValidationError, match=r"field=volume"):
+        inspect_parquet_file(path)
+    with pytest.raises(DataValidationError, match=r"field=volume"):
         manager.load()
 
     for property_name in (
@@ -328,6 +433,24 @@ def test_parquet_float32_overflow_fails_closed_after_reload(
     ):
         with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
             getattr(manager, property_name)
+
+
+def test_float32_underflow_is_rejected_by_inspect_and_managers(
+    tmp_path: Path,
+) -> None:
+    underflow = _make_ohlcv_df(periods=4)
+    for field in ("open", "high", "low", "close"):
+        underflow[field] = np.full(4, 1.0e-50, dtype=np.float64)
+    path = _write_parquet(tmp_path / "EURUSD_H1.parquet", underflow)
+
+    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+        inspect_parquet_file(path)
+    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+        ParquetDataManager(path).load()
+
+    mt5 = MT5DataManager(_make_mock_fetcher({"EURUSD": underflow}))
+    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+        mt5.load(["EURUSD"])
 
 
 def test_parquet_inspection_uses_timestamp_span_not_h1_bar_constant(
@@ -358,6 +481,16 @@ def test_parquet_fingerprint_is_path_independent(tmp_path: Path) -> None:
     assert left.data_identities == right.data_identities
 
 
+def test_parquet_public_tensors_are_defensive_copies(tmp_path: Path) -> None:
+    path = _write_parquet(
+        tmp_path / "EURUSD_H1.parquet", _make_ohlcv_df(periods=64)
+    )
+    manager = ParquetDataManager(path)
+    manager.load()
+
+    _assert_public_tensors_are_defensive_copies(manager)
+
+
 def test_single_symbol_manager_forwards_mask_time_and_identity(tmp_path: Path) -> None:
     path = _write_parquet(tmp_path / "EURUSD_H1.parquet", _make_ohlcv_df())
     multi = ParquetDataManager(path)
@@ -371,6 +504,17 @@ def test_single_symbol_manager_forwards_mask_time_and_identity(tmp_path: Path) -
     assert torch.equal(single.target_valid, multi.target_valid)
     assert torch.equal(single.bar_time, multi.bar_time)
     assert single.data_identity == multi.data_identities[0]
+
+
+def test_single_symbol_public_tensors_are_defensive_copies(tmp_path: Path) -> None:
+    path = _write_parquet(
+        tmp_path / "EURUSD_H1.parquet", _make_ohlcv_df(periods=64)
+    )
+    multi = ParquetDataManager(path)
+    multi.load()
+    single = SingleSymbolDataManager(multi, "EURUSD")
+
+    _assert_public_tensors_are_defensive_copies(single)
 
 
 def test_single_symbol_manager_rebinds_by_symbol_after_reorder_and_shrink() -> None:
