@@ -85,12 +85,16 @@ class ParquetDataManager:
         self.file_path = Path(file_path)
         self.symbol, self.timeframe = parse_parquet_filename(self.file_path)
         self.required_bars = required_bars
+        self._clear_loaded_state()
+
+    def _clear_loaded_state(self) -> None:
         self._raw_dict: dict[str, torch.Tensor] | None = None
         self._target_ret: torch.Tensor | None = None
         self._target_valid: torch.Tensor | None = None
         self._data_identities: tuple[DatasetIdentity, ...] | None = None
 
     def load(self) -> None:
+        self._clear_loaded_state()
         dataset = canonicalize_ohlcv(
             pd.read_parquet(self.file_path),
             symbol=self.symbol,
@@ -131,7 +135,12 @@ class ParquetDataManager:
         return [self.symbol]
 
     def _ensure_loaded(self) -> None:
-        if self._raw_dict is None:
+        if (
+            self._raw_dict is None
+            or self._target_ret is None
+            or self._target_valid is None
+            or self._data_identities is None
+        ):
             raise RuntimeError("Data not loaded. Call ParquetDataManager.load() first.")
 
     @property

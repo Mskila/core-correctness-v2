@@ -112,7 +112,33 @@ def _numeric_time_to_utc(values: pd.Series) -> pd.Series:
     if not np.isfinite(numeric_array).all():
         raise DataValidationError("invalid time: non-finite timestamp")
 
-    max_abs = float(np.max(np.abs(numeric_array))) if len(numeric_array) else 0.0
+    absolute = np.abs(numeric_array)
+    max_abs = float(np.max(absolute)) if len(numeric_array) else 0.0
+    inferred = np.select(
+        [
+            absolute < 100_000_000_000,
+            absolute < 100_000_000_000_000,
+            absolute < 100_000_000_000_000_000,
+        ],
+        ["s", "ms", "us"],
+        default="ns",
+    )
+    inferred_units = set(inferred.tolist())
+    positive = absolute[absolute > 0]
+    crosses_near_boundary = (
+        len(positive) == len(absolute)
+        and float(np.max(positive) / np.min(positive)) <= 10.0
+    )
+    if len(inferred_units) > 1 and not crosses_near_boundary:
+        counts = {
+            unit: int(np.count_nonzero(inferred == unit))
+            for unit in sorted(inferred_units)
+        }
+        raise DataValidationError(
+            "mixed numeric timestamp units: "
+            f"inferred {counts}; values must use one epoch unit"
+        )
+
     if max_abs < 100_000_000_000:
         unit = "s"
     elif max_abs < 100_000_000_000_000:

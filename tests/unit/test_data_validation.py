@@ -118,6 +118,36 @@ def test_bar_spacing_shorter_than_timeframe_is_rejected() -> None:
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
+def test_mixed_numeric_timestamp_units_are_rejected() -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = [
+        1_700_000_000,
+        1_700_003_600_000,
+        1_700_007_200_000,
+    ]
+
+    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+def test_consistent_early_milliseconds_can_cross_inference_boundary() -> None:
+    frame = valid_frame().iloc[:3].copy()
+    milliseconds = [
+        99_999_999_000,
+        100_003_599_000,
+        100_007_199_000,
+    ]
+    frame["time"] = milliseconds
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected = pd.to_datetime(milliseconds, unit="ms", utc=True).astype(
+        "datetime64[ns, UTC]"
+    )
+    assert result.frame["time"].tolist() == expected.tolist()
+    assert result.gap_count == 0
+
+
 def test_long_gap_is_counted_without_synthesizing_bars() -> None:
     frame = valid_frame().drop(index=[2, 3]).reset_index(drop=True)
 

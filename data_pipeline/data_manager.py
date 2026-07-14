@@ -32,7 +32,12 @@ def compute_forward_open_returns(
 
     values = torch.zeros_like(open_prices)
     valid = torch.zeros_like(open_prices, dtype=torch.bool)
-    values[:, :-2] = torch.log(open_prices[:, 2:] / open_prices[:, 1:-1])
+    forward_returns = torch.log(open_prices[:, 2:]) - torch.log(
+        open_prices[:, 1:-1]
+    )
+    if not torch.isfinite(forward_returns).all():
+        raise DataValidationError("valid forward open returns must be finite")
+    values[:, :-2] = forward_returns
     valid[:, :-2] = True
     return values, valid
 
@@ -89,17 +94,28 @@ class MT5DataManager:
             for symbol in symbol_list
         }
 
-        self._symbols = symbol_list
         aligned_frames = {
             symbol: aligned_datasets[symbol].frame for symbol in symbol_list
         }
-        self._raw_dict = self._build_raw_dict(aligned_frames)
-        self._target_ret, self._target_valid = compute_forward_open_returns(
-            self._raw_dict["open"]
+        raw_dict = self._build_raw_dict(aligned_frames, symbol_list)
+        for field in ("open", "high", "low", "close", "volume"):
+            if not torch.isfinite(raw_dict[field]).all():
+                raise DataValidationError(
+                    "OHLCV values must remain finite after float32 conversion: "
+                    f"field={field}"
+                )
+        target_ret, target_valid = compute_forward_open_returns(
+            raw_dict["open"]
         )
-        self._data_identities = tuple(
+        data_identities = tuple(
             aligned_datasets[symbol].identity for symbol in symbol_list
         )
+
+        self._symbols = symbol_list
+        self._raw_dict = raw_dict
+        self._target_ret = target_ret
+        self._target_valid = target_valid
+        self._data_identities = data_identities
         logger.info(
             f"Data loaded. raw_dict shape: N={len(self._symbols)}, "
             f"T={self._raw_dict['open'].shape[1]}"
@@ -151,7 +167,13 @@ class MT5DataManager:
         return list(self._symbols)
 
     def _ensure_loaded(self) -> None:
-        if self._raw_dict is None:
+        if (
+            not self._symbols
+            or self._raw_dict is None
+            or self._target_ret is None
+            or self._target_valid is None
+            or self._data_identities is None
+        ):
             raise RuntimeError("Data not loaded. Call MT5DataManager.load() first.")
 
     @staticmethod
@@ -192,14 +214,16 @@ class MT5DataManager:
         return aligned
 
     def _build_raw_dict(
-        self, aligned: dict[str, pd.DataFrame]
+        self,
+        aligned: dict[str, pd.DataFrame],
+        symbols: list[str],
     ) -> dict[str, torch.Tensor]:
         """Convert aligned canonical frames to ``{field: Tensor[N, T]}``."""
         fields = ("open", "high", "low", "close", "volume")
         raw_dict = {
             field: torch.tensor(
                 np.stack(
-                    [aligned[symbol][field].to_numpy() for symbol in self._symbols]
+                    [aligned[symbol][field].to_numpy() for symbol in symbols]
                 ),
                 dtype=torch.float32,
             )
@@ -208,7 +232,7 @@ class MT5DataManager:
         time_rows = np.stack(
             [
                 aligned[symbol]["time"].astype("int64").to_numpy(dtype=np.int64)
-                for symbol in self._symbols
+                for symbol in symbols
             ]
         )
         raw_dict["time"] = torch.tensor(time_rows, dtype=torch.int64)

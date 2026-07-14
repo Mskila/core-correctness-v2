@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -80,6 +81,25 @@ def test_forward_open_returns_reject_invalid_input(opens: torch.Tensor) -> None:
         compute_forward_open_returns(opens)
 
 
+def test_forward_open_returns_are_stable_and_differentiable_for_extreme_ratio() -> None:
+    opens = torch.tensor(
+        [[1.0, 1.0e-30, 1.0e10]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    returns, valid = compute_forward_open_returns(opens)
+
+    expected = math.log(1.0e10) - math.log(1.0e-30)
+    assert returns.dtype == opens.dtype
+    assert returns.device == opens.device
+    assert returns[0, 0].item() == pytest.approx(expected, rel=1.0e-6)
+    assert torch.isfinite(returns[valid]).all()
+    returns[valid].sum().backward()
+    assert opens.grad is not None
+    assert torch.isfinite(opens.grad).all()
+
+
 def test_mt5_manager_uses_only_real_intersection_and_exposes_v2_shapes() -> None:
     frames = {
         "LEFT": _make_ohlcv_df(start="2026-01-01 00:00:00", base_price=100.0),
@@ -139,6 +159,30 @@ def test_mt5_manager_canonicalizes_each_input_before_alignment() -> None:
 
     with pytest.raises(DataValidationError, match="duplicate timestamp"):
         manager.load(["EURUSD"])
+
+
+def test_mt5_load_failure_after_tensor_conversion_leaves_manager_unloaded() -> None:
+    frame = _make_ohlcv_df(periods=4)
+    frame["open"] = 1.0e40
+    frame["high"] = 1.1e40
+    frame["low"] = 0.9e40
+    frame["close"] = 1.05e40
+    manager = MT5DataManager(_make_mock_fetcher({"BIG": frame}))
+
+    with pytest.raises(DataValidationError, match="finite|float32"):
+        manager.load(["BIG"])
+
+    assert manager.symbols == []
+    for property_name in (
+        "raw_dict",
+        "feat_tensor",
+        "target_ret",
+        "target_valid",
+        "bar_time",
+        "data_identities",
+    ):
+        with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
+            getattr(manager, property_name)
 
 
 @pytest.mark.parametrize(
@@ -206,6 +250,33 @@ def test_parquet_validation_precedes_any_row_count_check(tmp_path: Path) -> None
         ParquetDataManager(path, required_bars=7).load()
 
 
+def test_parquet_failed_reload_invalidates_previously_loaded_state(
+    tmp_path: Path,
+) -> None:
+    path = _write_parquet(tmp_path / "EURUSD_H1.parquet", _make_ohlcv_df())
+    manager = ParquetDataManager(path)
+    manager.load()
+    duplicate = pd.concat(
+        [_make_ohlcv_df(), _make_ohlcv_df().iloc[[0]]],
+        ignore_index=True,
+    )
+    _write_parquet(path, duplicate)
+
+    with pytest.raises(DataValidationError, match="duplicate timestamp"):
+        manager.load()
+
+    for property_name in (
+        "raw_dict",
+        "feat_tensor",
+        "target_ret",
+        "target_valid",
+        "bar_time",
+        "data_identities",
+    ):
+        with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
+            getattr(manager, property_name)
+
+
 def test_parquet_inspection_uses_timestamp_span_not_h1_bar_constant(
     tmp_path: Path,
 ) -> None:
@@ -247,3 +318,54 @@ def test_single_symbol_manager_forwards_mask_time_and_identity(tmp_path: Path) -
     assert torch.equal(single.target_valid, multi.target_valid)
     assert torch.equal(single.bar_time, multi.bar_time)
     assert single.data_identity == multi.data_identities[0]
+
+
+def test_single_symbol_manager_rebinds_by_symbol_after_reorder_and_shrink() -> None:
+    frames = {
+        "LEFT": _make_ohlcv_df(periods=4, base_price=100.0),
+        "RIGHT": _make_ohlcv_df(periods=4, base_price=200.0),
+    }
+    multi = MT5DataManager(_make_mock_fetcher(frames))
+    multi.load(["LEFT", "RIGHT"])
+    single = SingleSymbolDataManager(multi, "RIGHT")
+    assert single.raw_dict["open"][0, 0].item() == 200.0
+    assert single.data_identity.symbol == "RIGHT"
+
+    multi.load(["RIGHT", "LEFT"])
+    assert single.raw_dict["open"][0, 0].item() == 200.0
+    assert torch.equal(single.target_ret, multi.target_ret[0:1])
+    assert torch.equal(single.target_valid, multi.target_valid[0:1])
+    assert torch.equal(single.bar_time, multi.bar_time[0:1])
+    assert single.data_identity == multi.data_identities[0]
+
+    multi.load(["RIGHT"])
+    assert single.raw_dict["open"].shape == (1, 4)
+    assert single.raw_dict["open"][0, 0].item() == 200.0
+    assert single.data_identity.symbol == "RIGHT"
+
+
+@pytest.mark.parametrize(
+    "property_name",
+    [
+        "raw_dict",
+        "feat_tensor",
+        "target_ret",
+        "target_valid",
+        "bar_time",
+        "data_identity",
+    ],
+)
+def test_single_symbol_manager_rejects_access_after_symbol_is_removed(
+    property_name: str,
+) -> None:
+    frames = {
+        "LEFT": _make_ohlcv_df(periods=4, base_price=100.0),
+        "RIGHT": _make_ohlcv_df(periods=4, base_price=200.0),
+    }
+    multi = MT5DataManager(_make_mock_fetcher(frames))
+    multi.load(["LEFT", "RIGHT"])
+    single = SingleSymbolDataManager(multi, "RIGHT")
+    multi.load(["LEFT"])
+
+    with pytest.raises(DataValidationError, match=r"RIGHT.*not available"):
+        getattr(single, property_name)

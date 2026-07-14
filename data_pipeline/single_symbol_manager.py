@@ -20,6 +20,7 @@ from loguru import logger
 
 from data_pipeline.validation import DatasetIdentity
 from model_core.features import MT5FeatureEngineer
+from model_core.semantics import DataValidationError
 
 
 class SingleSymbolDataManager:
@@ -42,15 +43,28 @@ class SingleSymbolDataManager:
             symbol:        要切片的品种名，必须在 multi_manager.symbols 中。
         """
         if symbol not in multi_manager.symbols:
-            raise ValueError(
-                f"Symbol '{symbol}' not found in multi_manager.symbols: "
+            raise DataValidationError(
+                f"Symbol '{symbol}' is not available in multi_manager.symbols: "
                 f"{multi_manager.symbols}"
             )
         self._multi  = multi_manager
         self._symbol = symbol
-        self._idx    = multi_manager.symbols.index(symbol)
 
-        logger.info(f"[SingleSymbolDataManager] symbol={symbol}  idx={self._idx}")
+        logger.info(
+            f"[SingleSymbolDataManager] symbol={symbol}  "
+            f"idx={multi_manager.symbols.index(symbol)}"
+        )
+
+    def _resolve_index(self) -> int:
+        """Resolve the symbol against the manager's current ordering."""
+        symbols = self._multi.symbols
+        try:
+            return symbols.index(self._symbol)
+        except ValueError as exc:
+            raise DataValidationError(
+                f"Symbol '{self._symbol}' is not available in current manager "
+                f"symbols: {symbols}"
+            ) from exc
 
     # ── AlphaEngine 所需接口 ──────────────────────────────────────────────
 
@@ -60,8 +74,9 @@ class SingleSymbolDataManager:
 
     @property
     def raw_dict(self) -> dict:
+        idx = self._resolve_index()
         full = self._multi.raw_dict
-        return {k: v[self._idx:self._idx+1] for k, v in full.items()}  # [1, T]
+        return {k: v[idx:idx+1] for k, v in full.items()}  # [1, T]
 
     @property
     def feat_tensor(self) -> torch.Tensor:
@@ -71,22 +86,26 @@ class SingleSymbolDataManager:
 
     @property
     def target_ret(self) -> torch.Tensor:
+        idx = self._resolve_index()
         full = self._multi.target_ret
-        return full[self._idx:self._idx+1]   # [1, T]
+        return full[idx:idx+1]   # [1, T]
 
     @property
     def target_valid(self) -> torch.Tensor:
+        idx = self._resolve_index()
         full = self._multi.target_valid
-        return full[self._idx:self._idx+1]   # bool [1, T]
+        return full[idx:idx+1]   # bool [1, T]
 
     @property
     def bar_time(self) -> torch.Tensor:
+        idx = self._resolve_index()
         full = self._multi.bar_time
-        return full[self._idx:self._idx+1]   # [1, T]
+        return full[idx:idx+1]   # [1, T]
 
     @property
     def data_identity(self) -> DatasetIdentity:
-        return self._multi.data_identities[self._idx]
+        idx = self._resolve_index()
+        return self._multi.data_identities[idx]
 
     @property
     def symbol(self) -> str:
