@@ -1,6 +1,8 @@
 import torch
 from hypothesis import given, settings, strategies as st
 
+import model_core.features as features_module
+import model_core.ops as ops_module
 from model_core.features import FEATURE_REGISTRY, MT5FeatureEngineer
 from model_core.ops import OPERATOR_REGISTRY
 from model_core.vm import StackVM
@@ -42,6 +44,61 @@ def assert_prefix_equal(
         rtol=0,
         atol=1e-6,
     )
+
+
+def test_ema_helpers_are_invariant_to_appended_future_and_large_scale() -> None:
+    index = torch.arange(250, dtype=torch.float64).unsqueeze(0)
+    long = 1.0e12 + 1.0e9 * torch.sin(index / 3.0)
+    short = long[:, :20].clone()
+
+    for helper in (features_module.MT5FeatureEngineer._ema_simple,
+                   ops_module._ema_simple):
+        for span in (5, 20):
+            expected = helper(short, span)
+            actual = helper(long, span)[:, :short.shape[1]]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_ema_helpers_preserve_dtype_device_shape_and_autograd() -> None:
+    for helper in (features_module.MT5FeatureEngineer._ema_simple,
+                   ops_module._ema_simple):
+        x = torch.linspace(1.0, 2.0, 73, dtype=torch.float64).unsqueeze(0)
+        x.requires_grad_()
+        out = helper(x, 20)
+        assert out.shape == x.shape
+        assert out.dtype == x.dtype
+        assert out.device == x.device
+        out.square().sum().backward()
+        assert x.grad is not None
+        assert torch.isfinite(x.grad).all()
+
+
+def test_all_ema_backed_features_are_invariant_to_appended_future() -> None:
+    names = {
+        "MACD_HIST",
+        "EMA_RATIO_12_26",
+        "TRIX_15",
+        "PPO",
+        "TRIX_SIGNAL",
+        "KELTNER_POS_20",
+        "SAR_DIST",
+    }
+    long = make_ohlcv(250)
+    long = {name: value * 100_000.0 for name, value in long.items()}
+    short = {name: value[:, :20].clone() for name, value in long.items()}
+
+    visited = set()
+    for spec in FEATURE_REGISTRY.feature_specs:
+        if spec.name not in names:
+            continue
+        visited.add(spec.name)
+        torch.testing.assert_close(
+            spec.compute(long)[:, :20],
+            spec.compute(short),
+            rtol=0,
+            atol=0,
+        )
+    assert visited == names
 
 
 @settings(max_examples=25, deadline=None)

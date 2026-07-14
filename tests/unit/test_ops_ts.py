@@ -356,3 +356,78 @@ class TestOperatorLookbacks:
         with pytest.raises(TypeError):
             OperatorSpec(name="TEST_OPERATOR", arity=1, transform=transform)
         assert registry.operator_specs == ()
+
+    def test_scale_declared_window_is_exactly_enforced(self):
+        spec = self._spec("SCALE")
+        assert spec.lookback == 200
+        target = spec.lookback
+        base = torch.ones(1, target + 1)
+        outside = base.clone()
+        outside[:, target - spec.lookback] = 10_000.0
+        inside = base.clone()
+        inside[:, target - spec.lookback + 1] = 10_000.0
+
+        baseline = spec.transform(base)[0, target]
+        torch.testing.assert_close(
+            spec.transform(outside)[0, target], baseline, rtol=0, atol=0
+        )
+        assert not torch.equal(spec.transform(inside)[0, target], baseline)
+
+
+class TestRegistryHardeningAndShortAxes:
+    def test_non_callable_operator_is_rejected_atomically(self):
+        registry = Registry()
+        before = (registry.operator_specs, registry.operator_names)
+        with pytest.raises(RegistrationError) as error:
+            registry.register_operator(
+                OperatorSpec(
+                    name="NOT_CALLABLE",
+                    arity=1,
+                    transform=42,
+                    lookback=1,
+                )
+            )
+        assert type(error.value) is not RegistrationError
+        assert (registry.operator_specs, registry.operator_names) == before
+
+    def test_local_registry_freeze_rejects_operator_atomically(self):
+        registry = Registry()
+        registry.freeze()
+        before = (registry.operator_specs, registry.operator_names)
+        with pytest.raises(RegistrationError) as error:
+            registry.register_operator(
+                OperatorSpec(
+                    name="AFTER_FREEZE",
+                    arity=1,
+                    transform=lambda x: x,
+                    lookback=1,
+                )
+            )
+        assert type(error.value) is not RegistrationError
+        assert (registry.operator_specs, registry.operator_names) == before
+
+    def test_global_operator_registry_is_frozen(self):
+        assert OPERATOR_REGISTRY.is_frozen
+        before = (OPERATOR_REGISTRY.operator_specs, OPERATOR_REGISTRY.operator_names)
+        with pytest.raises(RegistrationError):
+            OPERATOR_REGISTRY.register_operator(
+                OperatorSpec(
+                    name="GLOBAL_AFTER_FREEZE",
+                    arity=1,
+                    transform=lambda x: x,
+                    lookback=1,
+                )
+            )
+        assert (OPERATOR_REGISTRY.operator_specs, OPERATOR_REGISTRY.operator_names) == before
+
+    @pytest.mark.parametrize("length", [1, 19])
+    def test_every_operator_preserves_nonempty_short_axis(self, length):
+        for spec in OPERATOR_REGISTRY.operator_specs:
+            operands = [torch.ones(2, length) for _ in range(spec.arity)]
+            assert spec.transform(*operands).shape == (2, length), spec.name
+
+    def test_every_operator_rejects_empty_time_axis_consistently(self):
+        for spec in OPERATOR_REGISTRY.operator_specs:
+            operands = [torch.ones(2, 0) for _ in range(spec.arity)]
+            with pytest.raises(ValueError, match=r"non-empty.*\[N,T\]"):
+                spec.transform(*operands)

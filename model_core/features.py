@@ -8,9 +8,11 @@ Output: [N, F, T], all finite; F is derived from FEATURE_REGISTRY.
 每个特征的 compute 并堆叠为 [N, F, T]。计算逻辑与顺序与重构前逐元素一致。
 每个 compute 的签名为 `(raw_dict: dict) -> Tensor[N, T]`。
 """
+import functools
+
 import torch
 
-from .causal import causal_rolling_zscore
+from .causal import causal_rolling_zscore, ema_effective_window
 from .registry import FeatureSpec, Registry
 from .semantics import ArtifactCompatibilityError, CORE_SEMANTICS_VERSION
 
@@ -146,11 +148,18 @@ class MT5FeatureEngineer:
         保留此 helper 以兼容外部调用和测试代码。
         compute_features() 内部等效计算见 ret20_raw。
         """
-        N, T = close.shape
-        eps  = MT5FeatureEngineer._EPS
-        raw  = torch.log(close[:, 20:] / (close[:, :-20] + eps))
-        pad  = torch.zeros(N, 20, device=close.device, dtype=close.dtype)
-        return torch.cat([pad, raw], dim=1)
+        return MT5FeatureEngineer._lagged_log_return(close, 20)
+
+    @staticmethod
+    def _lagged_log_return(close: torch.Tensor, lag: int) -> torch.Tensor:
+        """Return a fixed-length lagged log return for every non-empty T."""
+        out = torch.zeros_like(close)
+        if close.shape[1] > lag:
+            out[:, lag:] = torch.log(
+                close[:, lag:]
+                / (close[:, :-lag] + MT5FeatureEngineer._EPS)
+            )
+        return out
 
     # ── v3.0 新增特征 helper ───────────────────────────────────────────
 
@@ -194,7 +203,7 @@ class MT5FeatureEngineer:
 
         默认路径（exact=False）：
             向量化因果卷积近似，复杂度 O(N·T·w)，无逐时间步 Python 循环（R8.3）。
-            alpha = 2/(span+1)；有效窗口 w = min(T, ceil(-log(1e-6)/(-log(1-alpha))))，
+            alpha = 2/(span+1)；有效窗口 w = ceil(-log(1e-6)/(-log(1-alpha)))，
             保证尾部权重 (1-alpha)^w < 1e-6。
             使用首值填充（first-value padding）以匹配递推版初始条件 out[0]=x[0]，
             max|Δ| 与递推版差异实测 < 1e-4。
@@ -203,9 +212,10 @@ class MT5FeatureEngineer:
             严格递推 out[t] = alpha*x[t] + (1-alpha)*out[t-1]。
             复杂度 O(N·T)（顺序累积）。
         """
-        import math
         alpha = 2.0 / (span + 1.0)
         N, T = x.shape
+        if T == 0:
+            raise ValueError("EMA expects a non-empty [N,T] time axis")
 
         if exact:
             out = torch.zeros_like(x)
@@ -218,37 +228,74 @@ class MT5FeatureEngineer:
         if alpha >= 1.0:
             return x.clone()
         # w_full 仅由 span 决定，不依赖 T，保证因果性
-        w_full = max(1, math.ceil(-math.log(1e-6) / (-math.log(1.0 - alpha))))
+        w_full = ema_effective_window(span)
 
-        # T < 2*w_full：精确递推（严格因果 O(N·T)）；
-        # T >= 2*w_full：向量化卷积近似，首值填充，max|Δ| < 1e-4。
-        # 固定阈值 2*w_full 确保不同长度序列超阈值后行为一致。
-        if T < 2 * w_full:
-            out = torch.zeros_like(x)
-            out[:, 0] = x[:, 0]
-            for t in range(1, T):
-                out[:, t] = alpha * x[:, t] + (1 - alpha) * out[:, t - 1]
-            return out
-
-        # T >= 2*w_full：向量化，首值填充，max|Δ| < 1e-4
+        # 对所有 T 使用同一有限卷积；追加未来数据不能切换历史算法。
         decay = 1.0 - alpha
         powers = torch.arange(w_full - 1, -1, -1, dtype=x.dtype, device=x.device)
         weights = alpha * (decay ** powers)                    # 未归一化
         first = x[:, :1].expand(N, w_full - 1)                # [N, w_full-1] 首值填充
         xp = torch.cat([first, x], dim=1)
         windows = xp.unfold(1, w_full, 1)                      # [N, T, w_full]
-        out = (windows * weights).sum(dim=-1)                  # [N, T]
+        # 固定 64-step 分块归约：既保持向量化，又避免内核因总 T 不同选择
+        # 不同浮点归约路径。末块补零后仍以相同形状执行。
+        chunk_size = 64
+        chunks = []
+        for start in range(0, T, chunk_size):
+            width = min(chunk_size, T - start)
+            chunk = windows[:, start:start + width].contiguous()
+            if width < chunk_size:
+                chunk = torch.cat(
+                    [
+                        chunk,
+                        torch.zeros(
+                            N, chunk_size - width, w_full,
+                            dtype=x.dtype, device=x.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+            chunks.append((chunk * weights).sum(dim=-1)[:, :width])
+        out = torch.cat(chunks, dim=1)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
     @staticmethod
     def _obv_slope(close: torch.Tensor, volume: torch.Tensor, w: int = 20) -> torch.Tensor:
         """能量潮斜率：OBV 的 w 期线性回归斜率（归一化）。"""
-        eps = MT5FeatureEngineer._EPS
         ret_sign = torch.sign(close[:, 1:] - close[:, :-1])
         ret_sign = torch.cat([torch.zeros_like(close[:, :1]), ret_sign], dim=1)
-        obv = torch.cumsum(ret_sign * volume, dim=1)
-        # OBV 斜率（用线性回归）
-        return MT5FeatureEngineer._linear_slope(obv, w)
+        return MT5FeatureEngineer._local_cumulative_slope(
+            ret_sign * volume, w
+        )
+
+    @staticmethod
+    def _local_cumulative_slope(
+        increments: torch.Tensor, w: int
+    ) -> torch.Tensor:
+        """Slope of a cumulative path rebuilt independently in each window."""
+        N, _ = increments.shape
+        pad = torch.zeros(
+            N, w - 1, dtype=increments.dtype, device=increments.device
+        )
+        windows = torch.cat([pad, increments], dim=1).unfold(1, w, 1)
+        # Include the local zero origin so the earliest increment remains a
+        # genuine slope input instead of becoming an additive constant.
+        local_path = torch.cat(
+            [torch.zeros_like(windows[..., :1]), windows.cumsum(dim=-1)],
+            dim=-1,
+        )
+        tidx = torch.arange(
+            w + 1, dtype=increments.dtype, device=increments.device
+        )
+        tc = tidx - tidx.mean()
+        centered = local_path - local_path.mean(dim=-1, keepdim=True)
+        slope = (centered * tc).sum(dim=-1) / (
+            tc.square().sum() + MT5FeatureEngineer._EPS
+        )
+        scale = windows.abs().mean(dim=-1) + MT5FeatureEngineer._EPS
+        return torch.nan_to_num(
+            slope / scale, nan=0.0, posinf=0.0, neginf=0.0
+        )
 
     @staticmethod
     def _mfi(close: torch.Tensor, high: torch.Tensor,
@@ -296,10 +343,10 @@ class MT5FeatureEngineer:
     def _roc(close: torch.Tensor, w: int = 12) -> torch.Tensor:
         """变化率 ROC = close[t]/close[t-w] - 1，前 w 位补 0。"""
         eps = MT5FeatureEngineer._EPS
-        N = close.shape[0]
-        raw = close[:, w:] / (close[:, :-w] + eps) - 1.0
-        pad = torch.zeros(N, w, device=close.device, dtype=close.dtype)
-        return torch.cat([pad, raw], dim=1)
+        out = torch.zeros_like(close)
+        if close.shape[1] > w:
+            out[:, w:] = close[:, w:] / (close[:, :-w] + eps) - 1.0
+        return out
 
     @staticmethod
     def _typical_dev(close: torch.Tensor, high: torch.Tensor,
@@ -386,23 +433,17 @@ class MT5FeatureEngineer:
     @classmethod
     def _c_ret(cls, raw: dict) -> torch.Tensor:
         close = raw["close"].float()
-        N = close.shape[0]; eps = cls._EPS
-        ret_raw = torch.log(close[:, 1:] / (close[:, :-1] + eps))
-        return cls._norm(torch.cat([torch.zeros(N, 1, device=close.device), ret_raw], dim=1))
+        return cls._norm(cls._lagged_log_return(close, 1))
 
     @classmethod
     def _c_ret5(cls, raw: dict) -> torch.Tensor:
         close = raw["close"].float()
-        N = close.shape[0]; eps = cls._EPS
-        ret5_raw = torch.log(close[:, 5:] / (close[:, :-5] + eps))
-        return cls._norm(torch.cat([torch.zeros(N, 5, device=close.device), ret5_raw], dim=1))
+        return cls._norm(cls._lagged_log_return(close, 5))
 
     @classmethod
     def _c_ret20(cls, raw: dict) -> torch.Tensor:
         close = raw["close"].float()
-        N = close.shape[0]; eps = cls._EPS
-        ret20_raw = torch.log(close[:, 20:] / (close[:, :-20] + eps))
-        return cls._norm(torch.cat([torch.zeros(N, 20, device=close.device), ret20_raw], dim=1))
+        return cls._norm(cls._lagged_log_return(close, 20))
 
     @classmethod
     def _c_ma_diff(cls, raw: dict) -> torch.Tensor:
@@ -696,16 +737,16 @@ class MT5FeatureEngineer:
 
     @classmethod
     def _c_ret_accel(cls, raw: dict) -> torch.Tensor:
-        close = raw["close"].float(); eps = cls._EPS; N = close.shape[0]
-        ret5_raw = torch.log(close[:, 5:] / (close[:, :-5] + eps))
-        ret5 = torch.cat([torch.zeros(N, 5, device=close.device, dtype=close.dtype), ret5_raw], dim=1)
-        pad = torch.zeros(N, 5, device=close.device, dtype=close.dtype)
-        prev = torch.cat([pad, ret5[:, :-5]], dim=1)             # ret5[t-5]，前5位为0
+        close = raw["close"].float()
+        ret5 = cls._lagged_log_return(close, 5)
+        prev = torch.zeros_like(ret5)
+        if ret5.shape[1] > 5:
+            prev[:, 5:] = ret5[:, :-5]
         return cls._norm(ret5 - prev)
 
     # ── task 5.4 量能/流动性类特征 volume (41-44) ─────────────────────────
     # 所有滚动操作用 _rolling_mean/_rolling_sum/_linear_slope（因果左pad+unfold）。
-    # cumsum 是严格因果的。所有除法/log 加 eps（R8.1）；出口 nan_to_num（R8.6）。
+    # 累计路径在每个有限窗口内重建。所有除法/log 加 eps（R8.1）；出口 finite clean。
 
     @classmethod
     def _c_amihud_illiq(cls, raw: dict) -> torch.Tensor:
@@ -780,8 +821,8 @@ class MT5FeatureEngineer:
     def _c_ad_line_slope(cls, raw: dict) -> torch.Tensor:
         """A/D line 斜率（R1.6）。
 
-        A/D line = cumsum(((C-L)-(H-C))/(H-L+eps) * volume)（严格因果）。
-        取其滚动线性回归斜率（_linear_slope 因果 unfold），robust_norm。
+        A/D 增量 = ((C-L)-(H-C))/(H-L+eps) * volume。
+        在每个 20 期窗口内从零重建累计路径并回归斜率，再 robust_norm。
         """
         eps    = cls._EPS
         close  = raw["close"].float()
@@ -791,8 +832,7 @@ class MT5FeatureEngineer:
 
         mf_mul  = ((close - low) - (high - close)) / (high - low + eps)
         mfv     = mf_mul * volume
-        ad_line = torch.cumsum(mfv, dim=1)                           # 严格因果
-        slope   = cls._linear_slope(ad_line, 20)
+        slope   = cls._local_cumulative_slope(mfv, 20)
         return cls._norm(cls._clean(slope))
 
     # ── task 5.5 反转/振荡类特征 reversal + trend/momentum (45-50) ────────
@@ -1036,40 +1076,57 @@ class MT5FeatureEngineer:
 
     @classmethod
     def _c_supertrend_dir(cls, raw: dict) -> torch.Tensor:
-        """SuperTrend 方向标志 {-1.0, +1.0}（因果逐时间步递推）。
+        """SuperTrend 方向标志 {-1.0, +1.0}（有限窗口因果状态）。
 
         upper_band = (high+low)/2 + 1.5*ATR14（当前 bar）
         lower_band = (high+low)/2 - 1.5*ATR14
-        递推规则（严格因果，对每个时间步并行处理所有 N 品种）：
-          - t=0：direction = +1
-          - t≥1：close > prev_upper_band → +1；close < prev_lower_band → -1；否则保持
-        注：Python 循环仅遍历时间维 T，每步操作 N 品种的向量（合法向量化）。
+        每步突破信号：close > prev_upper_band → +1；close < prev_lower_band → -1。
+        direction 取最近 385 个信号中的最后一个非零值，无信号时为 +1；结合
+        ATR14 的 15-bar 原始依赖，整体历史窗口严格限制为 400 bar。
         """
         close = raw["close"].float()
         high  = raw["high"].float()
         low   = raw["low"].float()
-        N, T  = close.shape
-
         atr          = cls._atr(close, high, low, w=14)
         mid          = (high + low) / 2.0
         upper_band   = mid + 1.5 * atr    # [N, T]
         lower_band   = mid - 1.5 * atr    # [N, T]
 
-        # 递推 direction：+1=上涨趋势，-1=下跌趋势
-        direction = torch.ones(N, T, dtype=close.dtype, device=close.device)
-        prev_upper = upper_band[:, 0]     # [N]（初始化为 t=0 的带值）
-        prev_lower = lower_band[:, 0]
-        for t in range(1, T):
-            # 严格因果：仅使用 close[t] 与前一时间步的带值
-            flip_up   = close[:, t] > prev_upper   # 价格突破上带 → 上涨
-            flip_down = close[:, t] < prev_lower   # 价格跌破下带 → 下跌
-            prev_dir  = direction[:, t - 1]
-            new_dir   = prev_dir.clone()
-            new_dir[flip_up]   =  1.0
-            new_dir[flip_down] = -1.0
-            direction[:, t]    = new_dir
-            prev_upper = upper_band[:, t]
-            prev_lower = lower_band[:, t]
+        prev_upper = torch.cat([upper_band[:, :1], upper_band[:, :-1]], dim=1)
+        prev_lower = torch.cat([lower_band[:, :1], lower_band[:, :-1]], dim=1)
+        signals = torch.where(
+            close > prev_upper,
+            torch.ones_like(close),
+            torch.where(close < prev_lower, -torch.ones_like(close), torch.zeros_like(close)),
+        )
+        signals = signals.clone()
+        signals[:, 0] = 0.0
+
+        # A signal depends on at most 16 raw bars (current close plus the
+        # previous ATR14 band). Keeping the most recent 385 signals therefore
+        # gives an exact 400-bar raw-data lookback.
+        signal_window = 385
+        pad = torch.zeros(
+            close.shape[0], signal_window - 1,
+            dtype=close.dtype, device=close.device,
+        )
+        windows = torch.cat([pad, signals], dim=1).unfold(
+            1, signal_window, 1
+        )
+        positions = torch.arange(
+            signal_window, device=close.device, dtype=torch.long
+        ).view(1, 1, -1)
+        latest = torch.where(
+            windows != 0,
+            positions,
+            torch.full_like(positions, -1),
+        ).amax(dim=-1)
+        selected = windows.gather(
+            -1, latest.clamp_min(0).unsqueeze(-1)
+        ).squeeze(-1)
+        direction = torch.where(
+            latest >= 0, selected, torch.ones_like(selected)
+        )
         return cls._clean(direction)
 
     @classmethod
@@ -1289,7 +1346,7 @@ _FEATURE_DEFS = [
     ("BOLL_POS",    "channel",         _fe._c_boll_pos, 20),
     ("BOLL_WIDTH",  "volatility",      _fe._c_boll_width, 219),
     ("MACD_HIST",   "momentum",        _fe._c_macd_hist, 440),
-    ("OBV_SLOPE",   "volume",          _fe._c_obv_slope, 400),
+    ("OBV_SLOPE",   "volume",          _fe._c_obv_slope, 220),
     ("MFI14",       "volume",          _fe._c_mfi14, 15),
     # v3.0 Alpha 101 + 互补特征
     ("WILLR_14",    "reversal",        _fe._c_willr14, 14),
@@ -1303,7 +1360,7 @@ _FEATURE_DEFS = [
     # task 5.2 动量类 momentum
     ("TRIX_15",     "momentum",        _fe._c_trix_15, 510),
     ("PPO",         "momentum",        _fe._c_ppo, 379),
-    ("ULT_OSC",     "momentum",        _fe._c_ult_osc, 28),
+    ("ULT_OSC",     "momentum",        _fe._c_ult_osc, 29),
     ("RET_ACCEL",   "momentum",        _fe._c_ret_accel, 210),
     # task 5.3 波动类（含 OHLC 估计量）volatility
     ("GK_VOL",          "volatility",  _fe._c_gk_vol, 219),
@@ -1314,7 +1371,7 @@ _FEATURE_DEFS = [
     ("AMIHUD_ILLIQ",    "volume",      _fe._c_amihud_illiq, 220),
     ("KYLE_LAMBDA",     "volume",      _fe._c_kyle_lambda, 220),
     ("CMF_20",          "volume",      _fe._c_cmf_20, 20),
-    ("AD_LINE_SLOPE",   "volume",      _fe._c_ad_line_slope, 400),
+    ("AD_LINE_SLOPE",   "volume",      _fe._c_ad_line_slope, 219),
     # task 5.5 反转/振荡类 reversal/trend/momentum
     ("STOCH_K_14",      "reversal",    _fe._c_stoch_k_14, 14),
     ("STOCH_D_3",       "reversal",    _fe._c_stoch_d_3, 16),
@@ -1388,10 +1445,41 @@ def _load_active_feature_allowlist(path=None) -> set[str] | None:
         raise ArtifactCompatibilityError(
             f"active feature artifact contains unknown names: {unknown}"
         )
+    if len(names) != len(set(names)):
+        raise ArtifactCompatibilityError(
+            "active feature artifact contains duplicate names"
+        )
     return set(names)
 
 
 _ACTIVE_FEATURES = _load_active_feature_allowlist()
+
+
+def _with_feature_shape_check(name: str, compute):
+    @functools.wraps(compute)
+    def _checked(raw: dict) -> torch.Tensor:
+        close = raw.get("close") if isinstance(raw, dict) else None
+        if (
+            not isinstance(close, torch.Tensor)
+            or close.ndim != 2
+            or close.shape[1] == 0
+        ):
+            raise ValueError(
+                f"feature '{name}' expects a non-empty [N,T] time axis"
+            )
+        for value in raw.values():
+            if isinstance(value, torch.Tensor) and value.shape != close.shape:
+                raise ValueError(
+                    f"feature '{name}' expects aligned [N,T] inputs"
+                )
+        result = compute(raw)
+        if not isinstance(result, torch.Tensor) or result.shape != close.shape:
+            raise ValueError(
+                f"feature '{name}' output must preserve [N,T]={tuple(close.shape)}"
+            )
+        return result
+
+    return _checked
 
 for _name, _category, _compute, _lookback in _FEATURE_DEFS:
     if _ACTIVE_FEATURES is not None and _name not in _ACTIVE_FEATURES:
@@ -1400,7 +1488,7 @@ for _name, _category, _compute, _lookback in _FEATURE_DEFS:
         FeatureSpec(
             name=_name,
             category=_category,
-            compute=_compute,
+            compute=_with_feature_shape_check(_name, _compute),
             lookback=_lookback,
         )
     )
@@ -1413,3 +1501,5 @@ MAX_FEATURE_LOOKBACK = max(
 
 # 计数一致性（R1.13）：INPUT_DIM == len(FEATURE_NAMES) == F
 MT5FeatureEngineer.INPUT_DIM = len(FEATURE_REGISTRY.feature_names)
+
+FEATURE_REGISTRY.freeze()

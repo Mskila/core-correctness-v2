@@ -44,6 +44,16 @@ def test_damaged_allowlist_json_fails_closed(tmp_path) -> None:
         _load_active_feature_allowlist(path)
 
 
+def test_duplicate_active_feature_names_fail_closed(tmp_path) -> None:
+    path = tmp_path / "active_features.json"
+    _write(
+        path,
+        {"core_semantics_version": "2", "active_features": ["RET", "RET"]},
+    )
+    with pytest.raises(ArtifactCompatibilityError, match="duplicate"):
+        _load_active_feature_allowlist(path)
+
+
 def test_valid_allowlist_is_smaller_and_has_new_vocab_hash(tmp_path) -> None:
     path = tmp_path / "active_features.json"
     _write(

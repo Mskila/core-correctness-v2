@@ -257,3 +257,149 @@ class TestFeatureLookbacks:
         with pytest.raises(TypeError):
             FeatureSpec(name="TEST_FEATURE", category="test", compute=compute)
         assert registry.feature_specs == ()
+
+    @staticmethod
+    def _spec(name):
+        return next(
+            spec for spec in FEATURE_REGISTRY.feature_specs if spec.name == name
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "lookback"),
+        [
+            ("ULT_OSC", 29),
+            ("OBV_SLOPE", 220),
+            ("AD_LINE_SLOPE", 219),
+            ("SUPERTREND_DIR", 400),
+            ("SAR_DIST", 545),
+        ],
+    )
+    def test_cumulative_and_recursive_feature_lookbacks(self, name, lookback):
+        assert self._spec(name).lookback == lookback
+
+    @pytest.mark.parametrize(
+        ("name", "lookback"),
+        [
+            ("ULT_OSC", 29),
+            ("OBV_SLOPE", 220),
+            ("AD_LINE_SLOPE", 219),
+            ("SAR_DIST", 545),
+        ],
+    )
+    def test_declared_feature_window_boundary(self, name, lookback):
+        spec = self._spec(name)
+        raw = _make_raw_dict(N=1, T=lookback + 1, seed=97)
+        target = lookback
+        baseline = spec.compute(raw)[0, target]
+
+        def variants(index):
+            for field in raw:
+                changed = {key: value.clone() for key, value in raw.items()}
+                changed[field][:, index] = changed[field][:, index] * 7.0 + 11.0
+                yield changed
+
+        for changed in variants(target - lookback):
+            torch.testing.assert_close(
+                spec.compute(changed)[0, target], baseline, rtol=0, atol=0
+            )
+        assert any(
+            not torch.equal(spec.compute(changed)[0, target], baseline)
+            for changed in variants(target - lookback + 1)
+        ), f"{name} ignores the earliest bar inside its declared window"
+
+    def test_supertrend_declared_window_boundary(self):
+        spec = self._spec("SUPERTREND_DIR")
+        lookback = 400
+        target = lookback
+
+        outside_base = {
+            "open": torch.full((1, target + 1), 100.0),
+            "high": torch.full((1, target + 1), 101.0),
+            "low": torch.full((1, target + 1), 99.0),
+            "close": torch.full((1, target + 1), 100.0),
+            "volume": torch.ones(1, target + 1),
+        }
+        outside = {key: value.clone() for key, value in outside_base.items()}
+        outside["high"][:, 0] = 110.0
+        outside["low"][:, 0] = 110.0
+        torch.testing.assert_close(
+            spec.compute(outside)[0, target],
+            spec.compute(outside_base)[0, target],
+            rtol=0,
+            atol=0,
+        )
+
+        inside_base = {key: value.clone() for key, value in outside_base.items()}
+        inside_base["close"][:, 16] = 96.0
+        inside = {key: value.clone() for key, value in inside_base.items()}
+        inside["close"][:, 1] = 1_000.0
+        assert not torch.equal(
+            spec.compute(inside)[0, target],
+            spec.compute(inside_base)[0, target],
+        )
+
+
+class TestFeatureRegistryHardeningAndShortAxes:
+    def test_non_callable_feature_is_rejected_atomically(self):
+        registry = Registry()
+        before = (registry.feature_specs, registry.feature_names)
+        with pytest.raises(RegistrationError) as error:
+            registry.register_feature(
+                FeatureSpec(
+                    name="NOT_CALLABLE",
+                    category="test",
+                    compute=42,
+                    lookback=1,
+                )
+            )
+        assert type(error.value) is not RegistrationError
+        assert (registry.feature_specs, registry.feature_names) == before
+
+    def test_local_registry_freeze_rejects_feature_atomically(self):
+        registry = Registry()
+        registry.freeze()
+        before = (registry.feature_specs, registry.feature_names)
+        with pytest.raises(RegistrationError) as error:
+            registry.register_feature(
+                FeatureSpec(
+                    name="AFTER_FREEZE",
+                    category="test",
+                    compute=lambda raw: raw["close"],
+                    lookback=1,
+                )
+            )
+        assert type(error.value) is not RegistrationError
+        assert (registry.feature_specs, registry.feature_names) == before
+
+    def test_global_feature_registry_is_frozen(self):
+        assert FEATURE_REGISTRY.is_frozen
+        before = (FEATURE_REGISTRY.feature_specs, FEATURE_REGISTRY.feature_names)
+        with pytest.raises(RegistrationError):
+            FEATURE_REGISTRY.register_feature(
+                FeatureSpec(
+                    name="GLOBAL_AFTER_FREEZE",
+                    category="test",
+                    compute=lambda raw: raw["close"],
+                    lookback=1,
+                )
+            )
+        assert (FEATURE_REGISTRY.feature_specs, FEATURE_REGISTRY.feature_names) == before
+
+    @pytest.mark.parametrize("length", [1, 19])
+    def test_every_feature_preserves_nonempty_short_axis(self, length):
+        raw = _make_raw_dict(N=2, T=length)
+        for spec in FEATURE_REGISTRY.feature_specs:
+            assert spec.compute(raw).shape == (2, length), spec.name
+        assert MT5FeatureEngineer.compute_features(raw).shape == (
+            2,
+            len(FEATURE_REGISTRY.feature_names),
+            length,
+        )
+
+    def test_every_feature_rejects_empty_time_axis_consistently(self):
+        raw = _make_raw_dict(N=2, T=0)
+        for spec in FEATURE_REGISTRY.feature_specs:
+            with pytest.raises(ValueError, match=r"non-empty.*\[N,T\]"):
+                spec.compute(raw)
+        with pytest.raises(ValueError, match=r"non-empty.*\[N,T\]"):
+            MT5FeatureEngineer.compute_features(raw)

@@ -57,6 +57,14 @@ class InvalidLookbackError(RegistrationError):
     """lookback 不是正整数。"""
 
 
+class InvalidCallableError(RegistrationError):
+    """Feature compute / Operator transform 不是可调用对象。"""
+
+
+class RegistryFrozenError(RegistrationError):
+    """冻结后的注册表拒绝任何新增声明。"""
+
+
 # ── 声明条目（frozen dataclass）─────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -146,6 +154,7 @@ class Registry:
         self._operator_specs: list[OperatorSpec] = []
         # 跨 Feature/Operator 的全局唯一名称集合，用于 O(1) 重名检测
         self._names: set[str] = set()
+        self._frozen = False
 
     # ── 只读视图 ────────────────────────────────────────────────────────
 
@@ -165,13 +174,22 @@ class Registry:
     def operator_names(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self._operator_specs)
 
+    @property
+    def is_frozen(self) -> bool:
+        return self._frozen
+
     def __contains__(self, name: str) -> bool:
         return name in self._names
+
+    def freeze(self) -> None:
+        """Seal this registry after all declarations and identity views exist."""
+        self._frozen = True
 
     # ── 注册接口 ────────────────────────────────────────────────────────
 
     def register_feature(self, spec: FeatureSpec) -> None:
         """注册单个 Feature（R10.2）。校验全部通过后才追加，否则注册表不变。"""
+        self._ensure_mutable()
         # 1) 必填字段校验（R10.7）：name / category / compute / lookback
         self._require_fields(
             spec,
@@ -184,9 +202,11 @@ class Registry:
         )
         # 2) name 合法性（R10.2）
         _validate_name(spec.name)
-        # 3) 历史窗口必须为正整数
+        # 3) compute 必须可调用
+        self._validate_callable(spec.compute, "compute")
+        # 4) 历史窗口必须为正整数
         self._validate_lookback(spec.lookback)
-        # 4) 重名校验（R10.5）
+        # 5) 重名校验（R10.5）
         self._check_duplicate(spec.name)
 
         # 全部通过 -> 原子追加
@@ -195,6 +215,7 @@ class Registry:
 
     def register_operator(self, spec: OperatorSpec) -> None:
         """注册单个 Operator（R10.1）。校验全部通过后才追加，否则注册表不变。"""
+        self._ensure_mutable()
         # 1) 必填字段校验（R10.7）：name / arity / transform / lookback
         #    arity 为 0 是合法值，故用「是否为 None」判断缺失而非真值判断。
         self._require_fields(
@@ -210,16 +231,18 @@ class Registry:
         _validate_name(spec.name)
         # 3) arity 类型与范围（R10.8）：必须为 0..10 的整数（bool 不算整数）
         self._validate_arity(spec.arity)
-        # 4) 历史窗口必须为正整数
+        # 4) transform 必须可调用
+        self._validate_callable(spec.transform, "transform")
+        # 5) 历史窗口必须为正整数
         self._validate_lookback(spec.lookback)
-        # 5) arity 与 transform 实际操作数一致性（R10.6）
+        # 6) arity 与 transform 实际操作数一致性（R10.6）
         observed = _observed_arity(spec.transform)
         if observed is not None and observed != spec.arity:
             raise ArityMismatchError(
                 f"算子 '{spec.name}' 声明 arity={spec.arity}，"
                 f"但 transform 实际消费 {observed} 个操作数"
             )
-        # 6) 重名校验（R10.5）
+        # 7) 重名校验（R10.5）
         self._check_duplicate(spec.name)
 
         # 全部通过 -> 原子追加
@@ -260,6 +283,17 @@ class Registry:
             raise InvalidLookbackError(
                 f"lookback 必须为正整数，实际为 {lookback}"
             )
+
+    @staticmethod
+    def _validate_callable(value, label: str) -> None:
+        if not callable(value):
+            raise InvalidCallableError(
+                f"字段 {label} 必须可调用，实际类型为 {type(value).__name__}"
+            )
+
+    def _ensure_mutable(self) -> None:
+        if self._frozen:
+            raise RegistryFrozenError("注册表已冻结，不能追加声明")
 
     def _check_duplicate(self, name: str) -> None:
         """跨 Feature/Operator 全局重名检测（R10.5）。"""

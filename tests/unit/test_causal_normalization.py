@@ -64,3 +64,37 @@ def test_feature_and_operator_normalizers_share_causal_semantics() -> None:
     )
     torch.testing.assert_close(_ts_zscore(x, 3), expected_3)
     torch.testing.assert_close(_op_jump(x), torch.tanh(expected_200 - 1.5))
+
+
+def test_ordinary_finite_input_has_finite_forward_and_backward() -> None:
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], requires_grad=True)
+    out = causal_rolling_zscore(x, window=200)
+    assert torch.isfinite(out).all()
+    out.square().sum().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.parametrize(
+    ("dtype", "amplitude"),
+    [
+        (torch.float16, 60_000.0),
+        (torch.float32, 1.0e20),
+        (torch.float64, 1.0e200),
+    ],
+)
+def test_extreme_finite_input_is_not_masked_and_has_finite_gradients(
+    dtype, amplitude
+) -> None:
+    x = torch.tensor(
+        [[amplitude, -amplitude, amplitude, -amplitude]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    out = causal_rolling_zscore(x, window=200)
+    assert out.dtype == dtype
+    assert torch.isfinite(out).all()
+    assert out[:, 1:].abs().max() > 0
+    out.to(torch.float64).square().sum().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()

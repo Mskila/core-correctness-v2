@@ -9,7 +9,7 @@ model_core/ops.py -- 算子库（Operator_Library, R2）
 
 统一契约（R2.8, R2.9, R2.13）：
   - 形状契约：所有算子输入 `[N, T]`、输出 `[N, T]`。
-  - 二元/三元算子在入口校验各操作数形状一致，不一致抛 `ShapeError` 且不产出张量。
+  - 所有算子统一校验非空 `[N,T]` 入口与出口；二元/三元另校验操作数形状一致。
   - 注册表存储 name（≤64 字符）与 arity（本模块算子均为 1/2/3）。
 
 说明：现有算子多以 lambda 定义，`inspect` 不总能可靠解析 arity（内建函数、被
@@ -17,11 +17,14 @@ model_core/ops.py -- 算子库（Operator_Library, R2）
 可变位置参数形式（`*operands`），注册层会跳过 arity 观测校验，从而避免对既有算子
 的 `ArityMismatchError` 误报。
 """
-import math
+import functools
 
 import torch
 
-from .causal import causal_rolling_zscore
+from .causal import (
+    causal_rolling_zscore,
+    ema_effective_window as _ema_effective_window,
+)
 from .registry import OperatorSpec, Registry
 
 
@@ -36,8 +39,10 @@ class ShapeError(Exception):
 
 def _ts_delay(x: torch.Tensor, d: int) -> torch.Tensor:
     if d == 0: return x
-    pad = torch.zeros((x.shape[0], d), device=x.device, dtype=x.dtype)
-    return torch.cat([pad, x[:, :-d]], dim=1)
+    out = torch.zeros_like(x)
+    if x.shape[1] > d:
+        out[:, d:] = x[:, :-d]
+    return out
 
 def _op_gate(condition: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     mask = (condition > 0).float()
@@ -120,29 +125,12 @@ def _ema(x: torch.Tensor, alpha: float) -> torch.Tensor:
     # 上面的 unfold 对 1D 不直接 work，改用简单循环近似
 
 
-_EMA_TAIL_WEIGHT_THRESHOLD = 1e-6
-
-
-def _ema_effective_window(span: int) -> int:
-    """Return the finite EMA kernel covering weights down to the V2 cutoff."""
-    alpha = 2.0 / (span + 1.0)
-    if alpha >= 1.0:
-        return 1
-    return max(
-        1,
-        math.ceil(
-            -math.log(_EMA_TAIL_WEIGHT_THRESHOLD)
-            / (-math.log(1.0 - alpha))
-        ),
-    )
-
-
 def _ema_simple(x: torch.Tensor, span: int, exact: bool = False) -> torch.Tensor:
     """指数加权移动平均（因果），span 期。
 
     默认路径（exact=False）：
         向量化因果卷积近似，复杂度 O(N·T·w)，无逐时间步 Python 循环（R8.3）。
-        alpha = 2/(span+1)；有效窗口 w = min(T, ceil(-log(1e-6)/(-log(1-alpha))))，
+        alpha = 2/(span+1)；有效窗口 w = ceil(-log(1e-6)/(-log(1-alpha)))，
         保证尾部权重 (1-alpha)^w < 1e-6。
         使用首值填充（first-value padding）以匹配递推版初始条件 out[0]=x[0]，
         max|Δ| 与递推版差异实测 < 1e-4。
@@ -153,6 +141,8 @@ def _ema_simple(x: torch.Tensor, span: int, exact: bool = False) -> torch.Tensor
     """
     alpha = 2.0 / (span + 1.0)
     N, T = x.shape
+    if T == 0:
+        raise ValueError("EMA expects a non-empty [N,T] time axis")
 
     if exact:
         # ── 精确递推路径（O(N·T) 顺序累积，R8.4 文档化复杂度）──────────
@@ -168,16 +158,7 @@ def _ema_simple(x: torch.Tensor, span: int, exact: bool = False) -> torch.Tensor
     # 实现与注册声明共享同一个 V2 有效窗口定义。
     w_full = _ema_effective_window(span)
 
-    # 只有不足一个完整有效窗口时才使用首值递推 warm-up；一旦 T >= w_full，
-    # 截断卷积确保任何 warmed output 都不依赖声明窗口之外的历史。
-    if T < w_full:
-        out = torch.zeros_like(x)
-        out[:, 0] = x[:, 0]
-        for t in range(1, T):
-            out[:, t] = alpha * x[:, t] + (1 - alpha) * out[:, t - 1]
-        return out
-
-    # T >= w_full：向量化卷积近似（首值填充），max|Δ| < 1e-4
+    # 对所有 T 使用同一有限卷积；追加未来数据不能切换历史算法。
     decay = 1.0 - alpha
     powers = torch.arange(w_full - 1, -1, -1, dtype=x.dtype, device=x.device)
     weights = alpha * (decay ** powers)                        # 未归一化
@@ -186,7 +167,25 @@ def _ema_simple(x: torch.Tensor, span: int, exact: bool = False) -> torch.Tensor
     first = x[:, :1].expand(N, w_full - 1)                    # [N, w_full-1]
     xp = torch.cat([first, x], dim=1)                          # [N, T+w_full-1]
     windows = xp.unfold(1, w_full, 1)                          # [N, T, w_full]
-    out = (windows * weights).sum(dim=-1)                      # [N, T]
+    # 固定 64-step 分块归约使共同前缀走完全相同的浮点运算图，同时保持向量化。
+    chunk_size = 64
+    chunks = []
+    for start in range(0, T, chunk_size):
+        width = min(chunk_size, T - start)
+        chunk = windows[:, start:start + width].contiguous()
+        if width < chunk_size:
+            chunk = torch.cat(
+                [
+                    chunk,
+                    torch.zeros(
+                        N, chunk_size - width, w_full,
+                        dtype=x.dtype, device=x.device,
+                    ),
+                ],
+                dim=1,
+            )
+        chunks.append((chunk * weights).sum(dim=-1)[:, :width])
+    out = torch.cat(chunks, dim=1)
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -248,12 +247,11 @@ def _decay_exp(x: torch.Tensor, d: int, alpha: float = 0.5) -> torch.Tensor:
 
 
 def _scale(x: torch.Tensor) -> torch.Tensor:
-    """沿时间轴缩放到单位 L1 范数（Alpha#028/032 高频算子）。
-    scale(x)[t] = x[t] / sum(|x[1..t]|)，避免未来信息用因果累积和。
+    """按最近 200 根的 L1 范数缩放（Alpha#028/032 高频算子）。
+    scale(x)[t] = x[t] / sum(|x[t-199..t]|)，严格有限且因果。
     """
-    abs_x = x.abs()
-    cumsum = torch.cumsum(abs_x, dim=1) + 1e-6
-    return x / cumsum
+    rolling_l1 = _ts_rolling(x.abs(), 200).sum(dim=-1) + 1e-6
+    return x / rolling_l1
 
 
 def _ts_covariance(x: torch.Tensor, y: torch.Tensor, d: int) -> torch.Tensor:
@@ -291,13 +289,27 @@ def _signed_power(x: torch.Tensor, a: float = 2.0) -> torch.Tensor:
 # ── 形状一致性校验包装（R2.9, R2.13）─────────────────────────────────────
 
 def _with_shape_check(name: str, transform):
-    """为二元/三元算子包装入口形状一致性校验。
+    """为所有算子包装统一的非空时间轴与形状校验。
 
     调用时先校验各操作数形状完全一致，不一致抛 `ShapeError` 且不调用底层
     transform（不产出张量）。包装后为可变位置参数形式，注册层将跳过 arity
     观测校验（以显式声明 arity 为准）。
     """
+    @functools.wraps(transform)
     def _checked(*operands: torch.Tensor) -> torch.Tensor:
+        if not operands:
+            raise ValueError(
+                f"operator '{name}' expects a non-empty [N,T] time axis"
+            )
+        for operand in operands:
+            if (
+                not isinstance(operand, torch.Tensor)
+                or operand.ndim != 2
+                or operand.shape[1] == 0
+            ):
+                raise ValueError(
+                    f"operator '{name}' expects a non-empty [N,T] time axis"
+                )
         base = operands[0].shape
         for other in operands[1:]:
             if other.shape != base:
@@ -305,7 +317,13 @@ def _with_shape_check(name: str, transform):
                     f"算子 '{name}' 操作数形状不一致: "
                     f"{tuple(base)} vs {tuple(other.shape)}"
                 )
-        return transform(*operands)
+        result = transform(*operands)
+        if not isinstance(result, torch.Tensor) or result.shape != base:
+            raise ShapeError(
+                f"算子 '{name}' 输出形状必须为 {tuple(base)}，"
+                f"实际为 {getattr(result, 'shape', None)}"
+            )
+        return result
 
     return _checked
 
@@ -385,11 +403,11 @@ OPERATOR_REGISTRY = Registry()
 def _register_initial_operators(registry: Registry) -> None:
     """把初始算子注册进给定注册表。
 
-    二元/三元算子经 `_with_shape_check` 包装以在入口校验操作数形状一致性
-    （R2.13）；一元算子直接注册。以显式声明的 arity 为准（R2.8）。
+    所有算子经 `_with_shape_check` 包装；二元/三元额外校验操作数形状一致性
+    （R2.13）。以显式声明的 arity 为准（R2.8）。
     """
     for name, transform, arity, lookback in _INITIAL_OPERATORS:
-        fn = _with_shape_check(name, transform) if arity >= 2 else transform
+        fn = _with_shape_check(name, transform)
         registry.register_operator(
             OperatorSpec(
                 name=name,
@@ -484,11 +502,11 @@ _TASK33_OPERATORS = [
 def _register_task33_operators(registry: Registry) -> None:
     """注册 Task 3.3 新增算子（时序求和/极值与幅度变换，R2.3–2.5）。
 
-    二元算子（MIN/MAX）经 `_with_shape_check` 包装；一元算子直接注册。
+    所有新增算子经 `_with_shape_check` 包装；MIN/MAX 额外校验双操作数形状。
     追加在既有 44 个 V2 单标算子之后，保持既有算子顺序在前（R2.9, R2.10）。
     """
     for name, transform, arity, lookback in _TASK33_OPERATORS:
-        fn = _with_shape_check(name, transform) if arity >= 2 else transform
+        fn = _with_shape_check(name, transform)
         registry.register_operator(
             OperatorSpec(
                 name=name,
@@ -627,11 +645,11 @@ _TASK34_OPERATORS = [
 def _register_task34_operators(registry: Registry) -> None:
     """注册 Task 3.4 新增算子（归一化与条件/逻辑，R2.6, R2.7）。
 
-    二元/三元算子经 `_with_shape_check` 包装；一元算子直接注册。
+    所有新增算子经 `_with_shape_check` 包装；二元/三元额外校验操作数形状。
     追加在既有 52 个 V2 单标算子之后，保持既有算子顺序在前（R2.9, R2.10）。
     """
     for name, transform, arity, lookback in _TASK34_OPERATORS:
-        fn = _with_shape_check(name, transform) if arity >= 2 else transform
+        fn = _with_shape_check(name, transform)
         registry.register_operator(
             OperatorSpec(
                 name=name,
@@ -668,3 +686,5 @@ assert len(OPERATOR_REGISTRY.operator_specs) == _EXPECTED_OPERATOR_COUNT, (
 MAX_OPERATOR_LOOKBACK = max(
     spec.lookback for spec in OPERATOR_REGISTRY.operator_specs
 )
+
+OPERATOR_REGISTRY.freeze()
