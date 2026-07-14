@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -170,6 +171,183 @@ def _scaled_time_ns(value: int, unit: str) -> int | None:
     return scaled
 
 
+def _complete_row_quotient_matching(
+    candidates_by_row: dict[int, set[int]],
+) -> dict[int, int] | None:
+    """Match every row to a distinct cadence quotient, if possible."""
+    matched_row: dict[int, int] = {}
+    matched_quotient: dict[int, int] = {}
+    for start_row in sorted(
+        candidates_by_row,
+        key=lambda row: len(candidates_by_row[row]),
+    ):
+        pending = deque([start_row])
+        seen_rows = {start_row}
+        seen_quotients: set[int] = set()
+        previous_row_by_quotient: dict[int, int] = {}
+        free_quotient: int | None = None
+        while pending and free_quotient is None:
+            row = pending.popleft()
+            for quotient in sorted(candidates_by_row[row]):
+                if quotient in seen_quotients:
+                    continue
+                seen_quotients.add(quotient)
+                previous_row_by_quotient[quotient] = row
+                owner = matched_quotient.get(quotient)
+                if owner is None:
+                    free_quotient = quotient
+                    break
+                if owner not in seen_rows:
+                    seen_rows.add(owner)
+                    pending.append(owner)
+        if free_quotient is None:
+            return None
+
+        quotient = free_quotient
+        while True:
+            row = previous_row_by_quotient[quotient]
+            previous_quotient = matched_row.get(row)
+            matched_row[row] = quotient
+            matched_quotient[quotient] = row
+            if previous_quotient is None:
+                break
+            quotient = previous_quotient
+    return matched_row
+
+
+def _cadence_quotient_score(quotients: list[int]) -> tuple[int, int]:
+    ordered = sorted(quotients)
+    if len(set(ordered)) != len(ordered):
+        return (-1, 0)
+    exact_count = sum(
+        current - previous == 1
+        for previous, current in zip(ordered, ordered[1:])
+    )
+    return exact_count, -(ordered[-1] - ordered[0])
+
+
+def _has_single_unit_regular_run(
+    candidates_by_row: dict[int, list[tuple[int, int]]],
+) -> bool:
+    candidates_by_unit: dict[int, list[tuple[int, int]]] = {}
+    for row, options in candidates_by_row.items():
+        for quotient, unit_bit in options:
+            if unit_bit:
+                candidates_by_unit.setdefault(unit_bit, []).append((quotient, row))
+    for candidates in candidates_by_unit.values():
+        ordered = sorted(candidates)
+        for index in range(1, len(ordered) - 1):
+            previous_quotient, previous_row = ordered[index - 1]
+            current_quotient, current_row = ordered[index]
+            following_quotient, following_row = ordered[index + 1]
+            cadence_multiple = current_quotient - previous_quotient
+            if (
+                cadence_multiple > 0
+                and following_quotient - current_quotient == cadence_multiple
+                and len({previous_row, current_row, following_row}) == 3
+            ):
+                return True
+    return False
+
+
+def _has_better_single_row_mixed_lattice(
+    candidates_by_row: dict[int, list[tuple[int, int]]],
+    *,
+    common_units: int,
+) -> bool:
+    nonzero_rows = sum(
+        any(unit_bit for _quotient, unit_bit in options)
+        for options in candidates_by_row.values()
+    )
+    if nonzero_rows < 2:
+        return False
+    unit_bit = 1
+    while unit_bit <= common_units:
+        if not common_units & unit_bit:
+            unit_bit <<= 1
+            continue
+        baseline_by_row: dict[int, int] = {}
+        for row, options in candidates_by_row.items():
+            matching = {
+                quotient
+                for quotient, option_unit in options
+                if option_unit in (0, unit_bit)
+            }
+            if len(matching) != 1:
+                break
+            baseline_by_row[row] = matching.pop()
+        else:
+            baseline_score = _cadence_quotient_score(list(baseline_by_row.values()))
+            for row, options in candidates_by_row.items():
+                for quotient, option_unit in options:
+                    if option_unit in (0, unit_bit):
+                        continue
+                    alternative = [
+                        quotient if candidate_row == row else baseline
+                        for candidate_row, baseline in baseline_by_row.items()
+                    ]
+                    if _cadence_quotient_score(alternative) > baseline_score:
+                        return True
+        unit_bit <<= 1
+    return False
+
+
+def _has_mixed_unit_lattice_evidence(
+    values: list[int],
+    *,
+    nominal_ns: int,
+    selected_unit: str | None = None,
+) -> bool:
+    """Detect mixed-unit evidence across each complete cadence lattice."""
+    units = tuple(_TIME_UNIT_NS)
+    lattice: dict[int, dict[int, list[tuple[int, int]]]] = {}
+    for row_index, value in enumerate(values):
+        for unit_index, unit in enumerate(units):
+            timestamp_ns = _scaled_time_ns(value, unit)
+            if timestamp_ns is None:
+                continue
+            remainder = timestamp_ns % nominal_ns
+            quotient = (timestamp_ns - remainder) // nominal_ns
+            unit_bit = 0 if value == 0 else 1 << unit_index
+            lattice.setdefault(remainder, {}).setdefault(row_index, []).append(
+                (quotient, unit_bit)
+            )
+
+    all_units_mask = (1 << len(units)) - 1
+    for candidates_by_row in lattice.values():
+        if len(candidates_by_row) != len(values):
+            continue
+        common_units = all_units_mask
+        has_nonzero_row = False
+        for options in candidates_by_row.values():
+            row_units = 0
+            for _quotient, unit_bit in options:
+                row_units |= unit_bit
+            if row_units:
+                common_units &= row_units
+                has_nonzero_row = True
+        if not has_nonzero_row:
+            continue
+        if common_units:
+            if selected_unit is None:
+                continue
+            selected_bit = 1 << units.index(selected_unit)
+            if common_units & selected_bit and _has_better_single_row_mixed_lattice(
+                candidates_by_row,
+                common_units=selected_bit,
+            ):
+                return True
+            continue
+        quotient_candidates = {
+            row: {quotient for quotient, _unit_bit in options}
+            for row, options in candidates_by_row.items()
+        }
+        matching = _complete_row_quotient_matching(quotient_candidates)
+        if matching is not None and _has_single_unit_regular_run(candidates_by_row):
+            return True
+    return False
+
+
 def _best_mixed_unit_cadence(
     sorted_values: list[int],
     *,
@@ -313,6 +491,20 @@ def _numeric_time_to_utc(
             candidate for candidate in candidates if candidate[3] or candidate[4]
         ]
     if len(plausible) != 1:
+        if nominal_ns is not None:
+            mixed_lattice_evidence = _has_mixed_unit_lattice_evidence(
+                integers,
+                nominal_ns=nominal_ns,
+            )
+            mixed_multiple_run = _has_mixed_cadence_multiple_run(
+                integers,
+                nominal_ns=nominal_ns,
+            )
+            if mixed_lattice_evidence or mixed_multiple_run:
+                raise DataValidationError(
+                    "mixed numeric timestamp units: values require multiple "
+                    "epoch units on one cadence lattice"
+                )
         raise DataValidationError(
             "ambiguous numeric timestamp unit: cadence does not uniquely "
             f"identify one epoch unit for timeframe {timeframe}"
@@ -328,7 +520,16 @@ def _numeric_time_to_utc(
             integers,
             nominal_ns=nominal_ns,
         )
-        if mixed_exact > selected[2] or mixed_multiple_run:
+        mixed_lattice_evidence = _has_mixed_unit_lattice_evidence(
+            integers,
+            nominal_ns=nominal_ns,
+            selected_unit=selected[0],
+        )
+        if (
+            mixed_exact > selected[2]
+            or mixed_multiple_run
+            or mixed_lattice_evidence
+        ):
             raise DataValidationError(
                 "mixed numeric timestamp units: values align better under "
                 "multiple epoch units"

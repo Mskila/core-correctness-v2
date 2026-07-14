@@ -289,3 +289,73 @@ def test_mixed_epoch_units_are_rejected_at_cadence_multiples(
             symbol="EURUSD",
             timeframe="H1",
         )
+
+
+_PROPERTY_TIME_UNIT_NS = {
+    "s": 1_000_000_000,
+    "ms": 1_000_000,
+    "us": 1_000,
+    "ns": 1,
+}
+_PROPERTY_UNIT_PAIRS = [
+    (left, right)
+    for left in _PROPERTY_TIME_UNIT_NS
+    for right in _PROPERTY_TIME_UNIT_NS
+    if left != right
+]
+
+
+@st.composite
+def _mixed_lattice_insertion_case(
+    draw: st.DrawFn,
+) -> tuple[list[int], list[int]]:
+    length = draw(st.integers(min_value=4, max_value=8))
+    multiplier = draw(st.integers(min_value=1, max_value=16))
+    minority_unit, majority_unit = draw(st.sampled_from(_PROPERTY_UNIT_PAIRS))
+    third_unit = draw(
+        st.one_of(
+            st.none(),
+            st.sampled_from(
+                [
+                    unit
+                    for unit in _PROPERTY_TIME_UNIT_NS
+                    if unit not in (minority_unit, majority_unit)
+                ]
+            ),
+        )
+    )
+    base_seconds = draw(
+        st.integers(min_value=946_684_800, max_value=2_000_000_000)
+    )
+    offsets = [0, 2 * multiplier, 3 * multiplier, 4 * multiplier]
+    offsets.extend((5 + index) * multiplier for index in range(length - 4))
+    units = [minority_unit, *([majority_unit] * (length - 1))]
+    if third_unit is not None:
+        units[draw(st.integers(min_value=1, max_value=length - 1))] = third_unit
+
+    nominal_ns = 3_600_000_000_000
+    base_ns = base_seconds * 1_000_000_000
+    encoded = [
+        (base_ns + offset * nominal_ns) // _PROPERTY_TIME_UNIT_NS[unit]
+        for offset, unit in zip(offsets, units)
+    ]
+    order_mode = draw(st.sampled_from(("forward", "reverse", "rotate")))
+    order = list(range(length))
+    if order_mode == "reverse":
+        order.reverse()
+    elif order_mode == "rotate":
+        pivot = draw(st.integers(min_value=1, max_value=length - 1))
+        order = order[pivot:] + order[:pivot]
+    return encoded, order
+
+
+@settings(max_examples=200)
+@given(case=_mixed_lattice_insertion_case())
+def test_mixed_epoch_unit_lattice_insertions_are_rejected_for_arbitrary_lengths(
+    case: tuple[list[int], list[int]],
+) -> None:
+    encoded, order = case
+    frame = _make_symbol_df(encoded).iloc[order]
+
+    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
