@@ -355,10 +355,99 @@ def test_execution_rejects_nonzero_float16_cost_underflow() -> None:
         )
 
 
+def test_execution_rejects_float64_working_cost_product_underflow() -> None:
+    with pytest.raises(DataValidationError, match="cost component.*underflow"):
+        run_execution(
+            factors=torch.atanh(
+                torch.tensor([[0.5, 0.0, 0.0]], dtype=torch.float64)
+            ),
+            target_ret=torch.zeros((1, 3), dtype=torch.float64),
+            target_valid=torch.tensor([[True, False, False]]),
+            bar_time_ns=_hourly_times(3),
+            cost_rate=math.ulp(0.0),
+            min_exposure=0.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "factors",
+    [
+        torch.tensor(
+            [[math.atanh(0.5), 1.0, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        torch.tensor(
+            [[1.0, math.atanh(-0.5), 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+    ],
+    ids=["entry-turnover", "final-liquidation"],
+)
+def test_execution_rejects_each_float64_cost_component_underflow(
+    factors: torch.Tensor,
+) -> None:
+    with pytest.raises(DataValidationError, match="cost component.*underflow"):
+        run_execution(
+            factors=factors,
+            target_ret=torch.zeros((1, 4), dtype=torch.float64),
+            target_valid=torch.tensor([[True, True, False, False]]),
+            bar_time_ns=_hourly_times(4),
+            cost_rate=math.ulp(0.0),
+            min_exposure=0.0,
+        )
+
+
 @pytest.mark.parametrize(
     "dtype",
-    [torch.float16, torch.float32, torch.float64],
-    ids=["float16", "float32", "float64"],
+    [torch.float16, torch.bfloat16],
+    ids=["float16", "bfloat16"],
+)
+def test_execution_rejects_low_precision_working_cost_product_underflow(
+    dtype: torch.dtype,
+) -> None:
+    with pytest.raises(DataValidationError, match="cost component.*underflow"):
+        run_execution(
+            factors=torch.atanh(torch.tensor([[0.5, 0.0, 0.0]], dtype=dtype)),
+            target_ret=torch.zeros((1, 3), dtype=dtype),
+            target_valid=torch.tensor([[True, False, False]]),
+            bar_time_ns=_hourly_times(3),
+            cost_rate=1e-46,
+            min_exposure=0.0,
+        )
+
+
+def test_execution_accepts_representable_float64_subnormal_cost() -> None:
+    result = run_execution(
+        factors=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float64),
+        target_ret=torch.zeros((1, 3), dtype=torch.float64),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=math.ulp(0.0),
+        min_exposure=0.0,
+    )
+
+    assert result.cost[0, 0] == 2 * math.ulp(0.0)
+    assert result.final_liquidation_cost[0] == math.ulp(0.0)
+
+
+def test_execution_accepts_float32_cost_rate_below_property_old_floor() -> None:
+    result = run_execution(
+        factors=torch.atanh(torch.tensor([[0.5, 0.0, 0.0]], dtype=torch.float32)),
+        target_ret=torch.zeros((1, 3), dtype=torch.float32),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=1e-8,
+        min_exposure=0.0,
+    )
+
+    assert result.cost[0, 0] > 0
+    assert result.final_liquidation_cost[0] > 0
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32, torch.float64],
+    ids=["float16", "bfloat16", "float32", "float64"],
 )
 def test_execution_preserves_representable_cost_dtype_and_gradient(
     dtype: torch.dtype,

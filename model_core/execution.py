@@ -121,6 +121,21 @@ def _validate_cost_publication(
         )
 
 
+def _validate_cost_component_product(
+    working_source: Tensor,
+    cost_rate: float,
+    working_product: Tensor,
+) -> None:
+    underflowed = (
+        cost_rate != 0.0
+        and bool(((working_source != 0) & (working_product == 0)).any())
+    )
+    if underflowed:
+        raise DataValidationError(
+            "non-zero execution cost component underflowed in the working dtype"
+        )
+
+
 def factor_to_position(factors: Tensor, *, min_exposure: float) -> Tensor:
     """Convert finite factors to continuous positions with a neutral band."""
     if not math.isfinite(min_exposure) or min_exposure < 0.0:
@@ -229,15 +244,27 @@ def run_execution(
     cost_work_dtype = _cost_work_dtype(position.dtype)
     position_for_cost = position.to(cost_work_dtype)
     turnover_for_cost = turnover.to(cost_work_dtype)
-    liquidation_cost_by_time_work = torch.where(
+    liquidation_position_for_cost = torch.where(
         final_valid,
-        position_for_cost.abs() * cost_rate,
+        position_for_cost.abs(),
         torch.zeros_like(position_for_cost),
+    )
+    turnover_cost_work = turnover_for_cost * cost_rate
+    liquidation_cost_by_time_work = liquidation_position_for_cost * cost_rate
+    _validate_cost_component_product(
+        turnover_for_cost,
+        cost_rate,
+        turnover_cost_work,
+    )
+    _validate_cost_component_product(
+        liquidation_position_for_cost,
+        cost_rate,
+        liquidation_cost_by_time_work,
     )
     final_liquidation_cost_work = liquidation_cost_by_time_work.sum(dim=1)
     cost_work = torch.where(
         target_valid,
-        turnover_for_cost * cost_rate + liquidation_cost_by_time_work,
+        turnover_cost_work + liquidation_cost_by_time_work,
         torch.zeros_like(position_for_cost),
     )
     final_liquidation_cost = final_liquidation_cost_work.to(position.dtype)
