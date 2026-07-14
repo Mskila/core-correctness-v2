@@ -364,3 +364,226 @@ def test_window_one_keeps_unrelated_subnormal_branch_gradient() -> None:
 
     torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
     torch.testing.assert_close(x.grad, branch_weights, rtol=0, atol=0)
+
+
+def _ordinary_gradient_from_upstream(
+    pattern: torch.Tensor,
+    window: int,
+    upstream: torch.Tensor,
+) -> torch.Tensor:
+    reference_input = pattern.clone().requires_grad_()
+    reference = _direct_prefix_zscore(reference_input, window)
+    reference.backward(upstream)
+    assert reference_input.grad is not None
+    return reference_input.grad
+
+
+def test_signed_log_aggregation_preserves_exact_cancellation_residual() -> None:
+    scale = torch.nextafter(
+        torch.tensor(0.0, dtype=torch.float64),
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+    pattern = torch.tensor(
+        [[-2.0, -2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0, -2.0]],
+        dtype=torch.float64,
+    )
+    upstream = torch.zeros_like(pattern)
+    upstream[0, 6] = scale
+    upstream[0, 7] = 1.0e308
+    upstream[0, 8] = -1.0e308
+    x = (pattern * scale).requires_grad_()
+
+    causal_rolling_zscore(x, window=4).backward(upstream)
+
+    assert x.grad is not None
+    assert x.grad[0, 6].item() == pytest.approx(
+        1.539600717839002,
+        rel=0,
+        abs=1.0e-15,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "pattern",
+        "window",
+        "target",
+        "small_upstream",
+        "large_outputs",
+        "large_signs",
+    ),
+    [
+        (
+            [-2.0, -2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0, -2.0],
+            4,
+            6,
+            {6: 1.0},
+            (7, 8),
+            (-1.0, 1.0),
+        ),
+        (
+            [-2.0, -2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0, -2.0],
+            4,
+            6,
+            {6: -1.0},
+            (7, 8),
+            (-1.0, 1.0),
+        ),
+        (
+            [-2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0, -2.0],
+            4,
+            7,
+            {7: 1.0},
+            (8, 9),
+            (1.0, -1.0),
+        ),
+        (
+            [-2.0, -2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0, -2.0, -2.0],
+            5,
+            6,
+            {6: 1.0, 7: 2.0},
+            (8, 9),
+            (1.0, -1.0),
+        ),
+        (
+            [-2.0, -2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0, -2.0, -2.0],
+            5,
+            6,
+            {8: 1.0},
+            (7, 9),
+            (1.0, -1.0),
+        ),
+        (
+            [-2.0, -2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0, -2.0, -2.0],
+            5,
+            6,
+            {9: 1.0},
+            (7, 8),
+            (1.0, -1.0),
+        ),
+        (
+            [
+                -2.0,
+                -2.0,
+                -2.0,
+                -2.0,
+                -2.0,
+                -1.0,
+                -2.0,
+                -2.0,
+                -2.0,
+                17.0,
+                -31.0,
+            ],
+            4,
+            6,
+            {6: 1.0},
+            (7, 8),
+            (1.0, -1.0),
+        ),
+    ],
+)
+def test_signed_log_cancellation_matrix_is_order_and_cut_invariant(
+    pattern,
+    window,
+    target,
+    small_upstream,
+    large_outputs,
+    large_signs,
+) -> None:
+    scale = torch.nextafter(
+        torch.tensor(0.0, dtype=torch.float64),
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+    values = torch.tensor([pattern], dtype=torch.float64)
+    small = torch.zeros_like(values)
+    actual_upstream = torch.zeros_like(values)
+    for index, weight in small_upstream.items():
+        small[0, index] = weight
+        actual_upstream[0, index] = weight * scale
+    for index, sign in zip(large_outputs, large_signs):
+        actual_upstream[0, index] = sign * 1.0e308
+    expected = _ordinary_gradient_from_upstream(values, window, small)[0, target]
+    x = (values * scale).requires_grad_()
+
+    causal_rolling_zscore(x, window).backward(actual_upstream)
+
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad[0, target], expected, rtol=0, atol=1.0e-15)
+
+
+def test_repeated_value_structural_zero_jacobian_is_exact() -> None:
+    scale = torch.nextafter(
+        torch.tensor(0.0, dtype=torch.float64),
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+    pattern = torch.tensor(
+        [[-2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0]],
+        dtype=torch.float64,
+    )
+    x = (pattern * scale).requires_grad_()
+
+    causal_rolling_zscore(x, window=3)[0, 6].backward()
+
+    assert x.grad is not None
+    assert x.grad[0, 4].item() == 0.0
+
+
+@pytest.mark.parametrize(
+    ("tail", "window", "target_offset"),
+    [
+        ([-1.0, -2.0, -2.0], 3, 0),
+        ([1.0, 2.0, 2.0], 3, 0),
+        ([1.0, 0.0, 0.0], 3, 0),
+        ([-2.0, -1.0, -2.0], 3, 1),
+        ([-1.0, -2.0, -2.0, -2.0], 4, 0),
+        ([-2.0, -1.0, -2.0, -2.0], 4, 1),
+        ([-1.0, -2.0, -2.0, -2.0, -2.0], 5, 0),
+    ],
+)
+def test_repeated_value_structural_zero_matrix(
+    tail,
+    window,
+    target_offset,
+) -> None:
+    scale = torch.nextafter(
+        torch.tensor(0.0, dtype=torch.float64),
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+    prefix = [-7.0] * 5
+    pattern = torch.tensor([prefix + tail], dtype=torch.float64)
+    target = len(prefix) + target_offset
+    x = (pattern * scale).requires_grad_()
+
+    causal_rolling_zscore(x, window)[0, -1].backward()
+
+    assert x.grad is not None
+    assert x.grad[0, target].item() == 0.0
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        [-1.0, -2.0, -3.0],
+        [-1.0, -3.0, -2.0],
+        [1.0, -2.0, 3.0],
+    ],
+)
+def test_nearby_true_subnormal_jacobian_is_not_erased(tail) -> None:
+    scale = torch.nextafter(
+        torch.tensor(0.0, dtype=torch.float64),
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+    pattern = torch.tensor([[-7.0] * 5 + tail], dtype=torch.float64)
+    ordinary = pattern.clone().requires_grad_()
+    _direct_prefix_zscore(ordinary, 3)[0, -1].backward()
+    x = (pattern * scale).requires_grad_()
+
+    causal_rolling_zscore(x, window=3)[0, -1].backward()
+
+    assert ordinary.grad is not None and x.grad is not None
+    expected_sign = torch.sign(ordinary.grad[0, -3])
+    assert expected_sign != 0
+    assert torch.isfinite(x.grad).all()
+    assert x.grad[0, -3] != 0
+    assert torch.sign(x.grad[0, -3]) == expected_sign
