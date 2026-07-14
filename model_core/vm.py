@@ -1,4 +1,5 @@
 import torch
+from .causal import causal_rolling_zscore
 from .ops import OPS_CONFIG
 from .vocab import FORMULA_VOCAB
 
@@ -10,7 +11,7 @@ from .vocab import FORMULA_VOCAB
 # TS_SUM_*: 本身不恒正，但如果输入已经非负则输出更正
 # TS_MAX_*: 取最大值，如果输入含正数则偏向正
 # 我们用「感染性算子」概念：一旦前面出现了恒正算子，后续的 TS_SUM/TS_MEAN/TS_MAX
-# 都不会让值域变回有正有负，反而会强化正值。只有 SUB/NEG/DIV/TS_ZSCORE/CS_NEUTRALIZE
+# 都不会让值域变回有正有负，反而会强化正值。只有 SUB/NEG/DIV/TS_ZSCORE
 # 等算子才能「恢复」符号信息。
 POSITIVE_ONLY_OPS = {"TS_RANK_5", "TS_RANK_10", "TS_RANK_20", "ABS"}
 # 感染传播算子：在恒正值域上使用时，输出仍为恒正
@@ -37,7 +38,6 @@ INFECTED_PROPAGATING_OPS = {
 SIGN_RESTORE_OPS = {
     "SUB", "DIV", "NEG", "GATE", "IF_GT",
     "TS_ZSCORE_10", "TS_ZSCORE_20",
-    "CS_NEUTRALIZE", "CS_RANK", "CS_SCALE",
     "TS_STD_5", "TS_STD_10", "TS_STD_20",
     "TS_CORR_10", "TS_SKEW_10", "TS_QUANTILE_10",
     "DELTA", "DELTA_5", "MOMENTUM_5", "MOMENTUM_10",
@@ -66,7 +66,7 @@ def validate_formula_structure(formula_tokens: list[int], vocab_names: tuple[str
     使用「感染模型」：一旦公式中出现恒正算子（如 TS_RANK），
     后续如果连续使用传播算子（如 TS_SUM/TS_MEAN/CLIP/SQRT），
     值域会一直保持非负，导致因子退化成 beta。
-    只有恢复算子（如 SUB/TS_ZSCORE/CS_NEUTRALIZE）才能打破感染。
+    只有恢复算子（如 SUB/TS_ZSCORE）才能打破感染。
     
     规则：
     1. 禁止恒正算子后连续 2 个以上传播算子（感染链太长）
@@ -119,22 +119,7 @@ def validate_formula_structure(formula_tokens: list[int], vocab_names: tuple[str
     
     return violations
 
-# ── 扩展后词表规模说明（task 12.1）──────────────────────────────────────────
-#
-# 本次扩展（factor-operator-library-expansion）后：
-#   - 特征数 F  = len(FORMULA_VOCAB.feature_names)  （当前 65，覆盖 8 大类）
-#   - 算子数 O  = len(OPS_CONFIG)                    （当前 66）
-#   - 词表总 size = F + O = 131
-#   - feat_offset = F = 65（feature token id ∈ [0, 64]）
-#   - operator token id ∈ [F, F+O-1] = [65, 130]
-#
-# StackVM 的 op_map / arity_map **完全动态**从 FORMULA_VOCAB 与 OPS_CONFIG 派生，
-# 不硬编码任何 token 数或偏移值，因此无需在此处做任何结构变更。后续再次扩展
-# 特征或算子时只需更新注册表，VM 自动消费。
-#
-# Cross-sectional 算子（CS_RANK / CS_SCALE / CS_NEUTRALIZE）沿 N 维逐时间步
-# 操作，输入/输出形状均为 [N, T]，满足统一的 [N,T]→[N,T] 契约（R2.9）；
-# VM 主循环无需对它们做任何特殊处理。
+# StackVM 的 op_map / arity_map 完全从 V2 词表和 OPS_CONFIG 动态派生。
 
 
 class StackVM:
@@ -152,42 +137,12 @@ class StackVM:
 
     @staticmethod
     def _normalize_output(x: torch.Tensor) -> torch.Tensor:
-        """
-        对因子输出做标准化，确保幅度足够触发 neutral band 入场。
-
-        策略（三级降级）：
-        1. 截面 zscore（跨品种，每时间步）：适合因子跨品种有分散
-        2. 时序 zscore（每品种，全局）：当截面 std 太小时使用
-        3. 若两级都失败（因子是常数）：返回原值，由 const_cnt 拦截
-
-        Returns:
-            [N, T] clip 到 [-3, 3]，若是常数则返回原值（engine 会过滤）
-        """
-        N, T = x.shape
-
-        # 检测是否是全局常数（标准化无意义）
-        global_std = x.std()
-        if global_std < 1e-6:
-            return x   # 常数因子，由 engine 的 const_cnt 拦截
-
-        # ── 截面标准化（跨品种，每时间步；N=1 时跳过）──────────────
-        if N > 1:
-            cs_mean = x.mean(dim=0, keepdim=True)
-            cs_std  = x.std(dim=0, keepdim=True).clamp(min=1e-8)
-            cs_z    = (x - cs_mean) / cs_std
-            if cs_z.std() >= 0.3:
-                return torch.clamp(cs_z, -3.0, 3.0)
-
-        # ── 时序标准化（每品种独立）─────────────────────────────────
-        ts_mean = x.mean(dim=1, keepdim=True)
-        ts_std  = x.std(dim=1, keepdim=True).clamp(min=1e-8)
-        ts_z    = (x - ts_mean) / ts_std
-
-        if ts_z.std() >= 0.1:
-            return torch.clamp(ts_z, -3.0, 3.0)
-
-        # ── 两级均失败：因子无区分度，返回原值让 engine 过滤 ────────
-        return x
+        """Normalize each single-symbol history using only its causal prefix."""
+        normalized = causal_rolling_zscore(x, 200)
+        normalized = torch.nan_to_num(
+            normalized, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        return torch.clamp(normalized, -3.0, 3.0)
 
     def execute(self, formula_tokens, feat_tensor):
         stack = []
