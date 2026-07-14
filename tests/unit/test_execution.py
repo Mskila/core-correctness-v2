@@ -239,6 +239,68 @@ def test_execution_rejects_non_prefix_valid_mask() -> None:
         )
 
 
+def test_execution_rejects_unrepresentable_finite_float16_result() -> None:
+    with pytest.raises(DataValidationError, match="execution result.*finite"):
+        run_execution(
+            factors=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float16),
+            target_ret=torch.zeros((1, 3), dtype=torch.float16),
+            target_valid=torch.tensor([[True, False, False]]),
+            bar_time_ns=_hourly_times(3),
+            cost_rate=40_000.0,
+            min_exposure=0.0,
+        )
+
+
+def test_execution_snapshots_target_valid_for_repeatable_ledger() -> None:
+    target_valid = torch.tensor([[True, True, False, False]])
+    expected_target_valid = target_valid.clone()
+    result = run_execution(
+        factors=torch.tensor([[0.2, 0.3, 0.0, 0.0]]),
+        target_ret=torch.tensor([[0.1, 0.2, 0.0, 0.0]]),
+        target_valid=target_valid,
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.01,
+        min_exposure=0.0,
+    )
+    ledger_before = build_execution_ledger(result, ["EURUSD"])
+
+    assert result.target_valid.data_ptr() != target_valid.data_ptr()
+    target_valid[0, 1] = False
+
+    torch.testing.assert_close(result.target_valid, expected_target_valid)
+    ledger_after = build_execution_ledger(result, ["EURUSD"])
+    assert ledger_after == ledger_before
+    assert sum(row.net_pnl for row in ledger_after) == pytest.approx(
+        result.net_pnl[result.target_valid].sum().item(),
+        abs=1e-8,
+    )
+
+
+def test_execution_snapshots_bar_time_for_repeatable_ledger() -> None:
+    bar_time_ns = _hourly_times(4)
+    expected_bar_time_ns = bar_time_ns.clone()
+    result = run_execution(
+        factors=torch.tensor([[0.2, 0.3, 0.0, 0.0]]),
+        target_ret=torch.tensor([[0.1, 0.2, 0.0, 0.0]]),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=bar_time_ns,
+        cost_rate=0.01,
+        min_exposure=0.0,
+    )
+    ledger_before = build_execution_ledger(result, ["EURUSD"])
+
+    assert result.bar_time_ns.data_ptr() != bar_time_ns.data_ptr()
+    bar_time_ns[0, 1] += 1
+
+    torch.testing.assert_close(result.bar_time_ns, expected_bar_time_ns)
+    ledger_after = build_execution_ledger(result, ["EURUSD"])
+    assert ledger_after == ledger_before
+    assert sum(row.net_pnl for row in ledger_after) == pytest.approx(
+        result.net_pnl[result.target_valid].sum().item(),
+        abs=1e-8,
+    )
+
+
 def test_execution_keeps_nonzero_factor_gradient() -> None:
     factors = torch.tensor([[0.2, -0.4, 0.0, 0.0]], requires_grad=True)
     result = run_execution(
@@ -357,7 +419,7 @@ def test_performance_metrics_is_invariant_to_symbol_row_permutation() -> None:
     result = ExecutionResult(
         position=zeros,
         turnover=zeros,
-        gross_pnl=zeros,
+        gross_pnl=net_pnl,
         cost=zeros,
         net_pnl=net_pnl,
         target_valid=valid,
@@ -554,6 +616,28 @@ def _consumer_result() -> ExecutionResult:
         cost_rate=0.0,
         min_exposure=0.05,
     )
+
+
+@pytest.mark.parametrize("field_name", ["gross_pnl", "cost", "net_pnl"])
+def test_execution_ledger_rejects_inconsistent_pnl_fields(
+    field_name: str,
+) -> None:
+    result = _consumer_result()
+    inconsistent_value = getattr(result, field_name).clone()
+    inconsistent_value[0, 0] += 1.0
+    result = replace(result, **{field_name: inconsistent_value})
+
+    with pytest.raises(
+        DataValidationError,
+        match="net_pnl.*gross_pnl.*cost",
+    ):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+@pytest.mark.parametrize("invalid_symbol", [None, 7, ""])
+def test_execution_ledger_rejects_invalid_symbol(invalid_symbol: object) -> None:
+    with pytest.raises(DataValidationError, match="non-empty strings"):
+        build_execution_ledger(_consumer_result(), [invalid_symbol])  # type: ignore[list-item]
 
 
 @pytest.mark.parametrize(

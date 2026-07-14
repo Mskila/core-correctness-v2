@@ -141,6 +141,8 @@ def run_execution(
         bar_time_ns=bar_time_ns,
         cost_rate=cost_rate,
     )
+    target_valid = target_valid.clone()
+    bar_time_ns = bar_time_ns.clone()
 
     raw_position = factor_to_position(factors, min_exposure=min_exposure)
     position = torch.where(
@@ -190,6 +192,18 @@ def run_execution(
         gross_pnl - cost,
         torch.zeros_like(position),
     )
+    floating_fields = (
+        position,
+        turnover,
+        gross_pnl,
+        cost,
+        net_pnl,
+        final_liquidation_cost,
+    )
+    if not all(bool(torch.isfinite(value).all()) for value in floating_fields):
+        raise DataValidationError(
+            "execution result floating fields must contain only finite values"
+        )
 
     return ExecutionResult(
         position=position,
@@ -359,6 +373,27 @@ def _validate_ledger_result(result: ExecutionResult) -> Tensor:
             raise DataValidationError(
                 f"valid {field_name} values must be finite"
             )
+
+    valid_gross = result.gross_pnl[result.target_valid].to(torch.float64)
+    valid_cost = result.cost[result.target_valid].to(torch.float64)
+    valid_net = result.net_pnl[result.target_valid].to(torch.float64)
+    expected_net = valid_gross - valid_cost
+    comparison_epsilon = max(
+        torch.finfo(value.dtype).eps
+        for value in (result.gross_pnl, result.cost, result.net_pnl)
+    )
+    comparison_scale = torch.maximum(
+        torch.maximum(valid_gross.abs(), valid_cost.abs()),
+        valid_net.abs(),
+    )
+    tolerance = comparison_scale * (4.0 * comparison_epsilon)
+    consistent = torch.isfinite(expected_net) & (
+        (valid_net - expected_net).abs() <= tolerance
+    )
+    if not bool(consistent.all()):
+        raise DataValidationError(
+            "valid net_pnl must equal gross_pnl - cost within dtype tolerance"
+        )
     return valid_counts
 
 
@@ -494,11 +529,17 @@ def build_execution_ledger(
     """Copy each valid shared execution row into an auditable ledger."""
     valid_counts = _validate_ledger_result(result)
     symbol_count, time_length = result.target_valid.shape
+    if not isinstance(symbols, (list, tuple)):
+        raise DataValidationError(
+            "symbols must be a list or tuple of non-empty strings"
+        )
     if len(symbols) != symbol_count:
         raise DataValidationError(
             f"symbols length must match execution rows: "
             f"expected {symbol_count}, actual {len(symbols)}"
         )
+    if any(not isinstance(symbol, str) or symbol == "" for symbol in symbols):
+        raise DataValidationError("symbols must contain only non-empty strings")
 
     if bool((valid_counts + 1 >= time_length).any()):
         raise DataValidationError("final exit timestamp is missing for ledger")
