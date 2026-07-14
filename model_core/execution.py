@@ -21,7 +21,7 @@ _EXECUTION_RESULT_TENSOR_FIELDS = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExecutionResult:
     """Immutable execution snapshot with differentiable defensive tensor access."""
 
@@ -436,41 +436,57 @@ def derive_periods_per_year(bar_time_ns: Tensor, target_valid: Tensor) -> float:
     return periods
 
 
-def _validate_performance_result(result: ExecutionResult) -> None:
-    if result.net_pnl.shape != result.target_valid.shape:
+def _validate_performance_result(
+    *,
+    net_pnl: Tensor,
+    target_valid: Tensor,
+    bar_time_ns: Tensor,
+) -> None:
+    if net_pnl.shape != target_valid.shape:
         raise DataValidationError("net_pnl shape must match target_valid")
-    _validate_supported_float_tensor(result.net_pnl, name="net_pnl")
-    if result.net_pnl.device != result.target_valid.device:
+    _validate_supported_float_tensor(net_pnl, name="net_pnl")
+    if net_pnl.device != target_valid.device:
         raise DataValidationError(
             "net_pnl, target_valid, and bar_time_ns must use the same device"
         )
-    valid_counts = _validate_time_mask(result.bar_time_ns, result.target_valid)
+    valid_counts = _validate_time_mask(bar_time_ns, target_valid)
     _validate_relevant_timestamps(
-        result.bar_time_ns,
+        bar_time_ns,
         valid_counts,
         start_index=1,
         missing_exit_message="final exit timestamp is missing",
     )
 
 
-def _validate_ledger_result(result: ExecutionResult) -> Tensor:
+def _validate_ledger_result(
+    *,
+    bar_time_ns: Tensor,
+    target_valid: Tensor,
+    position: Tensor,
+    gross_pnl: Tensor,
+    cost: Tensor,
+    net_pnl: Tensor,
+) -> Tensor:
     valid_counts = _validate_time_mask(
-        result.bar_time_ns,
-        result.target_valid,
+        bar_time_ns,
+        target_valid,
         minimum_observations=1,
     )
     _validate_relevant_timestamps(
-        result.bar_time_ns,
+        bar_time_ns,
         valid_counts,
         start_index=0,
         missing_exit_message="final exit timestamp is missing for ledger",
     )
-    expected_shape = result.target_valid.shape
-    expected_device = result.target_valid.device
-    read_fields: dict[str, Tensor] = {}
-    for field_name in ("position", "gross_pnl", "cost", "net_pnl"):
-        value = getattr(result, field_name)
-        read_fields[field_name] = value
+    expected_shape = target_valid.shape
+    expected_device = target_valid.device
+    read_fields = {
+        "position": position,
+        "gross_pnl": gross_pnl,
+        "cost": cost,
+        "net_pnl": net_pnl,
+    }
+    for field_name, value in read_fields.items():
         if value.shape != expected_shape:
             raise DataValidationError(
                 f"{field_name} shape must match target_valid"
@@ -480,7 +496,7 @@ def _validate_ledger_result(result: ExecutionResult) -> Tensor:
             raise DataValidationError(
                 f"{field_name} must use the same device as target_valid"
             )
-        if not bool(torch.isfinite(value[result.target_valid]).all()):
+        if not bool(torch.isfinite(value[target_valid]).all()):
             raise DataValidationError(
                 f"valid {field_name} values must be finite"
             )
@@ -490,7 +506,6 @@ def _validate_ledger_result(result: ExecutionResult) -> Tensor:
             "ledger read fields must use the same dtype"
         )
 
-    target_valid = result.target_valid
     valid_gross = read_fields["gross_pnl"][target_valid]
     valid_cost = read_fields["cost"][target_valid]
     valid_net = read_fields["net_pnl"][target_valid]
@@ -524,14 +539,21 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
     concatenation, is invariant to symbol row order, and preserves one-symbol
     behavior.
     """
-    _validate_performance_result(result)
-    net_pnl = result.net_pnl[result.target_valid]
+    net_pnl_by_symbol = result.net_pnl
+    target_valid = result.target_valid
+    bar_time_ns = result.bar_time_ns
+    _validate_performance_result(
+        net_pnl=net_pnl_by_symbol,
+        target_valid=target_valid,
+        bar_time_ns=bar_time_ns,
+    )
+    net_pnl = net_pnl_by_symbol[target_valid]
     if not bool(torch.isfinite(net_pnl).all()):
         raise DataValidationError("valid net_pnl values must be finite")
     net_pnl = net_pnl.to(torch.float64)
     periods_per_year = derive_periods_per_year(
-        result.bar_time_ns,
-        result.target_valid,
+        bar_time_ns,
+        target_valid,
     )
     observations = net_pnl.numel()
     elapsed_years = observations / periods_per_year
@@ -553,10 +575,10 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
         )
 
     symbol_max_drawdowns: list[Tensor] = []
-    for symbol_index in range(result.net_pnl.shape[0]):
-        symbol_net_pnl = result.net_pnl[
+    for symbol_index in range(net_pnl_by_symbol.shape[0]):
+        symbol_net_pnl = net_pnl_by_symbol[
             symbol_index,
-            result.target_valid[symbol_index],
+            target_valid[symbol_index],
         ].to(torch.float64)
         cumulative_log_return = torch.cumsum(symbol_net_pnl, dim=0)
         if not bool(torch.isfinite(cumulative_log_return).all()):
@@ -657,8 +679,21 @@ def build_execution_ledger(
     symbols: list[str] | tuple[str, ...],
 ) -> list[LedgerEntry]:
     """Copy each valid shared execution row into an auditable ledger."""
-    valid_counts = _validate_ledger_result(result)
-    symbol_count, time_length = result.target_valid.shape
+    target_valid = result.target_valid
+    bar_time_ns = result.bar_time_ns
+    position = result.position
+    gross_pnl = result.gross_pnl
+    cost = result.cost
+    net_pnl = result.net_pnl
+    valid_counts = _validate_ledger_result(
+        bar_time_ns=bar_time_ns,
+        target_valid=target_valid,
+        position=position,
+        gross_pnl=gross_pnl,
+        cost=cost,
+        net_pnl=net_pnl,
+    )
+    symbol_count, time_length = target_valid.shape
     if not isinstance(symbols, (list, tuple)):
         raise DataValidationError(
             "symbols must be a list or tuple of non-empty strings"
@@ -674,36 +709,34 @@ def build_execution_ledger(
     if bool((valid_counts + 1 >= time_length).any()):
         raise DataValidationError("final exit timestamp is missing for ledger")
 
+    valid_count_values = [
+        int(valid_count)
+        for valid_count in valid_counts.detach().cpu().tolist()
+    ]
+    bar_time_values = bar_time_ns.detach().cpu().tolist()
+    position_values = position.detach().cpu().tolist()
+    gross_pnl_values = gross_pnl.detach().cpu().tolist()
+    cost_values = cost.detach().cpu().tolist()
+    net_pnl_values = net_pnl.detach().cpu().tolist()
+
     ledger: list[LedgerEntry] = []
     for symbol_index, symbol in enumerate(symbols):
-        valid_count = int(valid_counts[symbol_index].detach().cpu())
+        valid_count = valid_count_values[symbol_index]
         for time_index in range(valid_count):
             ledger.append(
                 LedgerEntry(
                     symbol=symbol,
-                    signal_time_ns=int(
-                        result.bar_time_ns[symbol_index, time_index].detach().cpu()
-                    ),
+                    signal_time_ns=int(bar_time_values[symbol_index][time_index]),
                     entry_time_ns=int(
-                        result.bar_time_ns[symbol_index, time_index + 1]
-                        .detach()
-                        .cpu()
+                        bar_time_values[symbol_index][time_index + 1]
                     ),
                     exit_time_ns=int(
-                        result.bar_time_ns[symbol_index, time_index + 2]
-                        .detach()
-                        .cpu()
+                        bar_time_values[symbol_index][time_index + 2]
                     ),
-                    position=float(
-                        result.position[symbol_index, time_index].detach().cpu()
-                    ),
-                    gross_pnl=float(
-                        result.gross_pnl[symbol_index, time_index].detach().cpu()
-                    ),
-                    cost=float(result.cost[symbol_index, time_index].detach().cpu()),
-                    net_pnl=float(
-                        result.net_pnl[symbol_index, time_index].detach().cpu()
-                    ),
+                    position=float(position_values[symbol_index][time_index]),
+                    gross_pnl=float(gross_pnl_values[symbol_index][time_index]),
+                    cost=float(cost_values[symbol_index][time_index]),
+                    net_pnl=float(net_pnl_values[symbol_index][time_index]),
                     is_final_liquidation=time_index == valid_count - 1,
                 )
             )

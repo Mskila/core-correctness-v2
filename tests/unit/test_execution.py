@@ -1,9 +1,11 @@
 from dataclasses import FrozenInstanceError, fields, replace
+import inspect
 import math
 import pickle
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from model_core.execution import (
     ExecutionResult,
@@ -28,6 +30,27 @@ _EXECUTION_TENSOR_FIELDS = (
     "bar_time_ns",
     "final_liquidation_cost",
 )
+
+
+class _CloneStatsMode(TorchDispatchMode):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.elements = 0
+
+    def __torch_dispatch__(
+        self,
+        func: object,
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        if func is torch.ops.aten.clone.default:
+            tensor = args[0]
+            assert isinstance(tensor, torch.Tensor)
+            self.calls += 1
+            self.elements += tensor.numel()
+        return func(*args, **(kwargs or {}))  # type: ignore[operator]
 
 
 def test_factor_to_position_uses_tanh_and_neutral_band() -> None:
@@ -533,6 +556,30 @@ def _snapshot_result() -> ExecutionResult:
         cost_rate=0.01,
         min_exposure=0.0,
     )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["target_valid", "bar_time_ns", "position", "net_pnl"],
+)
+def test_execution_result_reflection_cannot_expose_writable_tensor(
+    field_name: str,
+) -> None:
+    result = _snapshot_result()
+    expected = getattr(result, field_name)
+
+    assert [field.name for field in fields(result)] == list(
+        _EXECUTION_TENSOR_FIELDS
+    )
+    assert not hasattr(result, "__dict__")
+    with pytest.raises(TypeError):
+        vars(result)
+    with pytest.raises(AttributeError):
+        result.__dict__  # type: ignore[attr-defined]
+
+    exposed = getattr(result, field_name)
+    _mutate_exposed_tensor(exposed, "getitem")
+    torch.testing.assert_close(getattr(result, field_name), expected)
 
 
 @pytest.mark.parametrize("field_name", _EXECUTION_TENSOR_FIELDS)
@@ -1729,3 +1776,110 @@ def test_multi_symbol_prefixes_reconcile_ledger_and_metrics() -> None:
         abs=1e-8,
     )
     assert metrics.observations == 5
+
+
+def _ledger_scale_result(valid_count: int) -> ExecutionResult:
+    time_length = valid_count + 2
+    return run_execution(
+        factors=torch.zeros((1, time_length)),
+        target_ret=torch.zeros((1, time_length)),
+        target_valid=(
+            torch.arange(time_length).unsqueeze(0) < valid_count
+        ),
+        bar_time_ns=_hourly_times(time_length),
+        cost_rate=0.0,
+        min_exposure=0.0,
+    )
+
+
+def _expected_zero_ledger(valid_count: int) -> list[LedgerEntry]:
+    hour_ns = 3_600 * 1_000_000_000
+    return [
+        LedgerEntry(
+            symbol="X",
+            signal_time_ns=time_index * hour_ns,
+            entry_time_ns=(time_index + 1) * hour_ns,
+            exit_time_ns=(time_index + 2) * hour_ns,
+            position=0.0,
+            gross_pnl=0.0,
+            cost=0.0,
+            net_pnl=0.0,
+            is_final_liquidation=time_index == valid_count - 1,
+        )
+        for time_index in range(valid_count)
+    ]
+
+
+def test_execution_ledger_snapshots_fields_once_and_scales_linearly() -> None:
+    stats: list[tuple[int, int, int]] = []
+    for valid_count in (64, 128):
+        result = _ledger_scale_result(valid_count)
+        clone_stats = _CloneStatsMode()
+
+        with clone_stats:
+            ledger = build_execution_ledger(result, ["X"])
+
+        assert ledger == _expected_zero_ledger(valid_count)
+        stats.append((valid_count, clone_stats.calls, clone_stats.elements))
+
+    assert stats[0][1] <= 8, stats
+    assert stats[1][1] <= 8, stats
+    assert stats[0][1] == stats[1][1], stats
+    assert stats[1][2] <= stats[0][2] * 2.1, stats
+
+
+def _performance_scale_result(symbol_count: int) -> ExecutionResult:
+    net_pnl = torch.tensor(
+        [[-0.01, 0.02, 0.0, 0.0]],
+        dtype=torch.float64,
+    ).expand(symbol_count, -1).clone()
+    target_valid = torch.tensor(
+        [[True, True, False, False]],
+    ).expand(symbol_count, -1).clone()
+    zeros = torch.zeros_like(net_pnl)
+    return ExecutionResult(
+        position=zeros,
+        turnover=zeros,
+        gross_pnl=net_pnl,
+        cost=zeros,
+        net_pnl=net_pnl,
+        target_valid=target_valid,
+        bar_time_ns=_hourly_times(4).expand(symbol_count, -1).clone(),
+        final_liquidation_cost=torch.zeros(
+            symbol_count,
+            dtype=net_pnl.dtype,
+        ),
+    )
+
+
+def test_performance_metrics_snapshots_fields_once_and_scales_linearly() -> None:
+    stats: list[tuple[int, int, int]] = []
+    for symbol_count in (32, 64):
+        result = _performance_scale_result(symbol_count)
+        clone_stats = _CloneStatsMode()
+
+        with clone_stats:
+            metrics = performance_metrics(result)
+
+        assert metrics.observations == 2 * symbol_count
+        stats.append((symbol_count, clone_stats.calls, clone_stats.elements))
+
+    assert stats[0][1] <= 4, stats
+    assert stats[1][1] <= 4, stats
+    assert stats[0][1] == stats[1][1], stats
+    assert stats[1][2] <= stats[0][2] * 2.1, stats
+
+
+def test_execution_ledger_inner_loop_uses_bulk_materialized_values() -> None:
+    source = inspect.getsource(build_execution_ledger)
+    inner_loop = source[source.index("    for symbol_index, symbol") :]
+
+    assert "result." not in inner_loop
+    assert ".cpu()" not in inner_loop
+
+
+def test_performance_metrics_symbol_loop_reuses_snapshots() -> None:
+    source = inspect.getsource(performance_metrics)
+    symbol_loop = source[source.index("    for symbol_index") :]
+
+    assert "result." not in symbol_loop
