@@ -1,5 +1,6 @@
 import importlib
 import importlib.util
+from decimal import Decimal, localcontext
 
 import pytest
 import torch
@@ -376,6 +377,300 @@ def _ordinary_gradient_from_upstream(
     reference.backward(upstream)
     assert reference_input.grad is not None
     return reference_input.grad
+
+
+def test_direct_subnormal_product_uses_unquantized_ratio() -> None:
+    scale = torch.nextafter(
+        torch.tensor(0.0, dtype=torch.float64),
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+    pattern = torch.tensor([[3.0, 0.0, -1.0]], dtype=torch.float64)
+    upstream = torch.tensor(
+        [[0.0, -2.0, 2.0]], dtype=torch.float64
+    ) * scale
+    expected = torch.tensor(
+        [[
+            0.13577270894181975,
+            -0.5430908357672788,
+            0.40731812682545904,
+        ]],
+        dtype=torch.float64,
+    )
+    x = (pattern * scale).requires_grad_()
+
+    causal_rolling_zscore(x, window=3).backward(upstream)
+
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad, expected, rtol=0, atol=1.0e-15)
+
+
+@pytest.mark.parametrize("scale", _FLOAT64_SCALE_CASES)
+def test_float64_ratio_accuracy_spans_subnormal_to_near_max(
+    scale: float,
+) -> None:
+    pattern = torch.tensor([[3.0, 0.0, -1.0]], dtype=torch.float64)
+    weights = torch.tensor([[0.0, -2.0, 2.0]], dtype=torch.float64)
+    x = (pattern * scale).requires_grad_()
+    upstream = weights * scale
+    unit_pattern = x.detach() / scale
+    expected = _ordinary_gradient_from_upstream(
+        unit_pattern,
+        3,
+        upstream / scale,
+    )
+
+    causal_rolling_zscore(x, window=3).backward(upstream)
+
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad, expected, rtol=0, atol=2.0e-12)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "scale", "atol"),
+    [
+        (
+            torch.float16,
+            torch.finfo(torch.float16).smallest_normal
+            * torch.finfo(torch.float16).eps,
+            2.0e-3,
+        ),
+        (
+            torch.bfloat16,
+            torch.finfo(torch.bfloat16).smallest_normal
+            * torch.finfo(torch.bfloat16).eps,
+            2.0e-2,
+        ),
+        (
+            torch.float32,
+            torch.finfo(torch.float32).smallest_normal
+            * torch.finfo(torch.float32).eps,
+            2.0e-6,
+        ),
+        (torch.float64, _FLOAT64_MIN_SUBNORMAL, 1.0e-12),
+    ],
+)
+@pytest.mark.parametrize("window", [3, 4, 5, 7, 20])
+def test_representable_tiny_ratio_matrix_matches_unit_scale_reference(
+    dtype: torch.dtype,
+    scale: float,
+    atol: float,
+    window: int,
+) -> None:
+    pattern = torch.tensor(
+        [[
+            3.0,
+            0.0,
+            -1.0,
+            2.0,
+            -2.0,
+            1.0,
+            4.0,
+            -3.0,
+            2.0,
+            -1.0,
+            3.0,
+            -2.0,
+            1.0,
+            0.0,
+            -4.0,
+            2.0,
+            1.0,
+            -3.0,
+            4.0,
+            -1.0,
+        ]],
+        dtype=dtype,
+    )
+    weights = torch.tensor(
+        [[
+            0.0,
+            -2.0,
+            2.0,
+            1.0,
+            -1.0,
+            3.0,
+            -2.0,
+            1.0,
+            -3.0,
+            2.0,
+            -1.0,
+            2.0,
+            -2.0,
+            1.0,
+            3.0,
+            -1.0,
+            2.0,
+            -3.0,
+            1.0,
+            -2.0,
+        ]],
+        dtype=dtype,
+    )
+    scale_tensor = torch.tensor(scale, dtype=dtype)
+    x = (pattern * scale_tensor).requires_grad_()
+    upstream = weights * scale_tensor
+    unit_pattern = x.detach().to(torch.float64) / float(scale_tensor)
+    unit_upstream = upstream.to(torch.float64) / float(scale_tensor)
+    expected = _ordinary_gradient_from_upstream(
+        unit_pattern,
+        window,
+        unit_upstream,
+    ).to(dtype)
+
+    causal_rolling_zscore(x, window).backward(upstream)
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    torch.testing.assert_close(x.grad, expected, rtol=0, atol=atol)
+
+
+def _ordinary_target_jacobians(
+    pattern: torch.Tensor,
+    window: int,
+    target: int,
+) -> torch.Tensor:
+    reference = pattern.clone().requires_grad_()
+    output = _direct_prefix_zscore(reference, window)
+    jacobians = torch.zeros_like(reference)
+    for output_index in range(pattern.shape[1]):
+        jacobians[0, output_index] = torch.autograd.grad(
+            output[0, output_index],
+            reference,
+            retain_graph=True,
+        )[0][0, target]
+    return jacobians
+
+
+def _decimal_gradient_sign_and_overflow(
+    jacobians: torch.Tensor,
+    upstream: torch.Tensor,
+    scale: float,
+) -> tuple[int, bool]:
+    with localcontext() as context:
+        context.prec = 200
+        total = sum(
+            Decimal.from_float(jacobian.item())
+            * Decimal.from_float(weight.item())
+            for jacobian, weight in zip(
+                jacobians.flatten(), upstream.flatten()
+            )
+        ) / Decimal.from_float(scale)
+        limit = Decimal.from_float(torch.finfo(torch.float64).max)
+    return (1 if total > 0 else -1 if total < 0 else 0), abs(total) > limit
+
+
+@pytest.mark.parametrize("residual_upstream", [2.0e-16, 5.0e-16])
+@pytest.mark.parametrize("gradient_sign", [1.0, -1.0])
+def test_signed_log_exact_cancellation_keeps_finite_unsafe_residual(
+    residual_upstream: float,
+    gradient_sign: float,
+) -> None:
+    scale = _FLOAT64_MIN_SUBNORMAL
+    pattern = torch.tensor(
+        [[-2.0, -2.0, -2.0, -2.0, -2.0, -1.0, -2.0, -2.0, -2.0]],
+        dtype=torch.float64,
+    )
+    upstream = torch.zeros_like(pattern)
+    upstream[0, 6] = gradient_sign * residual_upstream
+    upstream[0, 7] = gradient_sign * 1.0e308
+    upstream[0, 8] = gradient_sign * -1.0e308
+    jacobians = _ordinary_target_jacobians(pattern, 4, target=6)
+    expected = jacobians[0, 6] * (upstream[0, 6] / scale)
+    assert torch.isfinite(expected)
+    x = (pattern * scale).requires_grad_()
+
+    causal_rolling_zscore(x, window=4).backward(upstream)
+
+    assert x.grad is not None
+    torch.testing.assert_close(
+        x.grad[0, 6],
+        expected,
+        rtol=1.0e-13,
+        atol=0,
+    )
+
+
+def test_signed_log_reduction_preserves_third_cancellation_layer() -> None:
+    pattern = torch.tensor(
+        [[0.2, 1.1, -0.7, 2.0, 0.3, -1.2, 1.5, -0.4]],
+        dtype=torch.float64,
+    )
+    upstream = torch.tensor(
+        [[
+            0.0,
+            0.0,
+            0.0,
+            -9.144538313055768e47,
+            -6.4094842623250634e91,
+            -4.846061538168517e91,
+            -1.467111925850368e26,
+            -2.672128271936655e49,
+        ]],
+        dtype=torch.float64,
+    )
+    x = (pattern * 1.0e-300).requires_grad_()
+
+    causal_rolling_zscore(x, window=5).backward(upstream)
+
+    assert x.grad is not None
+    assert x.grad[0, 3].item() == torch.finfo(torch.float64).max
+
+
+@pytest.mark.parametrize("gradient_sign", [1.0, -1.0])
+@pytest.mark.parametrize(
+    "contribution_order",
+    [
+        (3, 4, 5, 6, 7),
+        (7, 6, 5, 4, 3),
+        (5, 6, 7, 3, 4),
+    ],
+)
+def test_signed_log_reduction_is_permutation_and_sign_stable(
+    gradient_sign: float,
+    contribution_order: tuple[int, ...],
+) -> None:
+    pattern = torch.tensor(
+        [[0.2, 1.1, -0.7, 2.0, 0.3, -1.2, 1.5, -0.4]],
+        dtype=torch.float64,
+    )
+    upstream = torch.tensor(
+        [[
+            0.0,
+            0.0,
+            0.0,
+            -9.144538313055768e47,
+            -6.4094842623250634e91,
+            -4.846061538168517e91,
+            -1.467111925850368e26,
+            -2.672128271936655e49,
+        ]],
+        dtype=torch.float64,
+    )
+    scale = 1.0e-300
+    target = 3
+    jacobians = _ordinary_target_jacobians(pattern, 5, target)
+    base_contributions = upstream * jacobians
+    permuted_upstream = torch.zeros_like(upstream)
+    active_indices = (3, 4, 5, 6, 7)
+    for source, destination in zip(active_indices, contribution_order):
+        permuted_upstream[0, destination] = (
+            base_contributions[0, source] / jacobians[0, destination]
+        )
+    permuted_upstream *= gradient_sign
+    expected_sign, expected_overflow = _decimal_gradient_sign_and_overflow(
+        jacobians,
+        permuted_upstream,
+        scale,
+    )
+    assert expected_overflow
+    x = (pattern * scale).requires_grad_()
+
+    causal_rolling_zscore(x, window=5).backward(permuted_upstream)
+
+    assert x.grad is not None
+    assert x.grad[0, target].item() == (
+        expected_sign * torch.finfo(torch.float64).max
+    )
 
 
 def test_signed_log_aggregation_preserves_exact_cancellation_residual() -> None:

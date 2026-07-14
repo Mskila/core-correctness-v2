@@ -4,195 +4,312 @@ import torch
 
 
 EMA_TAIL_WEIGHT_THRESHOLD = 1e-6
-
-
-def _signed_log_add(
-    left_sign: torch.Tensor,
-    left_log: torch.Tensor,
-    right_sign: torch.Tensor,
-    right_log: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Add signed log-magnitudes without materializing unsafe values."""
-    left_active = left_sign != 0
-    right_active = right_sign != 0
-    both_active = left_active & right_active
-    same_sign = both_active & (left_sign == right_sign)
-    opposite_sign = both_active & ~same_sign
-
-    result_sign = torch.where(left_active, left_sign, right_sign)
-    result_log = torch.where(left_active, left_log, right_log)
-    result_log = torch.where(
-        same_sign,
-        torch.logaddexp(left_log, right_log),
-        result_log,
-    )
-
-    left_is_larger = left_log > right_log
-    larger_log = torch.where(left_is_larger, left_log, right_log)
-    smaller_log = torch.where(left_is_larger, right_log, left_log)
-    larger_sign = torch.where(left_is_larger, left_sign, right_sign)
-    unequal_opposites = opposite_sign & (left_log != right_log)
-    safe_larger_log = torch.where(
-        unequal_opposites, larger_log, torch.zeros_like(larger_log)
-    )
-    log_ratio = torch.where(
-        unequal_opposites,
-        smaller_log - larger_log,
-        -torch.ones_like(smaller_log),
-    )
-    difference_log = safe_larger_log + torch.log(
-        -torch.expm1(log_ratio)
-    )
-    result_sign = torch.where(unequal_opposites, larger_sign, result_sign)
-    result_log = torch.where(unequal_opposites, difference_log, result_log)
-
-    exact_cancellation = opposite_sign & (left_log == right_log)
-    result_sign = torch.where(
-        exact_cancellation,
-        torch.zeros_like(result_sign),
-        result_sign,
-    )
-    result_log = torch.where(
-        exact_cancellation,
-        torch.full_like(result_log, -torch.inf),
-        result_log,
-    )
-    return result_sign, result_log
+_LOG_ACCUMULATOR_RADIX_BITS = 30
+_LOG_ACCUMULATOR_LIMBS = 256
+_LOG_ACCUMULATOR_SIGNIFICAND_BITS = 52
 
 
 def _sum_signed_logs(
     signs: torch.Tensor,
     log_magnitudes: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sum causal-window contributions while retaining an absorbed residual."""
-    high_sign = torch.zeros_like(log_magnitudes[..., 0])
-    high_log = torch.full_like(high_sign, -torch.inf)
-    residual_sign = torch.zeros_like(high_sign)
-    residual_log = torch.full_like(high_sign, -torch.inf)
-
-    for index in range(log_magnitudes.shape[-1]):
-        offset = log_magnitudes.shape[-1] - 1 - index
-        if offset >= log_magnitudes.shape[1]:
-            term_log = torch.full_like(high_log, -torch.inf)
-            term_sign = torch.zeros_like(high_sign)
-        elif offset:
-            term_log = torch.nn.functional.pad(
-                log_magnitudes[:, offset:, index],
-                (0, offset),
-                value=-torch.inf,
-            )
-            term_sign = torch.nn.functional.pad(
-                signs[:, offset:, index],
-                (0, offset),
-                value=0,
-            )
-        else:
-            term_log = log_magnitudes[..., index]
-            term_sign = signs[..., index]
-        high_active = high_sign != 0
-        term_active = torch.isfinite(term_log) & (term_sign != 0)
-        both_active = high_active & term_active
-        same_magnitude = both_active & (high_log == term_log)
-        exact_opposites = same_magnitude & (high_sign == -term_sign)
-        exact_same_sign = same_magnitude & (high_sign == term_sign)
-
-        merged_sign, merged_log = _signed_log_add(
-            high_sign,
-            high_log,
-            term_sign,
-            term_log,
-        )
-        term_was_absorbed = (
-            both_active
-            & ~same_magnitude
-            & (merged_sign == high_sign)
-            & (merged_log == high_log)
-        )
-        high_was_absorbed = (
-            both_active
-            & ~same_magnitude
-            & (merged_sign == term_sign)
-            & (merged_log == term_log)
-        )
-        defer_term = exact_same_sign | term_was_absorbed
-        deferred_sign = torch.where(
-            defer_term,
-            term_sign,
-            torch.where(
-                high_was_absorbed,
-                high_sign,
-                torch.zeros_like(high_sign),
-            ),
-        )
-        deferred_log = torch.where(
-            defer_term,
-            term_log,
-            torch.where(
-                high_was_absorbed,
-                high_log,
-                torch.full_like(high_log, -torch.inf),
-            ),
-        )
-        next_residual_sign, next_residual_log = _signed_log_add(
-            residual_sign,
-            residual_log,
-            deferred_sign,
-            deferred_log,
-        )
-
-        next_high_sign = torch.where(
-            exact_same_sign | term_was_absorbed,
-            high_sign,
-            torch.where(high_was_absorbed, term_sign, merged_sign),
-        )
-        next_high_log = torch.where(
-            exact_same_sign | term_was_absorbed,
-            high_log,
-            torch.where(high_was_absorbed, term_log, merged_log),
-        )
-        next_high_sign = torch.where(
-            exact_opposites,
-            residual_sign,
-            next_high_sign,
-        )
-        next_high_log = torch.where(
-            exact_opposites,
-            residual_log,
-            next_high_log,
-        )
-        next_residual_sign = torch.where(
-            exact_opposites,
-            torch.zeros_like(next_residual_sign),
-            next_residual_sign,
-        )
-        next_residual_log = torch.where(
-            exact_opposites,
-            torch.full_like(next_residual_log, -torch.inf),
-            next_residual_log,
-        )
-
-        residual_is_larger = (next_residual_sign != 0) & (
-            (next_high_sign == 0) | (next_residual_log > next_high_log)
-        )
-        high_sign = torch.where(
-            residual_is_larger, next_residual_sign, next_high_sign
-        )
-        high_log = torch.where(
-            residual_is_larger, next_residual_log, next_high_log
-        )
-        residual_sign = torch.where(
-            residual_is_larger, next_high_sign, next_residual_sign
-        )
-        residual_log = torch.where(
-            residual_is_larger, next_high_log, next_residual_log
-        )
-
-    return _signed_log_add(
-        high_sign,
-        high_log,
-        residual_sign,
-        residual_log,
+    direct_contributions: torch.Tensor,
+    direct_mask: torch.Tensor,
+    gradient_limit: torch.Tensor,
+) -> torch.Tensor:
+    """Exactly reduce aligned extreme-scale terms with a fixed superaccumulator."""
+    n_rows, time_steps, window = log_magnitudes.shape
+    padded_steps = time_steps + window - 1
+    target_indices = (
+        torch.arange(time_steps, device=signs.device).unsqueeze(-1)
+        + torch.arange(window, device=signs.device).unsqueeze(0)
     )
+    row_offsets = (
+        torch.arange(n_rows, device=signs.device) * padded_steps
+    ).reshape(-1, 1, 1)
+    flat_targets = (
+        target_indices.reshape(1, time_steps, window) + row_offsets
+    ).reshape(-1)
+
+    symbolic_active = (
+        ~direct_mask
+        & (signs != 0)
+        & torch.isfinite(log_magnitudes)
+    ).reshape(-1)
+    safe_logs = torch.where(
+        symbolic_active,
+        log_magnitudes.reshape(-1),
+        torch.zeros_like(log_magnitudes.reshape(-1)),
+    )
+    log2 = math.log(2.0)
+    symbolic_exponents = torch.floor(safe_logs / log2).to(torch.int64)
+    remainders = (
+        safe_logs - symbolic_exponents.to(safe_logs.dtype) * log2
+    )
+    symbolic_significands = torch.round(
+        torch.exp(remainders)
+        * (1 << _LOG_ACCUMULATOR_SIGNIFICAND_BITS)
+    ).to(torch.int64)
+    below_unit = symbolic_significands < (
+        1 << _LOG_ACCUMULATOR_SIGNIFICAND_BITS
+    )
+    symbolic_significands = torch.where(
+        below_unit,
+        symbolic_significands * 2,
+        symbolic_significands,
+    )
+    symbolic_exponents = torch.where(
+        below_unit,
+        symbolic_exponents - 1,
+        symbolic_exponents,
+    )
+    rounded_up = symbolic_significands >= (
+        1 << (_LOG_ACCUMULATOR_SIGNIFICAND_BITS + 1)
+    )
+    symbolic_significands = torch.where(
+        rounded_up,
+        torch.div(symbolic_significands, 2, rounding_mode="floor"),
+        symbolic_significands,
+    )
+    symbolic_exponents = torch.where(
+        rounded_up,
+        symbolic_exponents + 1,
+        symbolic_exponents,
+    )
+
+    flat_direct = direct_contributions.reshape(-1)
+    direct_active = direct_mask.reshape(-1) & (flat_direct != 0)
+    direct_mantissas, direct_powers = torch.frexp(flat_direct.abs())
+    direct_significands = torch.round(
+        direct_mantissas
+        * (1 << (_LOG_ACCUMULATOR_SIGNIFICAND_BITS + 1))
+    ).to(torch.int64)
+    direct_exponents = direct_powers.to(torch.int64) - 1
+
+    active = symbolic_active | direct_active
+    term_signs = torch.where(
+        direct_active,
+        flat_direct.sign(),
+        signs.reshape(-1),
+    ).to(torch.int64)
+    significands = torch.where(
+        direct_active,
+        direct_significands,
+        symbolic_significands,
+    )
+    exponents = torch.where(
+        direct_active,
+        direct_exponents,
+        symbolic_exponents,
+    )
+
+    target_count = n_rows * padded_steps
+    exponent_sentinel = torch.iinfo(torch.int64).min
+    top_exponents = torch.full(
+        (target_count,),
+        exponent_sentinel,
+        dtype=torch.int64,
+        device=signs.device,
+    )
+    top_exponents.scatter_reduce_(
+        0,
+        flat_targets,
+        torch.where(
+            active,
+            exponents,
+            torch.full_like(exponents, exponent_sentinel),
+        ),
+        reduce="amax",
+        include_self=True,
+    )
+    target_active = top_exponents != exponent_sentinel
+    safe_top_exponents = torch.where(
+        target_active,
+        top_exponents,
+        torch.zeros_like(top_exponents),
+    )
+    base_exponents = safe_top_exponents - (
+        _LOG_ACCUMULATOR_RADIX_BITS * (_LOG_ACCUMULATOR_LIMBS - 1)
+    )
+    term_base_exponents = base_exponents.gather(0, flat_targets)
+    bit_offsets = (
+        exponents
+        - _LOG_ACCUMULATOR_SIGNIFICAND_BITS
+        - term_base_exponents
+    )
+    low_limbs = torch.div(
+        bit_offsets,
+        _LOG_ACCUMULATOR_RADIX_BITS,
+        rounding_mode="floor",
+    )
+    shifts = bit_offsets - low_limbs * _LOG_ACCUMULATOR_RADIX_BITS
+    in_range = (
+        ~active
+        | ((low_limbs >= 0) & (low_limbs + 2 < _LOG_ACCUMULATOR_LIMBS))
+    )
+    if not in_range.all():
+        raise FloatingPointError(
+            "causal_rolling_zscore gradient exponent span is unsupported"
+        )
+    low_limbs = torch.where(active, low_limbs, torch.zeros_like(low_limbs))
+
+    radix = 1 << _LOG_ACCUMULATOR_RADIX_BITS
+    radix_mask = radix - 1
+    low_significands = significands & radix_mask
+    high_significands = torch.bitwise_right_shift(
+        significands,
+        _LOG_ACCUMULATOR_RADIX_BITS,
+    )
+    shifted_low = torch.bitwise_left_shift(low_significands, shifts)
+    chunk_0 = shifted_low & radix_mask
+    carry_0 = torch.bitwise_right_shift(
+        shifted_low,
+        _LOG_ACCUMULATOR_RADIX_BITS,
+    )
+    shifted_high = (
+        torch.bitwise_left_shift(high_significands, shifts) + carry_0
+    )
+    chunk_1 = shifted_high & radix_mask
+    chunk_2 = torch.bitwise_right_shift(
+        shifted_high,
+        _LOG_ACCUMULATOR_RADIX_BITS,
+    )
+
+    accumulator = torch.zeros(
+        target_count * _LOG_ACCUMULATOR_LIMBS,
+        dtype=torch.int64,
+        device=signs.device,
+    )
+    for limb_delta, chunk in enumerate((chunk_0, chunk_1, chunk_2)):
+        accumulator_indices = (
+            flat_targets * _LOG_ACCUMULATOR_LIMBS
+            + low_limbs
+            + limb_delta
+        )
+        accumulator.scatter_add_(
+            0,
+            accumulator_indices,
+            torch.where(
+                active,
+                term_signs * chunk,
+                torch.zeros_like(chunk),
+            ),
+        )
+    accumulator = accumulator.reshape(
+        target_count,
+        _LOG_ACCUMULATOR_LIMBS,
+    )
+
+    for limb in range(_LOG_ACCUMULATOR_LIMBS - 1):
+        carry = torch.div(
+            accumulator[:, limb],
+            radix,
+            rounding_mode="floor",
+        )
+        accumulator[:, limb] -= carry * radix
+        accumulator[:, limb + 1] += carry
+
+    negative = accumulator[:, -1] < 0
+    lower = accumulator[:, :-1]
+    lower_indices = torch.arange(
+        _LOG_ACCUMULATOR_LIMBS - 1,
+        dtype=torch.int64,
+        device=signs.device,
+    ).reshape(1, -1)
+    first_lower_nonzero = torch.where(
+        lower != 0,
+        lower_indices,
+        torch.full_like(lower_indices, _LOG_ACCUMULATOR_LIMBS - 1),
+    ).amin(dim=-1)
+    has_lower_nonzero = first_lower_nonzero < (
+        _LOG_ACCUMULATOR_LIMBS - 1
+    )
+    negative_lower = torch.where(
+        lower_indices < first_lower_nonzero.unsqueeze(-1),
+        torch.zeros_like(lower),
+        torch.where(
+            lower_indices == first_lower_nonzero.unsqueeze(-1),
+            radix - lower,
+            radix - 1 - lower,
+        ),
+    )
+    negative_top = (
+        -accumulator[:, -1] - has_lower_nonzero.to(torch.int64)
+    ).unsqueeze(-1)
+    negative_magnitude = torch.cat([negative_lower, negative_top], dim=-1)
+    magnitude = torch.where(
+        negative.unsqueeze(-1),
+        negative_magnitude,
+        accumulator,
+    )
+
+    limb_indices = torch.arange(
+        _LOG_ACCUMULATOR_LIMBS,
+        dtype=torch.int64,
+        device=signs.device,
+    ).reshape(1, -1)
+    highest_nonzero = torch.where(
+        magnitude != 0,
+        limb_indices,
+        torch.full_like(limb_indices, -1),
+    ).amax(dim=-1)
+    is_zero = highest_nonzero < 0
+    safe_highest = highest_nonzero.clamp_min(0)
+    top_limb = magnitude.gather(1, safe_highest.unsqueeze(-1)).squeeze(-1)
+    next_index = (safe_highest - 1).clamp_min(0)
+    next_limb = magnitude.gather(1, next_index.unsqueeze(-1)).squeeze(-1)
+    third_index = (safe_highest - 2).clamp_min(0)
+    third_limb = magnitude.gather(1, third_index.unsqueeze(-1)).squeeze(-1)
+    scaled_magnitude = top_limb.to(torch.float64)
+    scaled_magnitude = scaled_magnitude + torch.where(
+        safe_highest > 0,
+        next_limb.to(torch.float64) / radix,
+        torch.zeros_like(scaled_magnitude),
+    )
+    scaled_magnitude = scaled_magnitude + torch.where(
+        safe_highest > 1,
+        third_limb.to(torch.float64) / (radix * radix),
+        torch.zeros_like(scaled_magnitude),
+    )
+    normalized_magnitude, exponent_adjustment = torch.frexp(
+        scaled_magnitude
+    )
+    result_exponents = (
+        base_exponents
+        + safe_highest * _LOG_ACCUMULATOR_RADIX_BITS
+        + exponent_adjustment.to(torch.int64)
+    )
+    limit_mantissa, limit_exponent = torch.frexp(gradient_limit)
+    saturated = (
+        (result_exponents > limit_exponent)
+        | (
+            (result_exponents == limit_exponent)
+            & (normalized_magnitude >= limit_mantissa)
+        )
+    ) & ~is_zero
+    safe_result_exponents = torch.where(
+        saturated | is_zero,
+        torch.zeros_like(result_exponents),
+        result_exponents,
+    )
+    result_magnitude = torch.ldexp(
+        normalized_magnitude,
+        safe_result_exponents,
+    )
+    result_magnitude = torch.where(
+        saturated,
+        gradient_limit,
+        torch.where(is_zero, torch.zeros_like(result_magnitude), result_magnitude),
+    )
+    result_sign = torch.where(
+        is_zero,
+        torch.zeros_like(result_magnitude),
+        torch.where(
+            negative,
+            -torch.ones_like(result_magnitude),
+            torch.ones_like(result_magnitude),
+        ),
+    )
+    return (result_sign * result_magnitude).reshape(n_rows, padded_steps)
 
 
 class _CausalRollingZScore(torch.autograd.Function):
@@ -347,6 +464,14 @@ class _CausalRollingZScore(torch.autograd.Function):
         direct_arithmetic_safe = (
             product_arithmetic_safe | factorized_arithmetic_safe
         )
+        work_smallest_normal = torch.finfo(grad.dtype).smallest_normal
+        product_is_normally_represented = (
+            direct_numerator.abs() >= work_smallest_normal
+        ) & (direct_divisor >= work_smallest_normal)
+        use_product_path = product_arithmetic_safe & (
+            product_is_normally_represented
+            | ~factorized_arithmetic_safe
+        )
         row_is_direct = (
             (~active)
             | (
@@ -356,7 +481,7 @@ class _CausalRollingZScore(torch.autograd.Function):
         ).all(dim=-1)
         direct_mask = active & row_is_direct.unsqueeze(-1)
         product_divisor = torch.where(
-            direct_mask & product_arithmetic_safe,
+            direct_mask & use_product_path,
             direct_divisor,
             torch.ones_like(log_magnitude),
         )
@@ -364,7 +489,7 @@ class _CausalRollingZScore(torch.autograd.Function):
         direct_contribution = torch.where(
             direct_mask,
             torch.where(
-                product_arithmetic_safe,
+                use_product_path,
                 product_contribution,
                 factorized_contribution,
             ),
@@ -395,11 +520,6 @@ class _CausalRollingZScore(torch.autograd.Function):
             sign,
             torch.zeros_like(sign),
         )
-        start = window - 1
-        aggregate_sign, aggregate_log = _sum_signed_logs(
-            unsafe_signs,
-            unsafe_logs,
-        )
         unsafe_contribution = unsafe_mask.to(grad.dtype)
         unsafe_padded = torch.zeros(
             n_rows, padded_steps, dtype=grad.dtype, device=grad.device
@@ -407,40 +527,31 @@ class _CausalRollingZScore(torch.autograd.Function):
         unsafe_padded.scatter_add_(
             1, flat_indices, unsafe_contribution.reshape(n_rows, -1)
         )
-        unsafe_result = (
-            aggregate_sign
-            * torch.exp(torch.minimum(aggregate_log, log_limit))
-        )
-
+        start = window - 1
         direct_result = direct_padded[:, start : start + time_steps]
         input_has_unsafe = (
             unsafe_padded[:, start : start + time_steps] != 0
         )
-        direct_sign = direct_result.sign()
-        direct_log = torch.where(
-            direct_sign != 0,
-            direct_result.abs().log(),
-            torch.full_like(direct_result, -torch.inf),
+        if unsafe_mask.any():
+            exact_padded = _sum_signed_logs(
+                unsafe_signs,
+                unsafe_logs,
+                direct_contribution,
+                direct_mask,
+                gradient_limit,
+            )
+            exact_result = exact_padded[:, start : start + time_steps]
+            input_gradient = torch.where(
+                input_has_unsafe,
+                exact_result,
+                direct_result,
+            )
+        else:
+            input_gradient = direct_result
+        input_gradient = input_gradient.clamp(
+            -gradient_limit,
+            gradient_limit,
         )
-        combined_sign, combined_log = _signed_log_add(
-            aggregate_sign,
-            aggregate_log,
-            direct_sign,
-            direct_log,
-        )
-        combined_result = combined_sign * torch.exp(
-            torch.minimum(combined_log, log_limit)
-        )
-        combined_result = torch.where(
-            aggregate_sign == 0,
-            direct_result,
-            torch.where(direct_sign == 0, unsafe_result, combined_result),
-        )
-        input_gradient = torch.where(
-            input_has_unsafe,
-            combined_result,
-            direct_result,
-        ).clamp(-gradient_limit, gradient_limit)
         if not torch.isfinite(input_gradient).all():
             raise FloatingPointError(
                 "causal_rolling_zscore produced a non-finite gradient"
