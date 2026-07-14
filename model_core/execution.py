@@ -57,6 +57,8 @@ def factor_to_position(factors: Tensor, *, min_exposure: float) -> Tensor:
     """Convert finite factors to continuous positions with a neutral band."""
     if not math.isfinite(min_exposure) or min_exposure < 0.0:
         raise DataValidationError("min_exposure must be finite and non-negative")
+    if not factors.is_floating_point():
+        raise DataValidationError("factors must be a floating-point tensor")
     if not bool(torch.isfinite(factors).all()):
         raise DataValidationError("factors must contain only finite values")
 
@@ -78,12 +80,24 @@ def _validate_execution_inputs(
 ) -> None:
     if factors.ndim != 2:
         raise DataValidationError("factors must have shape [symbols, time]")
+    if factors.shape[0] == 0:
+        raise DataValidationError("factors must contain at least one symbol")
     if target_ret.shape != factors.shape:
         raise DataValidationError("target_ret shape must match factors")
     if target_valid.shape != factors.shape or target_valid.dtype is not torch.bool:
         raise DataValidationError("target_valid must be a boolean mask matching factors")
     if bar_time_ns.shape != factors.shape:
         raise DataValidationError("bar_time_ns shape must match factors")
+    if bar_time_ns.dtype is not torch.int64:
+        raise DataValidationError("bar_time_ns must contain int64 nanosecond timestamps")
+    devices = {
+        factors.device,
+        target_ret.device,
+        target_valid.device,
+        bar_time_ns.device,
+    }
+    if len(devices) != 1:
+        raise DataValidationError("execution input tensors must use the same device")
     if not factors.is_floating_point() or not target_ret.is_floating_point():
         raise DataValidationError("factors and target_ret must be floating-point tensors")
     if not math.isfinite(cost_rate) or cost_rate < 0.0:
@@ -231,6 +245,9 @@ def derive_periods_per_year(bar_time_ns: Tensor, target_valid: Tensor) -> float:
 def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
     """Compute timestamp-derived metrics from valid net log returns."""
     net_pnl = result.net_pnl[result.target_valid]
+    if not bool(torch.isfinite(net_pnl).all()):
+        raise DataValidationError("valid net_pnl values must be finite")
+    net_pnl = net_pnl.to(torch.float64)
     periods_per_year = derive_periods_per_year(
         result.bar_time_ns,
         result.target_valid,
@@ -239,14 +256,17 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
     elapsed_years = observations / periods_per_year
 
     cumulative_log_return = torch.cumsum(net_pnl, dim=0)
-    equity = torch.exp(cumulative_log_return)
-    running_peak = torch.cummax(equity, dim=0).values
-    drawdown = 1.0 - equity / running_peak
+    log_equity = torch.cat(
+        [torch.zeros_like(cumulative_log_return[:1]), cumulative_log_return],
+        dim=0,
+    )
+    running_peak_log = torch.cummax(log_equity, dim=0).values
+    drawdown = -torch.expm1(log_equity - running_peak_log)
 
-    total_return_tensor = equity[-1] - 1.0
-    annualized_return_tensor = torch.exp(
+    total_return_tensor = torch.expm1(cumulative_log_return[-1])
+    annualized_return_tensor = torch.expm1(
         cumulative_log_return[-1] / elapsed_years
-    ) - 1.0
+    )
     mean_return = net_pnl.mean()
     return_std = net_pnl.std(unbiased=False)
     annualization_scale = math.sqrt(periods_per_year)
@@ -271,19 +291,24 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
         torch.zeros_like(annualized_return_tensor),
     )
 
-    return PerformanceMetrics(
-        observations=observations,
-        elapsed_years=elapsed_years,
-        periods_per_year=periods_per_year,
-        total_return=float(total_return_tensor.detach().cpu()),
-        annualized_return=float(annualized_return_tensor.detach().cpu()),
-        volatility=float((return_std * annualization_scale).detach().cpu()),
-        sharpe=float(sharpe_tensor.detach().cpu()),
-        sortino=float(sortino_tensor.detach().cpu()),
-        max_drawdown=float(max_drawdown_tensor.detach().cpu()),
-        calmar=float(calmar_tensor.detach().cpu()),
-        win_rate=float((net_pnl > 0).to(torch.float64).mean().detach().cpu()),
-    )
+    metric_values = {
+        "elapsed_years": elapsed_years,
+        "periods_per_year": periods_per_year,
+        "total_return": float(total_return_tensor.detach().cpu()),
+        "annualized_return": float(annualized_return_tensor.detach().cpu()),
+        "volatility": float((return_std * annualization_scale).detach().cpu()),
+        "sharpe": float(sharpe_tensor.detach().cpu()),
+        "sortino": float(sortino_tensor.detach().cpu()),
+        "max_drawdown": float(max_drawdown_tensor.detach().cpu()),
+        "calmar": float(calmar_tensor.detach().cpu()),
+        "win_rate": float(
+            (net_pnl > 0).to(torch.float64).mean().detach().cpu()
+        ),
+    }
+    if not all(math.isfinite(value) for value in metric_values.values()):
+        raise DataValidationError("unable to derive finite performance metrics")
+
+    return PerformanceMetrics(observations=observations, **metric_values)
 
 
 def build_execution_ledger(
@@ -291,6 +316,18 @@ def build_execution_ledger(
     symbols: list[str] | tuple[str, ...],
 ) -> list[LedgerEntry]:
     """Copy each valid shared execution row into an auditable ledger."""
+    if (
+        result.target_valid.ndim != 2
+        or result.bar_time_ns.shape != result.target_valid.shape
+    ):
+        raise DataValidationError(
+            "bar_time_ns and target_valid must have matching [symbols, time] shape"
+        )
+    if result.target_valid.dtype is not torch.bool:
+        raise DataValidationError("target_valid must be a boolean mask")
+    if result.bar_time_ns.dtype is not torch.int64:
+        raise DataValidationError("bar_time_ns must contain int64 nanosecond timestamps")
+
     symbol_count, time_length = result.target_valid.shape
     if len(symbols) != symbol_count:
         raise DataValidationError(

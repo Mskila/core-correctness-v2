@@ -1,4 +1,5 @@
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
+import math
 
 import pytest
 import torch
@@ -50,6 +51,14 @@ def test_factor_to_position_rejects_non_finite_input(invalid: float) -> None:
 
     with pytest.raises(DataValidationError, match="factors.*finite"):
         factor_to_position(factors, min_exposure=0.05)
+
+
+def test_factor_to_position_rejects_integer_input() -> None:
+    with pytest.raises(DataValidationError, match="floating-point"):
+        factor_to_position(
+            torch.tensor([[1, 0]], dtype=torch.int64),
+            min_exposure=0.05,
+        )
 
 
 def _hourly_times(length: int) -> torch.Tensor:
@@ -171,6 +180,45 @@ def test_execution_rejects_no_valid_labels() -> None:
         )
 
 
+def test_execution_rejects_empty_symbol_batch() -> None:
+    with pytest.raises(DataValidationError, match="at least one symbol"):
+        run_execution(
+            factors=torch.empty((0, 4)),
+            target_ret=torch.empty((0, 4)),
+            target_valid=torch.empty((0, 4), dtype=torch.bool),
+            bar_time_ns=torch.empty((0, 4), dtype=torch.int64),
+            cost_rate=0.0,
+            min_exposure=0.05,
+        )
+
+
+def test_execution_rejects_non_int64_bar_time() -> None:
+    with pytest.raises(DataValidationError, match="bar_time_ns.*int64"):
+        run_execution(
+            factors=torch.zeros((1, 4)),
+            target_ret=torch.zeros((1, 4)),
+            target_valid=torch.tensor([[True, True, False, False]]),
+            bar_time_ns=torch.tensor(
+                [[0.75, 10.75, 20.75, 30.75]],
+                dtype=torch.float64,
+            ),
+            cost_rate=0.0,
+            min_exposure=0.05,
+        )
+
+
+def test_execution_rejects_mismatched_tensor_devices() -> None:
+    with pytest.raises(DataValidationError, match="same device"):
+        run_execution(
+            factors=torch.zeros((1, 4)),
+            target_ret=torch.zeros((1, 4), device="meta"),
+            target_valid=torch.tensor([[True, True, False, False]]),
+            bar_time_ns=_hourly_times(4),
+            cost_rate=0.0,
+            min_exposure=0.05,
+        )
+
+
 def test_execution_rejects_non_prefix_valid_mask() -> None:
     with pytest.raises(DataValidationError, match="continuous prefix"):
         run_execution(
@@ -282,6 +330,54 @@ def test_performance_metrics_uses_only_valid_net_log_returns() -> None:
     assert metrics.annualized_return > 0.0
 
 
+@pytest.mark.parametrize(
+    ("valid_net_pnl", "expected_max_drawdown"),
+    [
+        ([-0.1, 0.0], 1.0 - math.exp(-0.1)),
+        ([-0.1, -0.2], 1.0 - math.exp(-0.3)),
+    ],
+)
+def test_performance_metrics_includes_initial_equity_in_drawdown(
+    valid_net_pnl: list[float],
+    expected_max_drawdown: float,
+) -> None:
+    net_pnl = torch.tensor([[*valid_net_pnl, 0.0, 0.0]])
+    valid = torch.tensor([[True, True, False, False]])
+    zeros = torch.zeros_like(net_pnl)
+    result = ExecutionResult(
+        position=zeros,
+        turnover=zeros,
+        gross_pnl=zeros,
+        cost=zeros,
+        net_pnl=net_pnl,
+        target_valid=valid,
+        bar_time_ns=_hourly_times(4),
+        final_liquidation_cost=torch.zeros(1),
+    )
+
+    metrics = performance_metrics(result)
+
+    assert metrics.max_drawdown == pytest.approx(
+        expected_max_drawdown,
+        abs=1e-8,
+    )
+
+
+def test_performance_metrics_rejects_non_finite_derived_values() -> None:
+    result = run_execution(
+        factors=torch.atanh(torch.tensor([[0.5, 0.5, 0.0, 0.0]])),
+        target_ret=torch.tensor([[1000.0, 1000.0, 0.0, 0.0]]),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.0,
+        min_exposure=0.05,
+    )
+    assert bool(torch.isfinite(result.net_pnl).all())
+
+    with pytest.raises(DataValidationError, match="finite performance metrics"):
+        performance_metrics(result)
+
+
 def test_performance_metrics_result_is_frozen() -> None:
     metrics = PerformanceMetrics(
         observations=2,
@@ -363,3 +459,21 @@ def test_execution_ledger_rejects_symbol_count_mismatch() -> None:
 
     with pytest.raises(DataValidationError, match="symbols"):
         build_execution_ledger(result, [])
+
+
+def test_execution_ledger_rejects_non_int64_bar_time() -> None:
+    result = run_execution(
+        factors=torch.zeros((1, 4)),
+        target_ret=torch.zeros((1, 4)),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.0,
+        min_exposure=0.05,
+    )
+    invalid_result = replace(
+        result,
+        bar_time_ns=result.bar_time_ns.to(torch.float64) + 0.75,
+    )
+
+    with pytest.raises(DataValidationError, match="bar_time_ns.*int64"):
+        build_execution_ledger(invalid_result, ["EURUSD"])
