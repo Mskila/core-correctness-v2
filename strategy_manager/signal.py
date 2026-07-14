@@ -5,18 +5,14 @@ strategy_manager/signal.py — 回测与实盘共享的信号计算模块
   compute_target_positions(factors, prev_positions)  →  连续仓位 [-1, +1] 张量
   reconcile_action(current, target)                  →  动作字符串
 
-信号逻辑（收益优先模式，2026-07-04 重构）：
-  旧模式（Neutral Band）：tanh → sign → {-1, 0, +1} 三档，天花板锁死在 1 倍仓。
-  新模式（连续仓位）：factor 直接经 tanh 压缩到 (-1, +1) 作为仓位比例。
-    - factor 越强 → 仓位比例越大，允许"加码"
-    - 不设 Neutral Band，让模型自由决定在场时间
-    - 回测与实盘共用同一逻辑，消除两者差异
-  训练时用 tanh(factor) 作为连续仓位，回测也一致，避免训练/回测目标函数不对齐。
+因子到仓位的数值语义由 model_core.execution.factor_to_position 唯一定义；
+本模块只保留兼容 API 和根配置默认值的适配。
 """
 from __future__ import annotations
 
-import torch
 from torch import Tensor
+
+from model_core.execution import factor_to_position
 
 # ── 保留实盘用的阈值参数（实盘 Runner 可能还读取这些常量）──────────────────
 ENTRY_THRESHOLD: float = 0.3
@@ -25,11 +21,9 @@ MIN_TRADE_EXPOSURE: float = 0.05
 
 
 def _min_trade_exposure() -> float:
-    try:
-        from config import Config
-        return float(getattr(Config, "MIN_TRADE_EXPOSURE", MIN_TRADE_EXPOSURE))
-    except Exception:
-        return MIN_TRADE_EXPOSURE
+    from config import Config
+
+    return float(Config.MIN_TRADE_EXPOSURE)
 
 
 def compute_target_positions(
@@ -45,11 +39,10 @@ def compute_target_positions(
         factors:        [N, T] 或 [N] 的因子张量。
         prev_positions: 保留参数，连续模式下忽略。
     """
-    pos = torch.tanh(factors)
-    min_abs = _min_trade_exposure()
-    if min_abs > 0:
-        pos = torch.where(pos.abs() >= min_abs, pos, torch.zeros_like(pos))
-    return pos
+    return factor_to_position(
+        factors,
+        min_exposure=_min_trade_exposure(),
+    )
 
 def compute_target_positions_stateless(factors: Tensor) -> Tensor:
     """无状态版本，供训练回测快速计算（连续仓位模式）。"""
