@@ -18,6 +18,7 @@ from data_pipeline.validation import (
     canonicalize_ohlcv,
 )
 from model_core.features import MT5FeatureEngineer
+from model_core.semantics import DataValidationError
 
 
 _TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1")
@@ -115,6 +116,12 @@ class ParquetDataManager:
             )
             for field in ("open", "high", "low", "close", "volume")
         }
+        for field in ("open", "high", "low", "close", "volume"):
+            if not torch.isfinite(raw[field]).all():
+                raise DataValidationError(
+                    "OHLCV values must remain finite after float32 conversion: "
+                    f"field={field}"
+                )
         raw["time"] = torch.tensor(
             frame["time"].astype("int64").to_numpy(dtype=np.int64)[None, :],
             dtype=torch.int64,

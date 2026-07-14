@@ -302,6 +302,34 @@ def test_parquet_failed_reload_invalidates_previously_loaded_state(
             getattr(manager, property_name)
 
 
+def test_parquet_float32_overflow_fails_closed_after_reload(
+    tmp_path: Path,
+) -> None:
+    path = _write_parquet(
+        tmp_path / "EURUSD_H1.parquet",
+        _make_ohlcv_df(periods=4),
+    )
+    manager = ParquetDataManager(path)
+    manager.load()
+    overflow = _make_ohlcv_df(periods=4)
+    overflow["tick_volume"] = np.full(4, 1.0e40, dtype=np.float64)
+    _write_parquet(path, overflow)
+
+    with pytest.raises(DataValidationError, match=r"field=volume"):
+        manager.load()
+
+    for property_name in (
+        "raw_dict",
+        "feat_tensor",
+        "target_ret",
+        "target_valid",
+        "bar_time",
+        "data_identities",
+    ):
+        with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
+            getattr(manager, property_name)
+
+
 def test_parquet_inspection_uses_timestamp_span_not_h1_bar_constant(
     tmp_path: Path,
 ) -> None:
