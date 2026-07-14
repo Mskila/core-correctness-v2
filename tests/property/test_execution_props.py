@@ -5,12 +5,22 @@ from hypothesis import given, settings, strategies as st
 from model_core.execution import build_execution_ledger, run_execution
 
 
-_FINITE_FLOATS = st.floats(
-    min_value=-3.0,
-    max_value=3.0,
-    allow_nan=False,
-    allow_infinity=False,
-    width=32,
+_FINITE_FLOATS = st.one_of(
+    st.just(0.0),
+    st.floats(
+        min_value=-3.0,
+        max_value=-0.0009765625,
+        allow_nan=False,
+        allow_infinity=False,
+        width=32,
+    ),
+    st.floats(
+        min_value=0.0009765625,
+        max_value=3.0,
+        allow_nan=False,
+        allow_infinity=False,
+        width=32,
+    ),
 )
 _FINITE_RETURNS = st.floats(
     min_value=-0.5,
@@ -19,12 +29,15 @@ _FINITE_RETURNS = st.floats(
     allow_infinity=False,
     width=32,
 )
-_COST_RATES = st.floats(
-    min_value=0.0,
-    max_value=0.05,
-    allow_nan=False,
-    allow_infinity=False,
-    width=64,
+_COST_RATES = st.one_of(
+    st.just(0.0),
+    st.floats(
+        min_value=1e-6,
+        max_value=0.05,
+        allow_nan=False,
+        allow_infinity=False,
+        width=64,
+    ),
 )
 
 

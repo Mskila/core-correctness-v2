@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, fields, replace
 import math
+import pickle
 
 import pytest
 import torch
@@ -15,6 +16,18 @@ from model_core.execution import (
     run_execution,
 )
 from model_core.semantics import DataValidationError
+
+
+_EXECUTION_TENSOR_FIELDS = (
+    "position",
+    "turnover",
+    "gross_pnl",
+    "cost",
+    "net_pnl",
+    "target_valid",
+    "bar_time_ns",
+    "final_liquidation_cost",
+)
 
 
 def test_factor_to_position_uses_tanh_and_neutral_band() -> None:
@@ -66,6 +79,73 @@ def test_factor_to_position_rejects_meta_input() -> None:
         factor_to_position(
             torch.zeros((1, 2), device="meta"),
             min_exposure=0.05,
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float8_e4m3fn, torch.float8_e5m2],
+    ids=["float8-e4m3fn", "float8-e5m2"],
+)
+def test_factor_to_position_rejects_unsupported_float_dtype(
+    dtype: torch.dtype,
+) -> None:
+    with pytest.raises(DataValidationError, match="supported floating-point dtype"):
+        factor_to_position(
+            torch.zeros((1, 2), dtype=dtype),
+            min_exposure=0.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32, torch.float64],
+    ids=["float16", "bfloat16", "float32", "float64"],
+)
+def test_factor_and_execution_support_explicit_float_dtypes(
+    dtype: torch.dtype,
+) -> None:
+    factors = torch.tensor([[0.2, -0.3, 0.0, 0.0]], dtype=dtype)
+
+    positions = factor_to_position(factors, min_exposure=0.0)
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.tensor([[0.1, 0.2, 0.0, 0.0]], dtype=dtype),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.01,
+        min_exposure=0.0,
+    )
+
+    assert positions.dtype is dtype
+    assert result.position.dtype is dtype
+    assert result.cost.dtype is dtype
+    assert bool(torch.isfinite(result.net_pnl).all())
+
+
+@pytest.mark.parametrize("field_name", ["factors", "target_ret"])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float8_e4m3fn, torch.float8_e5m2],
+    ids=["float8-e4m3fn", "float8-e5m2"],
+)
+def test_execution_rejects_unsupported_float_dtype_before_backend(
+    field_name: str,
+    dtype: torch.dtype,
+) -> None:
+    inputs = {
+        "factors": torch.zeros((1, 4), dtype=torch.float32),
+        "target_ret": torch.zeros((1, 4), dtype=torch.float32),
+    }
+    inputs[field_name] = torch.zeros((1, 4), dtype=dtype)
+
+    with pytest.raises(DataValidationError, match="supported floating-point dtype"):
+        run_execution(
+            **inputs,
+            target_valid=torch.tensor([[True, True, False, False]]),
+            bar_time_ns=_hourly_times(4),
+            cost_rate=0.0,
+            min_exposure=0.0,
         )
 
 
@@ -215,6 +295,18 @@ def test_execution_rejects_non_int64_bar_time() -> None:
         )
 
 
+def test_execution_rejects_mixed_factor_and_return_dtypes() -> None:
+    with pytest.raises(DataValidationError, match="factors and target_ret.*same dtype"):
+        run_execution(
+            factors=torch.zeros((1, 4), dtype=torch.float32),
+            target_ret=torch.zeros((1, 4), dtype=torch.float64),
+            target_valid=torch.tensor([[True, True, False, False]]),
+            bar_time_ns=_hourly_times(4),
+            cost_rate=0.0,
+            min_exposure=0.0,
+        )
+
+
 def test_execution_rejects_mismatched_tensor_devices() -> None:
     with pytest.raises(DataValidationError, match="same device"):
         run_execution(
@@ -249,6 +341,48 @@ def test_execution_rejects_unrepresentable_finite_float16_result() -> None:
             cost_rate=40_000.0,
             min_exposure=0.0,
         )
+
+
+def test_execution_rejects_nonzero_float16_cost_underflow() -> None:
+    with pytest.raises(DataValidationError, match="representable.*cost"):
+        run_execution(
+            factors=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float16),
+            target_ret=torch.zeros((1, 3), dtype=torch.float16),
+            target_valid=torch.tensor([[True, False, False]]),
+            bar_time_ns=_hourly_times(3),
+            cost_rate=1e-8,
+            min_exposure=0.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.float64],
+    ids=["float16", "float32", "float64"],
+)
+def test_execution_preserves_representable_cost_dtype_and_gradient(
+    dtype: torch.dtype,
+) -> None:
+    factors = torch.tensor(
+        [[0.5, 0.25, 0.0, 0.0]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.zeros((1, 4), dtype=dtype),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.125,
+        min_exposure=0.0,
+    )
+
+    assert result.cost.dtype is dtype
+    assert result.final_liquidation_cost.dtype is dtype
+    assert bool((result.cost[result.target_valid] > 0).all())
+    result.net_pnl.sum().backward()
+    assert factors.grad is not None
+    assert bool((factors.grad.abs() > 0).any())
 
 
 def test_execution_snapshots_target_valid_for_repeatable_ledger() -> None:
@@ -299,6 +433,134 @@ def test_execution_snapshots_bar_time_for_repeatable_ledger() -> None:
         result.net_pnl[result.target_valid].sum().item(),
         abs=1e-8,
     )
+
+
+def _snapshot_result() -> ExecutionResult:
+    return run_execution(
+        factors=torch.tensor([[0.2, -0.3, 0.0, 0.0, 0.0]]),
+        target_ret=torch.tensor([[0.1, 0.2, 0.0, 0.0, 0.0]]),
+        target_valid=torch.tensor([[True, True, False, False, False]]),
+        bar_time_ns=_hourly_times(5),
+        cost_rate=0.01,
+        min_exposure=0.0,
+    )
+
+
+@pytest.mark.parametrize("field_name", _EXECUTION_TENSOR_FIELDS)
+def test_execution_result_tensor_access_has_isolated_storage(
+    field_name: str,
+) -> None:
+    result = _snapshot_result()
+
+    first = getattr(result, field_name)
+    second = getattr(result, field_name)
+
+    assert first.data_ptr() != second.data_ptr()
+    torch.testing.assert_close(first, second)
+
+
+def _mutate_exposed_tensor(value: torch.Tensor, mutation: str) -> None:
+    if mutation == "getitem":
+        flat = value.reshape(-1)
+        if value.dtype is torch.bool:
+            flat[0] = ~flat[0]
+        else:
+            flat[0] += 1
+    elif mutation == "storage_view":
+        storage_alias = value.view(torch.uint8).reshape(-1)
+        storage_alias[0].bitwise_xor_(1)
+    else:
+        value.resize_(0)
+
+
+@pytest.mark.parametrize("mutation", ["getitem", "storage_view", "resize"])
+def test_execution_result_public_tensor_mutations_do_not_change_snapshot(
+    mutation: str,
+) -> None:
+    for field_name in _EXECUTION_TENSOR_FIELDS:
+        result = _snapshot_result()
+        expected = getattr(result, field_name).clone()
+        exposed = getattr(result, field_name)
+
+        _mutate_exposed_tensor(exposed, mutation)
+
+        torch.testing.assert_close(getattr(result, field_name), expected)
+
+
+def test_execution_result_snapshots_constructor_tensor_inputs() -> None:
+    float_matrix = torch.zeros((1, 4))
+    inputs = {
+        "position": float_matrix.clone(),
+        "turnover": float_matrix.clone(),
+        "gross_pnl": float_matrix.clone(),
+        "cost": float_matrix.clone(),
+        "net_pnl": float_matrix.clone(),
+        "target_valid": torch.tensor([[True, True, False, False]]),
+        "bar_time_ns": _hourly_times(4),
+        "final_liquidation_cost": torch.zeros(1),
+    }
+    result = ExecutionResult(**inputs)
+    expected = {
+        field_name: getattr(result, field_name).clone()
+        for field_name in _EXECUTION_TENSOR_FIELDS
+    }
+
+    for value in inputs.values():
+        _mutate_exposed_tensor(value, "getitem")
+
+    for field_name in _EXECUTION_TENSOR_FIELDS:
+        torch.testing.assert_close(getattr(result, field_name), expected[field_name])
+
+
+def test_execution_result_stays_frozen_replaceable_and_serializable() -> None:
+    result = _snapshot_result()
+
+    with pytest.raises(FrozenInstanceError):
+        result.position = torch.zeros_like(result.position)  # type: ignore[misc]
+
+    replacement = replace(result, position=torch.ones_like(result.position))
+    torch.testing.assert_close(
+        replacement.position,
+        torch.ones_like(replacement.position),
+    )
+    restored = pickle.loads(pickle.dumps(result))
+    for field_name in _EXECUTION_TENSOR_FIELDS:
+        torch.testing.assert_close(
+            getattr(restored, field_name),
+            getattr(result, field_name),
+        )
+    assert "ExecutionResult" in repr(result)
+
+
+def test_execution_result_defensive_access_keeps_consumers_and_backward() -> None:
+    result = _snapshot_result()
+    expected_ledger = build_execution_ledger(result, ["EURUSD"])
+    expected_metrics = performance_metrics(result)
+
+    for field_name in _EXECUTION_TENSOR_FIELDS:
+        _mutate_exposed_tensor(getattr(result, field_name), "getitem")
+
+    assert build_execution_ledger(result, ["EURUSD"]) == expected_ledger
+    assert performance_metrics(result) == expected_metrics
+
+    factors = torch.tensor(
+        [[0.2, 0.4, 0.0, 0.0]],
+        requires_grad=True,
+    )
+    differentiable = run_execution(
+        factors=factors,
+        target_ret=torch.zeros((1, 4)),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=0.1,
+        min_exposure=0.0,
+    )
+    first_access = differentiable.net_pnl
+    second_access = differentiable.net_pnl
+    assert first_access.data_ptr() != second_access.data_ptr()
+    second_access.sum().backward()
+    assert factors.grad is not None
+    assert bool((factors.grad.abs() > 0).any())
 
 
 def test_execution_keeps_nonzero_factor_gradient() -> None:
@@ -506,6 +768,94 @@ def test_performance_metrics_rejects_non_finite_derived_values() -> None:
         performance_metrics(result)
 
 
+def _metric_result(
+    net_pnl: torch.Tensor,
+    target_valid: torch.Tensor,
+) -> ExecutionResult:
+    zeros = torch.zeros_like(net_pnl)
+    time_length = net_pnl.shape[1]
+    return ExecutionResult(
+        position=zeros,
+        turnover=zeros,
+        gross_pnl=net_pnl,
+        cost=zeros,
+        net_pnl=net_pnl,
+        target_valid=target_valid,
+        bar_time_ns=_hourly_times(time_length).expand(net_pnl.shape[0], -1).clone(),
+        final_liquidation_cost=torch.zeros(
+            net_pnl.shape[0],
+            dtype=net_pnl.dtype,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("net_pnl", "target_valid"),
+    [
+        (
+            torch.tensor([[0.01, 0.01, 0.0, 0.0]], dtype=torch.float64),
+            torch.tensor([[True, True, False, False]]),
+        ),
+        (
+            torch.tensor([[-0.01, -0.01, 0.0, 0.0]], dtype=torch.float64),
+            torch.tensor([[True, True, False, False]]),
+        ),
+        (
+            torch.tensor(
+                [[0.01, 0.0, 0.0], [0.01, 0.0, 0.0]],
+                dtype=torch.float64,
+            ),
+            torch.tensor(
+                [[True, False, False], [True, False, False]],
+            ),
+        ),
+    ],
+    ids=["constant-positive", "constant-negative", "single-period-per-symbol"],
+)
+def test_performance_metrics_rejects_nonzero_return_with_zero_risk_denominator(
+    net_pnl: torch.Tensor,
+    target_valid: torch.Tensor,
+) -> None:
+    with pytest.raises(DataValidationError, match="non-zero return.*zero risk"):
+        performance_metrics(_metric_result(net_pnl, target_valid))
+
+
+def test_performance_metrics_all_zero_returns_have_zero_risk_ratios() -> None:
+    metrics = performance_metrics(
+        _metric_result(
+            torch.zeros((1, 4), dtype=torch.float64),
+            torch.tensor([[True, True, False, False]]),
+        )
+    )
+
+    assert metrics.total_return == 0.0
+    assert metrics.annualized_return == 0.0
+    assert metrics.volatility == 0.0
+    assert metrics.sharpe == 0.0
+    assert metrics.sortino == 0.0
+    assert metrics.max_drawdown == 0.0
+    assert metrics.calmar == 0.0
+
+
+def test_performance_metrics_keeps_tiny_nonzero_risk_denominators() -> None:
+    metrics = performance_metrics(
+        _metric_result(
+            torch.tensor(
+                [[-1e-12, 2e-12, 0.0, 0.0]],
+                dtype=torch.float64,
+            ),
+            torch.tensor([[True, True, False, False]]),
+        )
+    )
+
+    assert metrics.volatility > 0.0
+    assert metrics.max_drawdown > 0.0
+    assert all(
+        math.isfinite(value)
+        for value in (metrics.sharpe, metrics.sortino, metrics.calmar)
+    )
+
+
 def test_performance_metrics_result_is_frozen() -> None:
     metrics = PerformanceMetrics(
         observations=2,
@@ -656,6 +1006,76 @@ def test_execution_ledger_rejects_large_cancellation_residuals() -> None:
         match="net_pnl.*gross_pnl.*cost",
     ):
         build_execution_ledger(result, ["EURUSD"])
+
+
+def test_execution_ledger_rejects_mixed_read_field_dtypes() -> None:
+    result = replace(
+        _consumer_result(),
+        position=torch.zeros((1, 5), dtype=torch.float64),
+        gross_pnl=torch.tensor(
+            [[1.0, 1.0, 0.0, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        cost=torch.zeros((1, 5), dtype=torch.float16),
+        net_pnl=torch.tensor(
+            [[1.001, 1.0, 0.0, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+    )
+
+    with pytest.raises(DataValidationError, match="same dtype"):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.float64],
+    ids=["float16", "float32", "float64"],
+)
+def test_execution_ledger_uses_consistent_four_ulp_boundary(
+    dtype: torch.dtype,
+) -> None:
+    zero = torch.tensor(0.0, dtype=dtype)
+    smallest_subnormal = torch.nextafter(
+        zero,
+        torch.tensor(float("inf"), dtype=dtype),
+    )
+    reference_values = (zero, smallest_subnormal, torch.tensor(1.0, dtype=dtype))
+
+    for reference in reference_values:
+        four_ulp = reference.clone()
+        for _ in range(4):
+            four_ulp = torch.nextafter(
+                four_ulp,
+                torch.tensor(float("inf"), dtype=dtype),
+            )
+        five_ulp = torch.nextafter(
+            four_ulp,
+            torch.tensor(float("inf"), dtype=dtype),
+        )
+        gross_pnl = torch.zeros((1, 5), dtype=dtype)
+        gross_pnl[0, :2] = reference
+        cost = torch.zeros_like(gross_pnl)
+        accepted_net = gross_pnl.clone()
+        accepted_net[0, :2] = four_ulp
+        accepted = replace(
+            _consumer_result(),
+            position=torch.zeros_like(gross_pnl),
+            gross_pnl=gross_pnl,
+            cost=cost,
+            net_pnl=accepted_net,
+        )
+
+        assert len(build_execution_ledger(accepted, ["EURUSD"])) == 2
+
+        rejected_net = accepted_net.clone()
+        rejected_net[0, :2] = five_ulp
+        rejected = replace(accepted, net_pnl=rejected_net)
+        with pytest.raises(
+            DataValidationError,
+            match="net_pnl.*gross_pnl.*cost",
+        ):
+            build_execution_ledger(rejected, ["EURUSD"])
 
 
 def test_execution_ledger_uses_net_ulp_for_cancellation_tolerance() -> None:

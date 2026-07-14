@@ -9,8 +9,22 @@ from torch import Tensor
 from .semantics import DataValidationError
 
 
+_EXECUTION_RESULT_TENSOR_FIELDS = (
+    "position",
+    "turnover",
+    "gross_pnl",
+    "cost",
+    "net_pnl",
+    "target_valid",
+    "bar_time_ns",
+    "final_liquidation_cost",
+)
+
+
 @dataclass(frozen=True)
 class ExecutionResult:
+    """Immutable execution snapshot with differentiable defensive tensor access."""
+
     position: Tensor
     turnover: Tensor
     gross_pnl: Tensor
@@ -19,6 +33,18 @@ class ExecutionResult:
     target_valid: Tensor
     bar_time_ns: Tensor
     final_liquidation_cost: Tensor
+
+    def __post_init__(self) -> None:
+        for field_name in _EXECUTION_RESULT_TENSOR_FIELDS:
+            value = object.__getattribute__(self, field_name)
+            if isinstance(value, Tensor):
+                object.__setattr__(self, field_name, value.clone())
+
+    def __getattribute__(self, name: str) -> object:
+        value = object.__getattribute__(self, name)
+        if name in _EXECUTION_RESULT_TENSOR_FIELDS and isinstance(value, Tensor):
+            return value.clone()
+        return value
 
 
 @dataclass(frozen=True)
@@ -54,6 +80,12 @@ _NANOSECONDS_PER_SECOND = 1_000_000_000
 _MIN_LOG_FLOAT64 = math.log(math.ulp(0.0))
 _MAX_LOG_FLOAT64 = math.log(float.fromhex("0x1.fffffffffffffp+1023"))
 _SUPPORTED_DEVICE_TYPES = {"cpu", "cuda"}
+_SUPPORTED_FLOAT_DTYPES = {
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+}
 
 
 def _validate_supported_device(device: torch.device, *, context: str) -> None:
@@ -61,13 +93,40 @@ def _validate_supported_device(device: torch.device, *, context: str) -> None:
         raise DataValidationError(f"{context} tensors must use CPU or CUDA")
 
 
+def _validate_supported_float_tensor(value: Tensor, *, name: str) -> None:
+    if not value.is_floating_point():
+        raise DataValidationError(f"{name} must be a floating-point tensor")
+    if value.dtype not in _SUPPORTED_FLOAT_DTYPES:
+        raise DataValidationError(
+            f"{name} must use a supported floating-point dtype"
+        )
+
+
+def _cost_work_dtype(published_dtype: torch.dtype) -> torch.dtype:
+    if published_dtype in {torch.float16, torch.bfloat16}:
+        return torch.float32
+    return torch.float64
+
+
+def _validate_cost_publication(
+    working_value: Tensor,
+    published_value: Tensor,
+) -> None:
+    underflowed = (working_value != 0) & (
+        published_value.to(working_value.dtype) == 0
+    )
+    if bool(underflowed.any()):
+        raise DataValidationError(
+            "the result dtype must provide representable non-zero execution cost"
+        )
+
+
 def factor_to_position(factors: Tensor, *, min_exposure: float) -> Tensor:
     """Convert finite factors to continuous positions with a neutral band."""
     if not math.isfinite(min_exposure) or min_exposure < 0.0:
         raise DataValidationError("min_exposure must be finite and non-negative")
     _validate_supported_device(factors.device, context="factors")
-    if not factors.is_floating_point():
-        raise DataValidationError("factors must be a floating-point tensor")
+    _validate_supported_float_tensor(factors, name="factors")
     if not bool(torch.isfinite(factors).all()):
         raise DataValidationError("factors must contain only finite values")
 
@@ -108,8 +167,10 @@ def _validate_execution_inputs(
     if len(devices) != 1:
         raise DataValidationError("execution input tensors must use the same device")
     _validate_supported_device(devices.pop(), context="execution input")
-    if not factors.is_floating_point() or not target_ret.is_floating_point():
-        raise DataValidationError("factors and target_ret must be floating-point tensors")
+    _validate_supported_float_tensor(factors, name="factors")
+    _validate_supported_float_tensor(target_ret, name="target_ret")
+    if factors.dtype is not target_ret.dtype:
+        raise DataValidationError("factors and target_ret must use the same dtype")
     if not math.isfinite(cost_rate) or cost_rate < 0.0:
         raise DataValidationError("cost_rate must be finite and non-negative")
     if bool((target_valid.sum(dim=1) == 0).any()):
@@ -165,18 +226,24 @@ def run_execution(
         dim=1,
     )
     final_valid = target_valid & ~next_valid
-    liquidation_cost_by_time = torch.where(
+    cost_work_dtype = _cost_work_dtype(position.dtype)
+    position_for_cost = position.to(cost_work_dtype)
+    turnover_for_cost = turnover.to(cost_work_dtype)
+    liquidation_cost_by_time_work = torch.where(
         final_valid,
-        position.abs() * cost_rate,
-        torch.zeros_like(position),
+        position_for_cost.abs() * cost_rate,
+        torch.zeros_like(position_for_cost),
     )
-    final_liquidation_cost = liquidation_cost_by_time.sum(dim=1)
-
-    cost = torch.where(
+    final_liquidation_cost_work = liquidation_cost_by_time_work.sum(dim=1)
+    cost_work = torch.where(
         target_valid,
-        turnover * cost_rate + liquidation_cost_by_time,
-        torch.zeros_like(position),
+        turnover_for_cost * cost_rate + liquidation_cost_by_time_work,
+        torch.zeros_like(position_for_cost),
     )
+    final_liquidation_cost = final_liquidation_cost_work.to(position.dtype)
+    cost = cost_work.to(position.dtype)
+    _validate_cost_publication(final_liquidation_cost_work, final_liquidation_cost)
+    _validate_cost_publication(cost_work, cost)
     valid_target_ret = torch.where(
         target_valid,
         target_ret,
@@ -326,8 +393,7 @@ def derive_periods_per_year(bar_time_ns: Tensor, target_valid: Tensor) -> float:
 def _validate_performance_result(result: ExecutionResult) -> None:
     if result.net_pnl.shape != result.target_valid.shape:
         raise DataValidationError("net_pnl shape must match target_valid")
-    if not result.net_pnl.is_floating_point():
-        raise DataValidationError("net_pnl must be a floating-point tensor")
+    _validate_supported_float_tensor(result.net_pnl, name="net_pnl")
     if result.net_pnl.device != result.target_valid.device:
         raise DataValidationError(
             "net_pnl, target_valid, and bar_time_ns must use the same device"
@@ -355,16 +421,15 @@ def _validate_ledger_result(result: ExecutionResult) -> Tensor:
     )
     expected_shape = result.target_valid.shape
     expected_device = result.target_valid.device
+    read_fields: dict[str, Tensor] = {}
     for field_name in ("position", "gross_pnl", "cost", "net_pnl"):
         value = getattr(result, field_name)
+        read_fields[field_name] = value
         if value.shape != expected_shape:
             raise DataValidationError(
                 f"{field_name} shape must match target_valid"
             )
-        if not value.is_floating_point():
-            raise DataValidationError(
-                f"{field_name} must be a floating-point tensor"
-            )
+        _validate_supported_float_tensor(value, name=field_name)
         if value.device != expected_device:
             raise DataValidationError(
                 f"{field_name} must use the same device as target_valid"
@@ -374,21 +439,27 @@ def _validate_ledger_result(result: ExecutionResult) -> Tensor:
                 f"valid {field_name} values must be finite"
             )
 
-    valid_gross = result.gross_pnl[result.target_valid].to(torch.float64)
-    valid_cost = result.cost[result.target_valid].to(torch.float64)
-    valid_net = result.net_pnl[result.target_valid].to(torch.float64)
+    if len({value.dtype for value in read_fields.values()}) != 1:
+        raise DataValidationError(
+            "ledger read fields must use the same dtype"
+        )
+
+    target_valid = result.target_valid
+    valid_gross = read_fields["gross_pnl"][target_valid]
+    valid_cost = read_fields["cost"][target_valid]
+    valid_net = read_fields["net_pnl"][target_valid]
     expected_net = valid_gross - valid_cost
-    comparison_epsilon = max(
-        torch.finfo(value.dtype).eps
-        for value in (result.gross_pnl, result.cost, result.net_pnl)
-    )
-    comparison_scale = torch.maximum(
-        expected_net.abs(),
-        valid_net.abs(),
-    )
-    tolerance = comparison_scale * (4.0 * comparison_epsilon)
-    consistent = torch.isfinite(expected_net) & (
-        (valid_net - expected_net).abs() <= tolerance
+    lower_bound = expected_net
+    upper_bound = expected_net
+    negative_infinity = torch.full_like(expected_net, -float("inf"))
+    positive_infinity = torch.full_like(expected_net, float("inf"))
+    for _ in range(4):
+        lower_bound = torch.nextafter(lower_bound, negative_infinity)
+        upper_bound = torch.nextafter(upper_bound, positive_infinity)
+    consistent = (
+        torch.isfinite(expected_net)
+        & (valid_net >= lower_bound)
+        & (valid_net <= upper_bound)
     )
     if not bool(consistent.all()):
         raise DataValidationError(
@@ -489,6 +560,19 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
         )
 
     annualization_scale = math.sqrt(periods_per_year)
+    zero_risk_denominators: list[str] = []
+    if bool(return_std == 0) and bool(mean_return != 0):
+        zero_risk_denominators.append("volatility")
+    if bool(downside_deviation == 0) and bool(mean_return != 0):
+        zero_risk_denominators.append("downside deviation")
+    if bool(max_drawdown_tensor == 0) and bool(annualized_return_tensor != 0):
+        zero_risk_denominators.append("maximum drawdown")
+    if zero_risk_denominators:
+        raise DataValidationError(
+            "non-zero return cannot be reported with zero risk denominator: "
+            + ", ".join(zero_risk_denominators)
+        )
+
     if bool(return_std > 0):
         sharpe_tensor = mean_return / return_std * annualization_scale
     else:
