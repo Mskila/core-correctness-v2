@@ -17,6 +17,8 @@ model_core/ops.py -- 算子库（Operator_Library, R2）
 可变位置参数形式（`*operands`），注册层会跳过 arity 观测校验，从而避免对既有算子
 的 `ArityMismatchError` 误报。
 """
+import math
+
 import torch
 
 from .causal import causal_rolling_zscore
@@ -118,6 +120,23 @@ def _ema(x: torch.Tensor, alpha: float) -> torch.Tensor:
     # 上面的 unfold 对 1D 不直接 work，改用简单循环近似
 
 
+_EMA_TAIL_WEIGHT_THRESHOLD = 1e-6
+
+
+def _ema_effective_window(span: int) -> int:
+    """Return the finite EMA kernel covering weights down to the V2 cutoff."""
+    alpha = 2.0 / (span + 1.0)
+    if alpha >= 1.0:
+        return 1
+    return max(
+        1,
+        math.ceil(
+            -math.log(_EMA_TAIL_WEIGHT_THRESHOLD)
+            / (-math.log(1.0 - alpha))
+        ),
+    )
+
+
 def _ema_simple(x: torch.Tensor, span: int, exact: bool = False) -> torch.Tensor:
     """指数加权移动平均（因果），span 期。
 
@@ -144,26 +163,21 @@ def _ema_simple(x: torch.Tensor, span: int, exact: bool = False) -> torch.Tensor
         return out
 
     # ── 向量化卷积近似路径（默认，R8.3）────────────────────────────────
-    import math
     if alpha >= 1.0:
         return x.clone()
-    # w_full 仅由 span 决定
-    w_full = max(1, math.ceil(-math.log(1e-6) / (-math.log(1.0 - alpha))))
+    # 实现与注册声明共享同一个 V2 有效窗口定义。
+    w_full = _ema_effective_window(span)
 
-    # 因果性保证：为确保前缀步输出与序列长度无关，必须保证相同 T 范围内
-    # 两种实现路径（精确 vs 向量化）不能混用。
-    # 策略：仅当 T >= 2 * w_full 时才使用向量化（此时 warm-up 区占比 < 50%，
-    # 精度问题可忽略）；否则使用精确递推（严格因果，O(N·T)）。
-    # 注意：2*w_full 是确定性阈值，不依赖具体输入，故不同长度的序列在
-    # 超过阈值后行为一致。实际训练序列 T=200-512 均远超 2*w_full(≤360)。
-    if T < 2 * w_full:
+    # 只有不足一个完整有效窗口时才使用首值递推 warm-up；一旦 T >= w_full，
+    # 截断卷积确保任何 warmed output 都不依赖声明窗口之外的历史。
+    if T < w_full:
         out = torch.zeros_like(x)
         out[:, 0] = x[:, 0]
         for t in range(1, T):
             out[:, t] = alpha * x[:, t] + (1 - alpha) * out[:, t - 1]
         return out
 
-    # T >= 2*w_full：向量化卷积近似（首值填充），max|Δ| < 1e-4
+    # T >= w_full：向量化卷积近似（首值填充），max|Δ| < 1e-4
     decay = 1.0 - alpha
     powers = torch.arange(w_full - 1, -1, -1, dtype=x.dtype, device=x.device)
     weights = alpha * (decay ** powers)                        # 未归一化
@@ -340,8 +354,8 @@ _INITIAL_OPERATORS = [
     # DELAY4: 延迟4根bar，构建中期动量差
     ('DELAY4',      lambda x: _ts_delay(x, 4), 1, 5),
     # ── v3.0 新增算子（token id = feat_offset+28~33）──────────────────
-    ('EMA_5',           lambda x: _ema_simple(x, 5),    1, 5),
-    ('EMA_20',          lambda x: _ema_simple(x, 20),   1, 20),
+    ('EMA_5',           lambda x: _ema_simple(x, 5),    1, _ema_effective_window(5)),
+    ('EMA_20',          lambda x: _ema_simple(x, 20),   1, _ema_effective_window(20)),
     ('TS_QUANTILE_10',  lambda x: _ts_quantile(x, 10),  1, 10),
     ('TS_SKEW_10',      lambda x: _ts_skew(x, 10),      1, 10),
     ('TS_MIN_20',       lambda x: _ts_rolling(x, 20).min(dim=-1).values, 1, 20),
@@ -417,7 +431,7 @@ assert len(OPERATOR_REGISTRY.operator_specs) == len(_INITIAL_OPERATORS), (
 # ── Task 3.3 追加：时序求和/极值与幅度变换算子 ────────────────────────────
 #
 # 新增 8 个算子（TS_SUM_5/10/20、MIN、MAX、POWER、SIGNED_LOG、SQRT），
-# 追加在既有 47 个算子（44 初始 + 3 Cross_Sectional）之后，保持既有顺序不变。
+# 追加在既有 44 个 V2 单标的算子之后，保持既有顺序不变。
 # 全部算子出口 nan_to_num→0，满足形状契约 [N,T]→[N,T]（R2.9, R2.10）。
 # 时序求和用因果 unfold（零填充），每步 t 只用 [t-w+1..t]（R2.11, R2.12）。
 

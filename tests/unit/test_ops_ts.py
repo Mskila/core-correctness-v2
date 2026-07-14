@@ -6,7 +6,7 @@
 - TS_RANK_5/10/20 值域 ∈ [0, 1)
 - TS_CORR_10 在常数输入时输出 0
 - 所有算子对边界值（全零、极大值 1e8）无 NaN / Inf
-- len(OPS_CONFIG) == 28（原 22 + 新增 6 个趋势/动量算子）
+- OPS_CONFIG 数量与 V2 operator registry 动态保持一致
 
 需求：F2.1~F2.6
 """
@@ -258,6 +258,68 @@ class TestHelperFunctions:
 
 
 class TestOperatorLookbacks:
+    @staticmethod
+    def _spec(name):
+        return next(
+            spec for spec in OPERATOR_REGISTRY.operator_specs if spec.name == name
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "expected_window"),
+        [("EMA_5", 35), ("EMA_20", 139)],
+    )
+    def test_ema_declaration_matches_effective_kernel(
+        self, name, expected_window
+    ):
+        spec = self._spec(name)
+        assert spec.lookback == expected_window, (
+            f"{name} declares {spec.lookback} bars but its 1e-6-truncated "
+            f"EMA kernel requires {expected_window}"
+        )
+
+    @pytest.mark.parametrize(
+        ("span", "expected_window"),
+        [(5, 35), (20, 139)],
+    )
+    def test_ema_window_helper_is_the_registration_source(
+        self, span, expected_window
+    ):
+        helper = getattr(ops_module, "_ema_effective_window", None)
+        assert callable(helper), "EMA implementation has no shared window helper"
+        assert helper(span) == expected_window
+
+    @pytest.mark.parametrize(
+        ("name", "window"),
+        [("EMA_5", 35), ("EMA_20", 139)],
+    )
+    def test_ema_dependency_stops_at_declared_window(self, name, window):
+        spec = self._spec(name)
+        target = window
+        base = torch.zeros(1, window + 1)
+
+        outside = base.clone()
+        outside[0, target - window] = 10_000.0
+        inside = base.clone()
+        inside[0, target - window + 1] = 10_000.0
+
+        baseline_value = spec.transform(base)[0, target]
+        outside_value = spec.transform(outside)[0, target]
+        inside_value = spec.transform(inside)[0, target]
+
+        torch.testing.assert_close(
+            outside_value,
+            baseline_value,
+            rtol=0,
+            atol=0,
+            msg=f"{name} still depends on a value older than {window} bars",
+        )
+        assert not torch.isclose(
+            inside_value,
+            baseline_value,
+            rtol=0,
+            atol=1e-6,
+        ), f"{name} must still depend on the earliest value inside its window"
+
     def test_all_registered_operators_have_positive_integer_lookback(self):
         assert OPERATOR_REGISTRY.operator_specs
         for spec in OPERATOR_REGISTRY.operator_specs:

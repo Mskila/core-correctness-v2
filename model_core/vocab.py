@@ -9,12 +9,12 @@ model_core/vocab.py -- Formula_Vocabulary 集成与确定性版本（R3）
   - token id 分段：feature id ∈ [0, F-1]，operator id ∈ [F, F+O-1]，两段严格
     不相交（`operator_offset == feature_count`，R3.3）。
   - 构建时用集合校验 token 名称全局唯一、无缺失/重复/多余（R3.1、R3.2）。
-  - `VOCAB_VERSION` 由有序 token 名称列表确定性派生（R3.4、R3.5）：
-        VOCAB_VERSION = "v" + sha256("\n".join(token_names)).hexdigest()[:12]
-    相同有序列表 → 相同版本；任意组成/顺序变化 → 不同版本。
+  - `VOCAB_VERSION` 对核心语义版本、schema tag、有序 feature 名/lookback 和
+    有序 operator 名/arity/lookback 的规范 JSON 做稳定 SHA-256 哈希。
+    相同 V2 声明 → 相同版本；任意窗口、组成或顺序变化 → 不同版本。
   - `FORMULA_VOCAB.verify(artifact_version)`：版本不匹配抛
     `VocabVersionMismatchError`，拒绝且不消费任何 token（R3.7）。
-  - `VOCAB_SCHEMA_TAG`：人类可读的 schema 标签，仅供日志展示，不参与兼容判定。
+  - `VOCAB_SCHEMA_TAG`：人类可读的 schema 标签，同时参与兼容身份哈希。
 
 import 方向说明：`features.py` / `ops.py` 只依赖 `.registry`，本模块从二者读取
 注册表视图不构成循环依赖。下游 `vm.py` / `config.py` /
@@ -192,7 +192,7 @@ FORMULA_VOCAB = _build_formula_vocab()
 # 由注册表导出有序特征名视图（保持下游 import 兼容）
 FEATURE_NAMES = FORMULA_VOCAB.feature_names
 
-# 词表版本：由有序 token 名称列表确定性派生（R3.4、R3.5）。
+# 词表版本：由核心语义/schema 身份和有序 V2 完整声明确定性派生（R3.4、R3.5）。
 # 特征/算子的组成或顺序变化都会改变本值，旧 checkpoint / best_strategy.json 将
 # 因版本不匹配而被 verify() 拒绝加载。
 VOCAB_VERSION = FORMULA_VOCAB.version

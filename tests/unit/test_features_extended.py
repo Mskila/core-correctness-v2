@@ -5,6 +5,9 @@
 
 需求：F1.1~F1.7, F4.1~F4.4
 """
+import ast
+from pathlib import Path
+
 import pytest
 import torch
 import sys
@@ -190,6 +193,34 @@ class TestRet20PrefixZero:
 
 
 class TestFeatureLookbacks:
+    def test_input_dim_is_only_derived_after_registry_construction(self):
+        source = Path(features_module.__file__).read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        engineer = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MT5FeatureEngineer"
+        )
+        class_body_assignments = []
+        for statement in engineer.body:
+            if isinstance(statement, ast.Assign):
+                class_body_assignments.extend(
+                    target
+                    for target in statement.targets
+                    if isinstance(target, ast.Name) and target.id == "INPUT_DIM"
+                )
+            elif (
+                isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name)
+                and statement.target.id == "INPUT_DIM"
+            ):
+                class_body_assignments.append(statement.target)
+
+        assert class_body_assignments == [], (
+            "MT5FeatureEngineer must not contain a class-body INPUT_DIM literal"
+        )
+        assert MT5FeatureEngineer.INPUT_DIM == len(FEATURE_REGISTRY.feature_names)
+
     def test_all_registered_features_have_positive_integer_lookback(self):
         assert FEATURE_REGISTRY.feature_specs
         for spec in FEATURE_REGISTRY.feature_specs:
