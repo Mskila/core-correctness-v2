@@ -239,23 +239,61 @@ def _validate_time_mask(
     return valid_counts
 
 
-def derive_periods_per_year(bar_time_ns: Tensor, target_valid: Tensor) -> float:
-    """Derive annualization from each symbol's first entry and final exit."""
-    valid_counts = _validate_time_mask(bar_time_ns, target_valid)
+def _validate_relevant_timestamps(
+    bar_time_ns: Tensor,
+    valid_counts: Tensor,
+    *,
+    start_index: int,
+    missing_exit_message: str,
+) -> Tensor:
+    """Validate only the timestamp prefix read by an execution consumer."""
     time_length = bar_time_ns.shape[1]
     if time_length <= 1:
         raise DataValidationError("first entry timestamp is missing")
 
     final_exit_indices = valid_counts + 1
     if bool((final_exit_indices >= time_length).any()):
-        raise DataValidationError("final exit timestamp is missing")
+        raise DataValidationError(missing_exit_message)
 
     first_entry_ns = bar_time_ns[:, 1]
-    final_exit_ns = bar_time_ns.gather(1, final_exit_indices[:, None]).squeeze(1)
+    final_exit_ns = bar_time_ns.gather(
+        1,
+        final_exit_indices[:, None],
+    ).squeeze(1)
     if bool((final_exit_ns <= first_entry_ns).any()):
         raise DataValidationError(
             "each symbol must have a positive entry-to-exit timestamp span"
         )
+
+    transition_end_indices = torch.arange(
+        1,
+        time_length,
+        device=bar_time_ns.device,
+    ).unsqueeze(0)
+    relevant_transitions = (
+        (transition_end_indices > start_index)
+        & (transition_end_indices <= final_exit_indices[:, None])
+    )
+    increasing = bar_time_ns[:, 1:] > bar_time_ns[:, :-1]
+    if bool((relevant_transitions & ~increasing).any()):
+        raise DataValidationError(
+            "bar_time_ns must be strictly increasing within each relevant prefix"
+        )
+    return final_exit_indices
+
+
+def derive_periods_per_year(bar_time_ns: Tensor, target_valid: Tensor) -> float:
+    """Derive annualization from each symbol's first entry and final exit."""
+    valid_counts = _validate_time_mask(bar_time_ns, target_valid)
+    final_exit_indices = _validate_relevant_timestamps(
+        bar_time_ns,
+        valid_counts,
+        start_index=1,
+        missing_exit_message="final exit timestamp is missing",
+    )
+
+    first_entry_ns = bar_time_ns[:, 1]
+    final_exit_ns = bar_time_ns.gather(1, final_exit_indices[:, None]).squeeze(1)
 
     first_entries = first_entry_ns.detach().cpu().tolist()
     final_exits = final_exit_ns.detach().cpu().tolist()
@@ -280,7 +318,13 @@ def _validate_performance_result(result: ExecutionResult) -> None:
         raise DataValidationError(
             "net_pnl, target_valid, and bar_time_ns must use the same device"
         )
-    _validate_time_mask(result.bar_time_ns, result.target_valid)
+    valid_counts = _validate_time_mask(result.bar_time_ns, result.target_valid)
+    _validate_relevant_timestamps(
+        result.bar_time_ns,
+        valid_counts,
+        start_index=1,
+        missing_exit_message="final exit timestamp is missing",
+    )
 
 
 def _validate_ledger_result(result: ExecutionResult) -> Tensor:
@@ -289,9 +333,15 @@ def _validate_ledger_result(result: ExecutionResult) -> Tensor:
         result.target_valid,
         minimum_observations=1,
     )
+    _validate_relevant_timestamps(
+        result.bar_time_ns,
+        valid_counts,
+        start_index=0,
+        missing_exit_message="final exit timestamp is missing for ledger",
+    )
     expected_shape = result.target_valid.shape
     expected_device = result.target_valid.device
-    for field_name in ("position", "turnover", "gross_pnl", "cost", "net_pnl"):
+    for field_name in ("position", "gross_pnl", "cost", "net_pnl"):
         value = getattr(result, field_name)
         if value.shape != expected_shape:
             raise DataValidationError(
@@ -313,7 +363,15 @@ def _validate_ledger_result(result: ExecutionResult) -> Tensor:
 
 
 def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
-    """Compute timestamp-derived metrics from valid net log returns."""
+    """Compute timestamp-derived metrics from valid shared net log returns.
+
+    Total, annualized, mean, standard-deviation, and downside statistics pool
+    every symbol's valid returns.  Equity paths and drawdowns instead use each
+    symbol's valid prefix independently, with the worst per-symbol drawdown
+    used by aggregate-annualized-return Calmar.  This avoids cross-symbol path
+    concatenation, is invariant to symbol row order, and preserves one-symbol
+    behavior.
+    """
     _validate_performance_result(result)
     net_pnl = result.net_pnl[result.target_valid]
     if not bool(torch.isfinite(net_pnl).all()):
@@ -326,19 +384,15 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
     observations = net_pnl.numel()
     elapsed_years = observations / periods_per_year
 
-    cumulative_log_return = torch.cumsum(net_pnl, dim=0)
-    if not bool(torch.isfinite(cumulative_log_return).all()):
-        raise DataValidationError("cumulative net log return must be finite")
-    log_equity = torch.cat(
-        [torch.zeros_like(cumulative_log_return[:1]), cumulative_log_return],
-        dim=0,
+    total_log_return = net_pnl.sum()
+    annualized_log_return = total_log_return / elapsed_years
+    aggregate_equity_logs = torch.stack(
+        [total_log_return, annualized_log_return]
     )
-    annualized_log_return = cumulative_log_return[-1] / elapsed_years
-    equity_logs = torch.cat([log_equity, annualized_log_return.reshape(1)])
-    if bool(
+    if not bool(torch.isfinite(aggregate_equity_logs).all()) or bool(
         (
-            (equity_logs < _MIN_LOG_FLOAT64)
-            | (equity_logs > _MAX_LOG_FLOAT64)
+            (aggregate_equity_logs < _MIN_LOG_FLOAT64)
+            | (aggregate_equity_logs > _MAX_LOG_FLOAT64)
         ).any()
     ):
         raise DataValidationError(
@@ -346,16 +400,40 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
             "unrepresentable equity path"
         )
 
-    running_peak_log = torch.cummax(log_equity, dim=0).values
-    drawdown_log = log_equity - running_peak_log
-    if bool((drawdown_log < _MIN_LOG_FLOAT64).any()):
-        raise DataValidationError(
-            "unable to derive finite performance metrics from an "
-            "unrepresentable equity drawdown"
+    symbol_max_drawdowns: list[Tensor] = []
+    for symbol_index in range(result.net_pnl.shape[0]):
+        symbol_net_pnl = result.net_pnl[
+            symbol_index,
+            result.target_valid[symbol_index],
+        ].to(torch.float64)
+        cumulative_log_return = torch.cumsum(symbol_net_pnl, dim=0)
+        if not bool(torch.isfinite(cumulative_log_return).all()):
+            raise DataValidationError("cumulative net log return must be finite")
+        log_equity = torch.cat(
+            [torch.zeros_like(cumulative_log_return[:1]), cumulative_log_return],
+            dim=0,
         )
-    drawdown = -torch.expm1(drawdown_log)
+        if bool(
+            (
+                (log_equity < _MIN_LOG_FLOAT64)
+                | (log_equity > _MAX_LOG_FLOAT64)
+            ).any()
+        ):
+            raise DataValidationError(
+                "unable to derive finite performance metrics from an "
+                "unrepresentable equity path"
+            )
+        running_peak_log = torch.cummax(log_equity, dim=0).values
+        drawdown_log = log_equity - running_peak_log
+        if bool((drawdown_log < _MIN_LOG_FLOAT64).any()):
+            raise DataValidationError(
+                "unable to derive finite performance metrics from an "
+                "unrepresentable equity drawdown"
+            )
+        symbol_max_drawdowns.append((-torch.expm1(drawdown_log)).max())
+    max_drawdown_tensor = torch.stack(symbol_max_drawdowns).max()
 
-    total_return_tensor = torch.expm1(cumulative_log_return[-1])
+    total_return_tensor = torch.expm1(total_log_return)
     annualized_return_tensor = torch.expm1(annualized_log_return)
     mean_return = net_pnl.mean()
     return_std = net_pnl.std(unbiased=False)
@@ -368,7 +446,7 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
     else:
         downside_deviation = torch.zeros_like(mean_return)
     critical_statistics = torch.stack(
-        [mean_return, return_std, downside_deviation, drawdown.max()]
+        [mean_return, return_std, downside_deviation, max_drawdown_tensor]
     )
     if not bool(torch.isfinite(critical_statistics).all()):
         raise DataValidationError(
@@ -384,7 +462,6 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
         sortino_tensor = mean_return / downside_deviation * annualization_scale
     else:
         sortino_tensor = torch.zeros_like(mean_return)
-    max_drawdown_tensor = drawdown.max()
     if bool(max_drawdown_tensor > 0):
         calmar_tensor = annualized_return_tensor / max_drawdown_tensor
     else:

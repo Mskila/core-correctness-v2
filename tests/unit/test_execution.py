@@ -338,6 +338,64 @@ def test_performance_metrics_uses_only_valid_net_log_returns() -> None:
     assert metrics.annualized_return > 0.0
 
 
+def test_performance_metrics_is_invariant_to_symbol_row_permutation() -> None:
+    day_ns = 86_400 * 1_000_000_000
+    valid = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, True, False, False],
+        ]
+    )
+    net_pnl = torch.tensor(
+        [
+            [-0.10, 0.12, 0.0, 0.0],
+            [0.10, -0.08, 0.0, 0.0],
+        ],
+        dtype=torch.float64,
+    )
+    zeros = torch.zeros_like(net_pnl)
+    result = ExecutionResult(
+        position=zeros,
+        turnover=zeros,
+        gross_pnl=zeros,
+        cost=zeros,
+        net_pnl=net_pnl,
+        target_valid=valid,
+        bar_time_ns=torch.tensor(
+            [[0, day_ns, 2 * day_ns, 3 * day_ns]] * 2,
+            dtype=torch.int64,
+        ),
+        final_liquidation_cost=torch.zeros(2, dtype=torch.float64),
+    )
+    symbols = ["ALPHA", "BETA"]
+    order = torch.tensor([1, 0])
+    permuted = replace(
+        result,
+        position=result.position[order],
+        turnover=result.turnover[order],
+        gross_pnl=result.gross_pnl[order],
+        cost=result.cost[order],
+        net_pnl=result.net_pnl[order],
+        target_valid=result.target_valid[order],
+        bar_time_ns=result.bar_time_ns[order],
+        final_liquidation_cost=result.final_liquidation_cost[order],
+    )
+    permuted_symbols = [symbols[index] for index in order.tolist()]
+
+    actual = performance_metrics(permuted)
+    expected = performance_metrics(result)
+    ledger = build_execution_ledger(permuted, permuted_symbols)
+
+    actual_metrics = {
+        field.name: getattr(actual, field.name) for field in fields(PerformanceMetrics)
+    }
+    expected_metrics = {
+        field.name: getattr(expected, field.name) for field in fields(PerformanceMetrics)
+    }
+    assert actual_metrics == pytest.approx(expected_metrics, rel=1e-12, abs=1e-12)
+    assert [row.symbol for row in ledger] == ["BETA", "BETA", "ALPHA", "ALPHA"]
+
+
 @pytest.mark.parametrize(
     ("valid_net_pnl", "expected_max_drawdown"),
     [
@@ -498,6 +556,58 @@ def _consumer_result() -> ExecutionResult:
     )
 
 
+@pytest.mark.parametrize(
+    "bar_time_ns",
+    [
+        torch.tensor([[0, 10, 5, 30, 40]], dtype=torch.int64),
+        torch.tensor([[0, 10, 10, 30, 40]], dtype=torch.int64),
+    ],
+    ids=["descending", "equal"],
+)
+@pytest.mark.parametrize("consumer", ["performance", "ledger"])
+def test_execution_consumers_reject_non_increasing_relevant_timestamps(
+    bar_time_ns: torch.Tensor,
+    consumer: str,
+) -> None:
+    result = replace(_consumer_result(), bar_time_ns=bar_time_ns)
+
+    with pytest.raises(DataValidationError, match="strictly increasing"):
+        if consumer == "performance":
+            performance_metrics(result)
+        else:
+            build_execution_ledger(result, ["EURUSD"])
+
+
+def test_execution_consumers_validate_only_timestamps_they_read() -> None:
+    result = replace(
+        _consumer_result(),
+        bar_time_ns=torch.tensor([[15, 10, 20, 30, 40]], dtype=torch.int64),
+    )
+
+    assert performance_metrics(result).observations == 2
+    with pytest.raises(DataValidationError, match="strictly increasing"):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+@pytest.mark.parametrize("consumer", ["performance", "ledger"])
+def test_execution_consumers_ignore_non_increasing_unread_timestamp_tail(
+    consumer: str,
+) -> None:
+    result = replace(
+        _consumer_result(),
+        bar_time_ns=torch.tensor([[0, 10, 20, 30, 5]], dtype=torch.int64),
+    )
+
+    if consumer == "performance":
+        assert performance_metrics(result).observations == 2
+    else:
+        ledger = build_execution_ledger(result, ["EURUSD"])
+        assert [(row.entry_time_ns, row.exit_time_ns) for row in ledger] == [
+            (10, 20),
+            (20, 30),
+        ]
+
+
 def test_execution_ledger_rejects_non_prefix_result_mask() -> None:
     result = replace(
         _consumer_result(),
@@ -541,7 +651,7 @@ def test_performance_metrics_rejects_result_device_mismatch() -> None:
 
 @pytest.mark.parametrize(
     "field_name",
-    ["position", "turnover", "gross_pnl", "cost", "net_pnl"],
+    ["position", "gross_pnl", "cost", "net_pnl"],
 )
 def test_execution_ledger_rejects_result_field_shape_mismatch(
     field_name: str,
@@ -557,7 +667,7 @@ def test_execution_ledger_rejects_result_field_shape_mismatch(
 
 @pytest.mark.parametrize(
     "field_name",
-    ["position", "turnover", "gross_pnl", "cost", "net_pnl"],
+    ["position", "gross_pnl", "cost", "net_pnl"],
 )
 def test_execution_ledger_rejects_non_floating_result_field(
     field_name: str,
@@ -573,7 +683,7 @@ def test_execution_ledger_rejects_non_floating_result_field(
 
 @pytest.mark.parametrize(
     "field_name",
-    ["position", "turnover", "gross_pnl", "cost", "net_pnl"],
+    ["position", "gross_pnl", "cost", "net_pnl"],
 )
 def test_execution_ledger_rejects_result_field_device_mismatch(
     field_name: str,
@@ -585,6 +695,37 @@ def test_execution_ledger_rejects_result_field_device_mismatch(
 
     with pytest.raises(DataValidationError, match=rf"{field_name}.*same device"):
         build_execution_ledger(result, ["EURUSD"])
+
+
+@pytest.mark.parametrize("field_name", ["position", "gross_pnl", "cost", "net_pnl"])
+def test_execution_ledger_rejects_non_finite_read_field(field_name: str) -> None:
+    result = _consumer_result()
+    invalid_value = getattr(result, field_name).clone()
+    invalid_value[0, 0] = float("nan")
+    result = replace(result, **{field_name: invalid_value})
+
+    with pytest.raises(DataValidationError, match=rf"valid {field_name}.*finite"):
+        build_execution_ledger(result, ["EURUSD"])
+
+
+@pytest.mark.parametrize("corruption", ["non_finite", "shape", "dtype"])
+def test_execution_ledger_ignores_unread_turnover_field(corruption: str) -> None:
+    result = _consumer_result()
+    if corruption == "non_finite":
+        invalid_turnover = torch.full_like(result.turnover, float("nan"))
+    elif corruption == "shape":
+        invalid_turnover = torch.zeros((1, 2))
+    else:
+        invalid_turnover = torch.zeros((1, 5), dtype=torch.int64)
+    result = replace(result, turnover=invalid_turnover)
+
+    ledger = build_execution_ledger(result, ["EURUSD"])
+
+    assert len(ledger) == 2
+    assert sum(row.net_pnl for row in ledger) == pytest.approx(
+        result.net_pnl[result.target_valid].sum().item(),
+        abs=1e-8,
+    )
 
 
 def test_performance_metrics_rejects_unrepresentable_equity_path() -> None:
