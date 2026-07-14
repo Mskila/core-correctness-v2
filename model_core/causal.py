@@ -46,7 +46,22 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
         )
 
     original_dtype = x.dtype
-    work = x.to(torch.float64)
+    # Keep hooks on a private work tensor: for float64 input, ``to`` alone may
+    # return the caller's tensor and would otherwise affect unrelated branches.
+    work = x.to(torch.float64).clone()
+    if work.requires_grad:
+        # Subnormal inputs can imply a derivative larger than their dtype can
+        # represent. Saturate only at that dtype's representability boundary.
+        gradient_limit = torch.finfo(original_dtype).max
+
+        def _keep_gradient_representable(gradient: torch.Tensor) -> torch.Tensor:
+            if torch.isnan(gradient).any():
+                raise FloatingPointError(
+                    "causal_rolling_zscore produced a NaN gradient"
+                )
+            return gradient.clamp(-gradient_limit, gradient_limit)
+
+        work.register_hook(_keep_gradient_representable)
     pad = torch.zeros(
         x.shape[0], window - 1, dtype=work.dtype, device=x.device
     )
@@ -60,19 +75,23 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
     valid_work = valid.to(work.dtype)
     count = valid.sum(dim=-1).clamp_min(1).to(work.dtype)
 
-    # Per-window scaling prevents square overflow even for finite float64
-    # magnitudes near 1e308. Detaching the scale avoids unstable gradients
-    # through the max selection; z-score itself is scale invariant.
-    scale = (windows.abs() * valid_work).amax(dim=-1).clamp_min(1.0).detach()
-    scaled = windows / scale.unsqueeze(-1)
+    # Per-window relative scaling prevents both square overflow and loss of
+    # representable small-scale variation. Only a truly all-zero prefix uses
+    # the neutral divisor; there is no absolute variance threshold.
+    scale = (windows.abs() * valid_work).amax(dim=-1)
+    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale)).detach()
+    scaled = windows / safe_scale.unsqueeze(-1)
     mean = (scaled * valid_work).sum(dim=-1) / count
     centered = (scaled - mean.unsqueeze(-1)) * valid_work
     variance = centered.square().sum(dim=-1) / count
-    variance_floor = 1e-12
-    std = variance.clamp_min(variance_floor).sqrt()
+    has_variance = variance > 0
+    safe_variance = torch.where(
+        has_variance, variance, torch.ones_like(variance)
+    )
+    std = safe_variance.sqrt()
     zscore = torch.where(
-        variance > variance_floor,
-        (work / scale - mean) / std,
+        has_variance,
+        (work / safe_scale - mean) / std,
         torch.zeros_like(work),
     )
     if not torch.isfinite(zscore).all():

@@ -339,6 +339,59 @@ class TestFeatureLookbacks:
         )
 
 
+class TestWilliamsR:
+    def test_exact_approved_negative_unit_scale(self):
+        high = torch.full((1, 14), 10.0, dtype=torch.float64)
+        low = torch.full((1, 14), 5.0, dtype=torch.float64)
+        close_7 = torch.full((1, 14), 7.0, dtype=torch.float64)
+        close_9 = torch.full((1, 14), 9.0, dtype=torch.float64)
+
+        at_7 = MT5FeatureEngineer._willr(close_7, high, low, 14)
+        at_9 = MT5FeatureEngineer._willr(close_9, high, low, 14)
+
+        torch.testing.assert_close(
+            at_7, torch.full_like(at_7, -0.6), rtol=0, atol=1e-7
+        )
+        torch.testing.assert_close(
+            at_9, torch.full_like(at_9, -0.2), rtol=0, atol=1e-7
+        )
+        assert not torch.equal(at_7, at_9)
+
+    def test_declared_14_bar_window_has_exact_boundary(self):
+        length = 15
+        target = length - 1
+        close = torch.full((1, length), 7.0)
+        high = torch.full((1, length), 10.0)
+        low = torch.full((1, length), 5.0)
+        baseline = MT5FeatureEngineer._willr(close, high, low, 14)[0, target]
+
+        outside = high.clone()
+        outside[:, 0] = 100.0
+        torch.testing.assert_close(
+            MT5FeatureEngineer._willr(close, outside, low, 14)[0, target],
+            baseline,
+            rtol=0,
+            atol=0,
+        )
+
+        inside = high.clone()
+        inside[:, 1] = 20.0
+        assert not torch.equal(
+            MT5FeatureEngineer._willr(close, inside, low, 14)[0, target],
+            baseline,
+        )
+        spec = next(
+            spec for spec in FEATURE_REGISTRY.feature_specs
+            if spec.name == "WILLR_14"
+        )
+        assert spec.lookback == 14
+
+    def test_zero_range_is_finite_zero(self):
+        price = torch.full((2, 5), 7.0)
+        actual = MT5FeatureEngineer._willr(price, price, price, 14)
+        torch.testing.assert_close(actual, torch.zeros_like(actual), rtol=0, atol=0)
+
+
 class TestFeatureRegistryHardeningAndShortAxes:
     def test_non_callable_feature_is_rejected_atomically(self):
         registry = Registry()

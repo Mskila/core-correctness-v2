@@ -27,6 +27,8 @@ from model_core.ops import (
     _ts_std,
 )
 from model_core.registry import OperatorSpec, RegistrationError, Registry
+from model_core.vm import StackVM
+from model_core.vocab import FORMULA_VOCAB, VOCAB_VERSION
 
 # ── 常量 ────────────────────────────────────────────────────────────────────────
 N, T = 4, 30
@@ -45,6 +47,30 @@ def rand_input() -> torch.Tensor:
 class TestOpsConfigLength:
     def test_ops_config_matches_registry(self):
         assert len(OPS_CONFIG) == len(OPERATOR_REGISTRY.operator_names)
+
+    def test_ops_config_is_an_immutable_registry_snapshot(self):
+        expected = tuple(
+            (spec.name, spec.transform, spec.arity)
+            for spec in OPERATOR_REGISTRY.operator_specs
+        )
+        assert isinstance(OPS_CONFIG, tuple)
+        assert OPS_CONFIG == expected
+
+        feature = torch.tensor([[[1.0, 2.0, 4.0, 8.0]]])
+        neg_token = FORMULA_VOCAB.operator_offset + 4
+        before = StackVM().execute([0, neg_token], feature)
+        version_before = VOCAB_VERSION
+        original = OPS_CONFIG[4]
+        try:
+            with pytest.raises(TypeError):
+                OPS_CONFIG[4] = ("NEG", lambda x: x, 1)
+        finally:
+            if isinstance(OPS_CONFIG, list):
+                OPS_CONFIG[4] = original
+
+        after = StackVM().execute([0, neg_token], feature)
+        assert VOCAB_VERSION == version_before == FORMULA_VOCAB.version
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
 
     def test_new_ops_count_equals_10(self):
         """时序算子（索引 12-21）共 10 个"""

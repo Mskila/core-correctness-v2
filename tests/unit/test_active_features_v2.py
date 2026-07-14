@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +21,16 @@ def test_missing_allowlist_uses_all_v2_features(tmp_path) -> None:
     missing = tmp_path / "missing.json"
     assert _load_active_feature_allowlist(missing) is None
     assert len(FEATURE_REGISTRY.feature_names) == 60
+
+
+def test_allowlist_stat_permission_error_fails_closed(tmp_path) -> None:
+    denied = tmp_path / "denied.json"
+    with patch.object(Path, "stat", side_effect=PermissionError("stat denied")):
+        with pytest.raises(ArtifactCompatibilityError, match="stat denied"):
+            _load_active_feature_allowlist(denied)
+
+    missing = tmp_path / "actually-missing.json"
+    assert _load_active_feature_allowlist(missing) is None
 
 
 @pytest.mark.parametrize(

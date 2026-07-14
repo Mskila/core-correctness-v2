@@ -98,3 +98,55 @@ def test_extreme_finite_input_is_not_masked_and_has_finite_gradients(
     out.to(torch.float64).square().sum().backward()
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.parametrize(
+    ("dtype", "scale", "atol"),
+    [
+        (
+            torch.float16,
+            torch.finfo(torch.float16).smallest_normal * torch.finfo(torch.float16).eps,
+            2e-3,
+        ),
+        (
+            torch.bfloat16,
+            torch.finfo(torch.bfloat16).smallest_normal * torch.finfo(torch.bfloat16).eps,
+            1e-2,
+        ),
+        (
+            torch.float32,
+            torch.finfo(torch.float32).smallest_normal * torch.finfo(torch.float32).eps,
+            1e-6,
+        ),
+        (torch.float64, 1.0e-200, 1e-12),
+    ],
+)
+def test_nonzero_small_scale_is_preserved_with_finite_gradients(
+    dtype, scale, atol
+) -> None:
+    reference = torch.tensor([[0.0, 1.0, 2.0]], dtype=dtype)
+    tiny = (reference * scale).requires_grad_()
+
+    expected = causal_rolling_zscore(reference, window=200)
+    actual = causal_rolling_zscore(tiny, window=200)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=atol)
+    actual.to(torch.float64).sum().backward()
+    assert tiny.grad is not None
+    assert torch.isfinite(tiny.grad).all()
+
+
+def test_amihud_illiq_does_not_collapse_representable_variation() -> None:
+    close = torch.tensor(
+        [[1.0, 1.0001, 0.9998, 1.0003, 0.9997, 1.0002]],
+        dtype=torch.float32,
+    )
+    raw = {
+        "close": close,
+        "volume": torch.full_like(close, 1.0e8),
+    }
+
+    actual = MT5FeatureEngineer._c_amihud_illiq(raw)
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual).item() > 0

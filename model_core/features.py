@@ -319,11 +319,29 @@ class MT5FeatureEngineer:
     def _willr(close: torch.Tensor, high: torch.Tensor,
                low: torch.Tensor, w: int = 14) -> torch.Tensor:
         """威廉指标 Williams %R，归一化到 [-1, 0]（-1=超卖，0=超买）。"""
-        eps = MT5FeatureEngineer._EPS
-        pad = torch.zeros(close.shape[0], w - 1, device=close.device, dtype=high.dtype)
-        hw = torch.cat([pad, high], dim=1).unfold(1, w, 1).max(dim=-1).values
-        lw = torch.cat([pad, low], dim=1).unfold(1, w, 1).min(dim=-1).values
-        willr = (hw - close) / (hw - lw + eps)
+        high_pad = torch.full(
+            (close.shape[0], w - 1),
+            -torch.inf,
+            device=high.device,
+            dtype=high.dtype,
+        )
+        low_pad = torch.full(
+            (close.shape[0], w - 1),
+            torch.inf,
+            device=low.device,
+            dtype=low.dtype,
+        )
+        hw = torch.cat([high_pad, high], dim=1).unfold(1, w, 1).max(dim=-1).values
+        lw = torch.cat([low_pad, low], dim=1).unfold(1, w, 1).min(dim=-1).values
+        price_range = hw - lw
+        safe_range = torch.where(
+            price_range > 0, price_range, torch.ones_like(price_range)
+        )
+        willr = torch.where(
+            price_range > 0,
+            -(hw - close) / safe_range,
+            torch.zeros_like(close),
+        )
         return torch.clamp(willr, -1.0, 0.0)
 
     @staticmethod
@@ -1406,8 +1424,14 @@ def _load_active_feature_allowlist(path=None) -> set[str] | None:
         if path is not None
         else _pathlib.Path(__file__).resolve().parent.parent / "active_features.json"
     )
-    if not active_path.exists():
+    try:
+        active_path.stat()
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise ArtifactCompatibilityError(
+            f"active feature artifact is unreadable: {active_path}: {exc}"
+        ) from exc
 
     try:
         data = _json.loads(active_path.read_text(encoding="utf-8"))

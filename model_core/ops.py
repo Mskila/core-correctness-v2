@@ -421,12 +421,12 @@ def _register_initial_operators(registry: Registry) -> None:
 _register_initial_operators(OPERATOR_REGISTRY)
 
 
-# `OPS_CONFIG` 现为 `OPERATOR_REGISTRY` 的导出视图，保持既有元组结构
-# `[(name, transform, arity), ...]` 与下游 vocab.py / vm.py 的 import 兼容。
-OPS_CONFIG = [
+# `OPS_CONFIG` 现为 `OPERATOR_REGISTRY` 的不可变导出视图，保持既有条目结构
+# `((name, transform, arity), ...)` 与下游 vocab.py / vm.py 的 import 兼容。
+OPS_CONFIG = tuple(
     (spec.name, spec.transform, spec.arity)
     for spec in OPERATOR_REGISTRY.operator_specs
-]
+)
 
 
 # 动态断言：导出视图与注册表严格一致；且既有 44 个算子必须全部在册（不回归）。
@@ -520,10 +520,10 @@ def _register_task33_operators(registry: Registry) -> None:
 _register_task33_operators(OPERATOR_REGISTRY)
 
 # 重新派生 OPS_CONFIG 导出视图（追加新算子后更新）
-OPS_CONFIG = [
+OPS_CONFIG = tuple(
     (spec.name, spec.transform, spec.arity)
     for spec in OPERATOR_REGISTRY.operator_specs
-]
+)
 
 # Task 3.3：新增算子必须全部在册
 _EXPECTED_T33_NAMES = {name for name, _, _, _ in _TASK33_OPERATORS}
@@ -663,10 +663,10 @@ def _register_task34_operators(registry: Registry) -> None:
 _register_task34_operators(OPERATOR_REGISTRY)
 
 # 重新派生 OPS_CONFIG 导出视图（追加新算子后更新）
-OPS_CONFIG = [
+OPS_CONFIG = tuple(
     (spec.name, spec.transform, spec.arity)
     for spec in OPERATOR_REGISTRY.operator_specs
-]
+)
 
 # Task 3.4：新增算子必须全部在册
 _EXPECTED_T34_NAMES = {name for name, _, _, _ in _TASK34_OPERATORS}
