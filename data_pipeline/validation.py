@@ -217,6 +217,48 @@ def _best_mixed_unit_cadence(
     )
 
 
+def _has_mixed_cadence_multiple_run(
+    values: list[int],
+    *,
+    nominal_ns: int,
+) -> bool:
+    """Detect a regular three-bar cadence that requires mixed epoch units."""
+    units = tuple(_TIME_UNIT_NS)
+    lattice: dict[int, dict[int, list[tuple[int, int]]]] = {}
+    for row_index, value in enumerate(values):
+        for unit_index, unit in enumerate(units):
+            timestamp_ns = _scaled_time_ns(value, unit)
+            if timestamp_ns is None:
+                continue
+            remainder = timestamp_ns % nominal_ns
+            quotient = (timestamp_ns - remainder) // nominal_ns
+            unit_bit = 0 if value == 0 else 1 << unit_index
+            lattice.setdefault(remainder, {}).setdefault(quotient, []).append(
+                (row_index, unit_bit)
+            )
+
+    for candidates_by_quotient in lattice.values():
+        quotients = sorted(candidates_by_quotient)
+        for index in range(1, len(quotients) - 1):
+            previous = quotients[index - 1]
+            current = quotients[index]
+            following = quotients[index + 1]
+            cadence_multiple = current - previous
+            if cadence_multiple <= 0 or following - current != cadence_multiple:
+                continue
+            for left_row, left_unit in candidates_by_quotient[previous]:
+                for middle_row, middle_unit in candidates_by_quotient[current]:
+                    if middle_row == left_row:
+                        continue
+                    for right_row, right_unit in candidates_by_quotient[following]:
+                        if right_row in (left_row, middle_row):
+                            continue
+                        unit_mask = left_unit | middle_unit | right_unit
+                        if unit_mask.bit_count() > 1:
+                            return True
+    return False
+
+
 def _numeric_time_to_utc(
     values: pd.Series,
     *,
@@ -282,7 +324,11 @@ def _numeric_time_to_utc(
             sorted_values,
             nominal_ns=nominal_ns,
         )
-        if mixed_exact > selected[2]:
+        mixed_multiple_run = _has_mixed_cadence_multiple_run(
+            integers,
+            nominal_ns=nominal_ns,
+        )
+        if mixed_exact > selected[2] or mixed_multiple_run:
             raise DataValidationError(
                 "mixed numeric timestamp units: values align better under "
                 "multiple epoch units"
@@ -414,10 +460,11 @@ def canonicalize_ohlcv(
         if _contains_complex(result[column]):
             raise DataValidationError(f"complex OHLCV value: field={column}")
 
-    result["time"] = _to_utc_time(
+    converted_time = _to_utc_time(
         result["time"],
         timeframe=canonical_timeframe,
     )
+    result["time"] = converted_time.array
     if result["time"].duplicated().any():
         raise DataValidationError("duplicate timestamp")
     result = result.sort_values("time", kind="mergesort").reset_index(drop=True)

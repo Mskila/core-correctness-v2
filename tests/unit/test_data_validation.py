@@ -113,6 +113,106 @@ def test_time_is_stably_sorted_without_changing_bar_contents() -> None:
     pd.testing.assert_frame_equal(result.frame, expected)
 
 
+def test_numeric_time_preserves_rows_with_nonmonotonic_input_index() -> None:
+    frame = pd.DataFrame(
+        {
+            "time": [1_700_000_000, 1_700_003_600, 1_700_007_200],
+            "open": [10.0, 20.0, 30.0],
+            "high": [11.0, 21.0, 31.0],
+            "low": [9.0, 19.0, 29.0],
+            "close": [10.25, 20.25, 30.25],
+            "volume": [100.0, 200.0, 300.0],
+        }
+    ).iloc[[2, 0, 1]]
+    reset = frame.reset_index(drop=True)
+
+    retained_index = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    reset_index = canonicalize_ohlcv(reset, symbol="EURUSD", timeframe="H1")
+
+    pd.testing.assert_frame_equal(retained_index.frame, reset_index.frame)
+    assert retained_index.identity == reset_index.identity
+
+
+def _time_values_for_index_invariance(kind: str) -> list[object]:
+    seconds = [1_700_000_000 + index * 3_600 for index in range(6)]
+    if kind == "s":
+        return seconds
+    if kind == "ms":
+        return [value * 1_000 for value in seconds]
+    if kind == "us":
+        return [value * 1_000_000 for value in seconds]
+    if kind == "ns":
+        return [value * 1_000_000_000 for value in seconds]
+    timestamps = pd.to_datetime(seconds, unit="s", utc=True)
+    if kind == "datetime":
+        return timestamps.tolist()
+    if kind == "string":
+        return [value.isoformat() for value in timestamps]
+    raise AssertionError(f"unknown test time kind: {kind}")
+
+
+@pytest.mark.parametrize("time_kind", ["s", "ms", "us", "ns", "datetime", "string"])
+@pytest.mark.parametrize("index_kind", ["unique", "duplicate", "string"])
+def test_canonicalization_is_independent_of_input_index_labels(
+    time_kind: str,
+    index_kind: str,
+) -> None:
+    frame = valid_frame()
+    frame["time"] = _time_values_for_index_invariance(time_kind)
+    frame = frame.iloc[[4, 1, 5, 0, 3, 2]].copy()
+    if index_kind == "duplicate":
+        frame.index = [7, 7, 2, 2, 9, 9]
+    elif index_kind == "string":
+        frame.index = ["echo", "bravo", "foxtrot", "alpha", "delta", "charlie"]
+    expected_input = frame.copy(deep=True)
+    expected_index = frame.index.copy()
+
+    retained_index = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    reset_index = canonicalize_ohlcv(
+        frame.reset_index(drop=True),
+        symbol="EURUSD",
+        timeframe="H1",
+    )
+
+    pd.testing.assert_frame_equal(retained_index.frame, reset_index.frame)
+    assert retained_index.identity == reset_index.identity
+    pd.testing.assert_frame_equal(frame, expected_input)
+    assert frame.index.equals(expected_index)
+
+
+def test_unsorted_rows_keep_time_ohlcv_and_volume_bound_together() -> None:
+    frame = valid_frame()
+    frame["time"] = _time_values_for_index_invariance("ms")
+    frame["open"] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    frame["high"] = frame["open"] + 1.0
+    frame["low"] = frame["open"] - 1.0
+    frame["close"] = frame["open"] + 0.25
+    frame["volume"] = frame["open"] * 10.0
+    frame = frame.iloc[[5, 2, 0, 4, 1, 3]].copy()
+    frame.index = ["f", "c", "a", "e", "b", "d"]
+    expected_input = frame.copy(deep=True)
+
+    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    assert list(
+        zip(
+            dataset.frame["open"].tolist(),
+            dataset.frame["high"].tolist(),
+            dataset.frame["low"].tolist(),
+            dataset.frame["close"].tolist(),
+            dataset.frame["volume"].tolist(),
+        )
+    ) == [
+        (10.0, 11.0, 9.0, 10.25, 100.0),
+        (20.0, 21.0, 19.0, 20.25, 200.0),
+        (30.0, 31.0, 29.0, 30.25, 300.0),
+        (40.0, 41.0, 39.0, 40.25, 400.0),
+        (50.0, 51.0, 49.0, 50.25, 500.0),
+        (60.0, 61.0, 59.0, 60.25, 600.0),
+    ]
+    pd.testing.assert_frame_equal(frame, expected_input)
+
+
 def test_bar_spacing_shorter_than_timeframe_is_rejected() -> None:
     frame = valid_frame()
     frame.loc[1, "time"] = frame.loc[0, "time"] + pd.Timedelta(minutes=30)
@@ -131,6 +231,80 @@ def test_mixed_numeric_timestamp_units_are_rejected() -> None:
 
     with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+def test_mixed_numeric_timestamp_units_at_double_cadence_are_rejected() -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = [
+        1_700_000_000,
+        1_700_007_200_000,
+        1_700_014_400_000,
+    ]
+
+    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@pytest.mark.parametrize(
+    ("units", "gap_multiplier"),
+    [
+        (("s", "ms", "ms"), 3),
+        (("s", "ms", "us"), 5),
+        (("ms", "s", "ms"), 2),
+        (("ms", "ms", "s"), 4),
+        (("ms", "us", "us"), 6),
+    ],
+)
+def test_mixed_numeric_timestamp_unit_combinations_at_cadence_multiples_are_rejected(
+    units: tuple[str, str, str],
+    gap_multiplier: int,
+) -> None:
+    unit_ns = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000}
+    base_ns = 1_700_000_000_000_000_000
+    nominal_ns = 3_600_000_000_000
+    semantic_ns = [
+        base_ns + index * gap_multiplier * nominal_ns for index in range(3)
+    ]
+    encoded = [
+        timestamp_ns // unit_ns[unit]
+        for timestamp_ns, unit in zip(semantic_ns, units)
+    ]
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = encoded
+
+    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@pytest.mark.parametrize(
+    ("unit_ns", "gap_multipliers"),
+    [
+        (1_000_000_000, (2, 5)),
+        (1_000_000, (3, 7)),
+        (1_000, (4, 9)),
+        (1, (2, 11)),
+    ],
+    ids=["seconds", "milliseconds", "microseconds", "nanoseconds"],
+)
+def test_consistent_numeric_timestamp_units_allow_cadence_multiples(
+    unit_ns: int,
+    gap_multipliers: tuple[int, int],
+) -> None:
+    base_ns = 1_700_000_000_000_000_000
+    nominal_ns = 3_600_000_000_000
+    semantic_ns = [base_ns]
+    for multiplier in gap_multipliers:
+        semantic_ns.append(semantic_ns[-1] + multiplier * nominal_ns)
+    encoded = [timestamp_ns // unit_ns for timestamp_ns in semantic_ns]
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = encoded[::-1]
+
+    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    assert dataset.frame["time"].astype("int64").tolist() == semantic_ns
+    assert dataset.identity.start_time_ns == semantic_ns[0]
+    assert dataset.identity.end_time_ns == semantic_ns[-1]
+    assert dataset.gap_count == 2
 
 
 def test_consistent_early_milliseconds_can_cross_inference_boundary() -> None:

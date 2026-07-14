@@ -64,7 +64,7 @@ symbol_strategy = st.text(
 timeframe_strategy = st.integers(min_value=1, max_value=49153)
 
 
-@settings(max_examples=25)
+@settings(max_examples=100)
 @given(symbol=symbol_strategy, timeframe=timeframe_strategy)
 def test_fetcher_returns_canonical_dataframe_when_mt5_succeeds(
     symbol: str, timeframe: int
@@ -98,7 +98,7 @@ def test_fetcher_returns_canonical_dataframe_when_mt5_succeeds(
     mock_mt5.copy_rates_from_pos.assert_called_once_with(symbol, timeframe, 0, 5)
 
 
-@settings(max_examples=50)
+@settings(max_examples=100)
 @given(
     open_prices=st.lists(
         st.floats(
@@ -108,7 +108,7 @@ def test_fetcher_returns_canonical_dataframe_when_mt5_succeeds(
             allow_infinity=False,
         ),
         min_size=3,
-        max_size=100,
+        max_size=200,
     ),
     n_symbols=st.integers(min_value=1, max_value=3),
 )
@@ -153,7 +153,7 @@ def multi_symbol_dfs(draw) -> dict[str, pd.DataFrame]:
     return frames
 
 
-@settings(max_examples=50)
+@settings(max_examples=100)
 @given(frames=multi_symbol_dfs())
 def test_alignment_keeps_exact_real_intersection_without_future_fill(
     frames: dict[str, pd.DataFrame]
@@ -251,3 +251,41 @@ def test_integer_epoch_units_preserve_exact_identity_with_long_gaps(
     assert dataset.identity.start_time_ns == expected_ns[0]
     assert dataset.identity.end_time_ns == expected_ns[-1]
     assert dataset.gap_count == sum(gap > 1 for gap in gaps)
+
+
+@settings(max_examples=100)
+@given(
+    base_seconds=st.integers(min_value=946_684_800, max_value=2_000_000_000),
+    gap_multiplier=st.integers(min_value=2, max_value=48),
+    units=st.sampled_from(
+        [
+            ("s", "ms", "ms"),
+            ("s", "ms", "us"),
+            ("ms", "s", "ms"),
+            ("ms", "ms", "s"),
+            ("ms", "us", "us"),
+        ]
+    ),
+)
+def test_mixed_epoch_units_are_rejected_at_cadence_multiples(
+    base_seconds: int,
+    gap_multiplier: int,
+    units: tuple[str, str, str],
+) -> None:
+    unit_ns = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000}
+    nominal_ns = 3_600_000_000_000
+    base_ns = base_seconds * 1_000_000_000
+    semantic_ns = [
+        base_ns + index * gap_multiplier * nominal_ns for index in range(3)
+    ]
+    encoded = [
+        timestamp_ns // unit_ns[unit]
+        for timestamp_ns, unit in zip(semantic_ns, units)
+    ]
+
+    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+        canonicalize_ohlcv(
+            _make_symbol_df(encoded),
+            symbol="EURUSD",
+            timeframe="H1",
+        )
