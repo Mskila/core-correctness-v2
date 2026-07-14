@@ -695,6 +695,186 @@ def test_derive_periods_per_year_uses_bar_timestamps(
     assert actual == pytest.approx(expected, rel=1e-8)
 
 
+def _multi_symbol_cadence_case(
+    *,
+    interval_ns: int,
+    valid_counts: tuple[int, ...],
+    entry_starts_ns: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    time_length = max(valid_counts) + 2
+    time_rows: list[list[int]] = []
+    valid_rows: list[list[bool]] = []
+    for valid_count, entry_start_ns in zip(
+        valid_counts,
+        entry_starts_ns,
+        strict=True,
+    ):
+        relevant_times = [
+            entry_start_ns - interval_ns,
+            *[
+                entry_start_ns + step * interval_ns
+                for step in range(valid_count + 1)
+            ],
+        ]
+        tail_length = time_length - len(relevant_times)
+        time_rows.append(
+            relevant_times
+            + [relevant_times[-1] + interval_ns] * tail_length
+        )
+        valid_rows.append(
+            [True] * valid_count + [False] * (time_length - valid_count)
+        )
+    return (
+        torch.tensor(time_rows, dtype=torch.int64),
+        torch.tensor(valid_rows, dtype=torch.bool),
+    )
+
+
+def test_derive_periods_per_year_rejects_h1_h4_mixed_cadence() -> None:
+    hour_ns = 3_600 * 1_000_000_000
+    times = torch.tensor(
+        [
+            [0, hour_ns, 2 * hour_ns, 3 * hour_ns],
+            [0, 4 * hour_ns, 8 * hour_ns, 12 * hour_ns],
+        ],
+        dtype=torch.int64,
+    )
+    valid = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, True, False, False],
+        ]
+    )
+
+    with pytest.raises(DataValidationError, match="cadence"):
+        derive_periods_per_year(times, valid)
+
+
+@pytest.mark.parametrize(
+    "intervals_hours",
+    [(1, 4), (1, 24), (4, 24)],
+    ids=["h1-h4", "h1-d1", "h4-d1"],
+)
+def test_derive_periods_per_year_rejects_heterogeneous_cadence_matrix(
+    intervals_hours: tuple[int, int],
+) -> None:
+    hour_ns = 3_600 * 1_000_000_000
+    rows = [
+        [0, interval * hour_ns, 2 * interval * hour_ns, 3 * interval * hour_ns]
+        for interval in intervals_hours
+    ]
+    valid = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, True, False, False],
+        ]
+    )
+
+    for order in ([0, 1], [1, 0]):
+        with pytest.raises(DataValidationError, match="cadence"):
+            derive_periods_per_year(
+                torch.tensor([rows[index] for index in order], dtype=torch.int64),
+                valid,
+            )
+
+
+@pytest.mark.parametrize(
+    ("interval_ns", "expected_periods_per_year"),
+    [
+        (3_600 * 1_000_000_000, 8_765.82),
+        (4 * 3_600 * 1_000_000_000, 2_191.455),
+        (24 * 3_600 * 1_000_000_000, 365.2425),
+    ],
+    ids=["h1", "h4", "d1"],
+)
+def test_derive_periods_per_year_accepts_equal_multi_symbol_cadence(
+    interval_ns: int,
+    expected_periods_per_year: float,
+) -> None:
+    times, valid = _multi_symbol_cadence_case(
+        interval_ns=interval_ns,
+        valid_counts=(2, 4),
+        entry_starts_ns=(17 * interval_ns, 101 * interval_ns + 123),
+    )
+    order = torch.tensor([1, 0])
+
+    actual = derive_periods_per_year(times, valid)
+    permuted = derive_periods_per_year(times[order], valid[order])
+
+    assert actual == pytest.approx(expected_periods_per_year, rel=1e-12)
+    assert permuted == pytest.approx(actual, rel=0.0, abs=0.0)
+
+
+def test_derive_periods_per_year_compares_large_int64_cadence_exactly() -> None:
+    interval_ns = 1_000_000_007
+    times, valid = _multi_symbol_cadence_case(
+        interval_ns=interval_ns,
+        valid_counts=(2, 4),
+        entry_starts_ns=(
+            8_000_000_000_000_000_000,
+            -8_000_000_000_000_000_000,
+        ),
+    )
+
+    actual = derive_periods_per_year(times, valid)
+
+    expected = 365.2425 * 24 * 3_600 * 1_000_000_000 / interval_ns
+    assert actual == pytest.approx(expected, rel=1e-15)
+
+
+def test_derive_rejects_cadences_even_when_aggregate_matches_h1() -> None:
+    hour_ns = 3_600 * 1_000_000_000
+    spans = (hour_ns, 2 * hour_ns, 3 * hour_ns)
+    times = torch.tensor(
+        [
+            [-1, 0, span // 2, span]
+            for span in spans
+        ],
+        dtype=torch.int64,
+    )
+    valid = torch.tensor(
+        [[True, True, False, False]] * 3,
+        dtype=torch.bool,
+    )
+
+    with pytest.raises(DataValidationError, match="cadence"):
+        derive_periods_per_year(times, valid)
+
+
+def test_mixed_cadence_is_a_metrics_boundary_not_a_ledger_boundary() -> None:
+    hour_ns = 3_600 * 1_000_000_000
+    times = torch.tensor(
+        [
+            [0, hour_ns, 2 * hour_ns, 3 * hour_ns],
+            [0, 4 * hour_ns, 8 * hour_ns, 12 * hour_ns],
+        ],
+        dtype=torch.int64,
+    )
+    valid = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, True, False, False],
+        ]
+    )
+    result = run_execution(
+        factors=torch.zeros((2, 4)),
+        target_ret=torch.zeros((2, 4)),
+        target_valid=valid,
+        bar_time_ns=times,
+        cost_rate=0.0,
+        min_exposure=0.0,
+    )
+
+    ledger = build_execution_ledger(result, ["H1", "H4"])
+
+    assert len(ledger) == 4
+    assert [row.symbol for row in ledger] == ["H1", "H1", "H4", "H4"]
+    with pytest.raises(DataValidationError, match="cadence"):
+        derive_periods_per_year(result.bar_time_ns, result.target_valid)
+    with pytest.raises(DataValidationError, match="cadence"):
+        performance_metrics(result)
+
+
 def test_derive_periods_per_year_rejects_fewer_than_two_observations() -> None:
     with pytest.raises(DataValidationError, match="at least two"):
         derive_periods_per_year(

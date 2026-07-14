@@ -405,11 +405,30 @@ def derive_periods_per_year(bar_time_ns: Tensor, target_valid: Tensor) -> float:
 
     first_entries = first_entry_ns.detach().cpu().tolist()
     final_exits = final_exit_ns.detach().cpu().tolist()
-    elapsed_ns = sum(
+    valid_count_values = [
+        int(valid_count)
+        for valid_count in valid_counts.detach().cpu().tolist()
+    ]
+    elapsed_spans_ns = [
         int(final_exit) - int(first_entry)
         for first_entry, final_exit in zip(first_entries, final_exits)
-    )
-    observations = int(valid_counts.sum().detach().cpu())
+    ]
+    reference_count = valid_count_values[0]
+    reference_span_ns = elapsed_spans_ns[0]
+    if any(
+        valid_count * reference_span_ns
+        != reference_count * elapsed_span_ns
+        for valid_count, elapsed_span_ns in zip(
+            valid_count_values,
+            elapsed_spans_ns,
+        )
+    ):
+        raise DataValidationError(
+            "all symbols must have a consistent execution cadence"
+        )
+
+    elapsed_ns = sum(elapsed_spans_ns)
+    observations = sum(valid_count_values)
     elapsed_seconds = elapsed_ns / _NANOSECONDS_PER_SECOND
     periods = observations * _SECONDS_PER_YEAR / elapsed_seconds
     if not math.isfinite(periods) or periods <= 0.0:
