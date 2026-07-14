@@ -19,6 +19,7 @@ model_core/ops.py -- 算子库（Operator_Library, R2）
 """
 import torch
 
+from .causal import causal_rolling_zscore
 from .registry import OperatorSpec, Registry
 
 
@@ -42,9 +43,7 @@ def _op_gate(condition: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> torch
 
 def _op_jump(x: torch.Tensor) -> torch.Tensor:
     """降低稀疏度：阈值从 3σ 改为 1.5σ，让更多时间步有非零输出"""
-    mean = x.mean(dim=1, keepdim=True)
-    std = x.std(dim=1, keepdim=True) + 1e-6
-    z = (x - mean) / std
+    z = causal_rolling_zscore(x, 200)
     return torch.tanh(z - 1.5)   # tanh 软化，不再产生全零区间
 
 def _op_decay(x: torch.Tensor) -> torch.Tensor:
@@ -275,58 +274,6 @@ def _signed_power(x: torch.Tensor, a: float = 2.0) -> torch.Tensor:
     return torch.nan_to_num(out.clamp(-1e9, 1e9), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# ── Cross_Sectional 算子 helper（沿 N 维，每时间步跨品种；R2.1, R2.2）───────
-#
-# 输入 `[N, T]`：N=品种数、T=时间步。计算沿 dim=0（N 维）逐时间步进行，
-# 完全向量化（禁止逐时间步 Python 循环）。N=1（单品种，截面无分散）时按语义退化。
-# 全部 NaN-safe：出口 `nan_to_num`，CS_RANK/CS_SCALE 退化默认值 0.5，其余 0。
-
-def _cs_rank(x: torch.Tensor) -> torch.Tensor:
-    """每时间步跨品种百分位排名，值域 [0, 1]（R2.1）。
-
-    对每一列（时间步）沿 N 维排名，归一化到 `[0, 1]`（rank/(N-1)）。N=1 时截面
-    无分散，退化为 0.5。用双 argsort 向量化，无逐时间步 Python 循环。
-    """
-    N, T = x.shape
-    if N == 1:
-        return torch.full_like(x, 0.5)
-    order = x.argsort(dim=0)                       # 沿 N 维排序索引
-    ranks = torch.empty_like(x)
-    rank_vals = torch.arange(N, device=x.device, dtype=x.dtype).unsqueeze(1).expand(N, T)
-    ranks.scatter_(0, order, rank_vals)            # ranks[order[i,t], t] = i
-    pct = ranks / (N - 1)
-    return torch.nan_to_num(pct, nan=0.5, posinf=0.5, neginf=0.5)
-
-
-def _cs_scale(x: torch.Tensor) -> torch.Tensor:
-    """每时间步跨品种缩放到 [0, 1]：`(x - min) / (max - min)`（R2.1）。
-
-    沿 N 维取每列的 min/max。零跨度（max==min）该列退化为 0.5；N=1 退化为 0.5。
-    完全向量化。
-    """
-    N, T = x.shape
-    if N == 1:
-        return torch.full_like(x, 0.5)
-    mn = x.min(dim=0, keepdim=True).values         # [1, T]
-    mx = x.max(dim=0, keepdim=True).values          # [1, T]
-    span = mx - mn                                  # [1, T]
-    zero_span = span.abs() < 1e-9                   # [1, T]
-    span_safe = torch.where(zero_span, torch.ones_like(span), span)
-    out = (x - mn) / span_safe
-    out = torch.where(zero_span.expand_as(out), torch.full_like(out, 0.5), out)
-    return torch.nan_to_num(out, nan=0.5, posinf=0.5, neginf=0.5)
-
-
-def _cs_neutralize(x: torch.Tensor) -> torch.Tensor:
-    """每时间步减去跨品种算术均值（截面中性化，R2.2）。N=1 退化为 0。"""
-    N, T = x.shape
-    if N == 1:
-        return torch.zeros_like(x)
-    mean = x.mean(dim=0, keepdim=True)              # [1, T]
-    out = x - mean
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-
 # ── 形状一致性校验包装（R2.9, R2.13）─────────────────────────────────────
 
 def _with_shape_check(name: str, transform):
@@ -351,79 +298,67 @@ def _with_shape_check(name: str, transform):
 
 # ── 初始算子定义（保持既有 44 个算子的命名、顺序与行为）──────────────────
 #
-# 每项为 (name, transform, arity)。此列表等价于历史 `OPS_CONFIG` 的内容与顺序，
+# 每项为 (name, transform, arity, lookback)。
 # 用于注册进 `OPERATOR_REGISTRY`；`OPS_CONFIG` 随后由注册表派生为导出视图。
 
 _INITIAL_OPERATORS = [
     # ── 基础算子（token id = feat_offset+0~11）────────────────────────
-    ('ADD',    lambda x, y: x + y,          2),
-    ('SUB',    lambda x, y: x - y,          2),
-    ('MUL',    lambda x, y: x * y,          2),
-    ('DIV',    lambda x, y: x / (y + 1e-6), 2),
-    ('NEG',    lambda x: -x,                1),
-    ('ABS',    torch.abs,                   1),
-    ('SIGN',   torch.sign,                  1),
-    ('GATE',   _op_gate,                    3),
-    ('JUMP',   _op_jump,                    1),   # 已降低稀疏度
-    ('DECAY',  _op_decay,                   1),
-    ('DELAY1', lambda x: _ts_delay(x, 1),   1),
-    ('MAX3',   lambda x: torch.max(x, torch.max(_ts_delay(x, 1), _ts_delay(x, 2))), 1),
+    ('ADD',    lambda x, y: x + y,          2, 1),
+    ('SUB',    lambda x, y: x - y,          2, 1),
+    ('MUL',    lambda x, y: x * y,          2, 1),
+    ('DIV',    lambda x, y: x / (y + 1e-6), 2, 1),
+    ('NEG',    lambda x: -x,                1, 1),
+    ('ABS',    torch.abs,                   1, 1),
+    ('SIGN',   torch.sign,                  1, 1),
+    ('GATE',   _op_gate,                    3, 1),
+    ('JUMP',   _op_jump,                    1, 200),
+    ('DECAY',  _op_decay,                   1, 3),
+    ('DELAY1', lambda x: _ts_delay(x, 1),   1, 2),
+    ('MAX3',   lambda x: torch.max(x, torch.max(_ts_delay(x, 1), _ts_delay(x, 2))), 1, 3),
     # ── 时序算子（token id = feat_offset+12~21）───────────────────────
-    ('TS_MEAN_5',  lambda x: _ts_mean(x, 5),  1),
-    ('TS_MEAN_10', lambda x: _ts_mean(x, 10), 1),
-    ('TS_MEAN_20', lambda x: _ts_mean(x, 20), 1),
-    ('TS_STD_5',   lambda x: _ts_std(x, 5),   1),
-    ('TS_STD_10',  lambda x: _ts_std(x, 10),  1),
-    ('TS_STD_20',  lambda x: _ts_std(x, 20),  1),
-    ('TS_RANK_5',  lambda x: _ts_rank(x, 5),  1),
-    ('TS_RANK_10', lambda x: _ts_rank(x, 10), 1),
-    ('TS_RANK_20', lambda x: _ts_rank(x, 20), 1),
-    ('TS_CORR_10', _ts_corr_10,               2),
+    ('TS_MEAN_5',  lambda x: _ts_mean(x, 5),  1, 5),
+    ('TS_MEAN_10', lambda x: _ts_mean(x, 10), 1, 10),
+    ('TS_MEAN_20', lambda x: _ts_mean(x, 20), 1, 20),
+    ('TS_STD_5',   lambda x: _ts_std(x, 5),   1, 5),
+    ('TS_STD_10',  lambda x: _ts_std(x, 10),  1, 10),
+    ('TS_STD_20',  lambda x: _ts_std(x, 20),  1, 20),
+    ('TS_RANK_5',  lambda x: _ts_rank(x, 5),  1, 5),
+    ('TS_RANK_10', lambda x: _ts_rank(x, 10), 1, 10),
+    ('TS_RANK_20', lambda x: _ts_rank(x, 20), 1, 20),
+    ('TS_CORR_10', _ts_corr_10,               2, 10),
     # ── 趋势 / 动量类算子（token id = feat_offset+22~27）──────────────
     # MOMENTUM_5: 短期均线 - 长期均线，捕捉趋势方向
-    ('MOMENTUM_5',  lambda x: _ts_mean(x, 5)  - _ts_mean(x, 20), 1),
+    ('MOMENTUM_5',  lambda x: _ts_mean(x, 5)  - _ts_mean(x, 20), 1, 20),
     # MOMENTUM_10: 中期动量
-    ('MOMENTUM_10', lambda x: _ts_mean(x, 10) - _ts_mean(x, 20), 1),
+    ('MOMENTUM_10', lambda x: _ts_mean(x, 10) - _ts_mean(x, 20), 1, 20),
     # TS_MAX_10: 10周期最大值，捕捉强势突破
-    ('TS_MAX_10',   lambda x: _ts_rolling(x, 10).max(dim=-1).values, 1),
+    ('TS_MAX_10',   lambda x: _ts_rolling(x, 10).max(dim=-1).values, 1, 10),
     # TS_MIN_10: 10周期最小值，捕捉弱势突破
-    ('TS_MIN_10',   lambda x: _ts_rolling(x, 10).min(dim=-1).values, 1),
+    ('TS_MIN_10',   lambda x: _ts_rolling(x, 10).min(dim=-1).values, 1, 10),
     # WMA: 加权移动平均，平滑信号
-    ('WMA',         _op_wma,  1),
+    ('WMA',         _op_wma,  1, 3),
     # DELAY4: 延迟4根bar，构建中期动量差
-    ('DELAY4',      lambda x: _ts_delay(x, 4), 1),
+    ('DELAY4',      lambda x: _ts_delay(x, 4), 1, 5),
     # ── v3.0 新增算子（token id = feat_offset+28~33）──────────────────
-    ('EMA_5',           lambda x: _ema_simple(x, 5),    1),
-    ('EMA_20',          lambda x: _ema_simple(x, 20),   1),
-    ('TS_QUANTILE_10',  lambda x: _ts_quantile(x, 10),  1),
-    ('TS_SKEW_10',      lambda x: _ts_skew(x, 10),      1),
-    ('TS_MIN_20',       lambda x: _ts_rolling(x, 20).min(dim=-1).values, 1),
-    ('TS_MAX_20',       lambda x: _ts_rolling(x, 20).max(dim=-1).values, 1),
+    ('EMA_5',           lambda x: _ema_simple(x, 5),    1, 5),
+    ('EMA_20',          lambda x: _ema_simple(x, 20),   1, 20),
+    ('TS_QUANTILE_10',  lambda x: _ts_quantile(x, 10),  1, 10),
+    ('TS_SKEW_10',      lambda x: _ts_skew(x, 10),      1, 10),
+    ('TS_MIN_20',       lambda x: _ts_rolling(x, 20).min(dim=-1).values, 1, 20),
+    ('TS_MAX_20',       lambda x: _ts_rolling(x, 20).max(dim=-1).values, 1, 20),
     # ── v3.0 Alpha 101 + 补充算子（token id = feat_offset+34~43）──────
     # Alpha 101 核心 4 个
-    ('DELTA',           lambda x: _delta(x, 1),                1),
-    ('TS_ARG_MAX_5',    lambda x: _ts_arg_max(x, 5),           1),
-    ('TS_ARG_MIN_5',    lambda x: _ts_arg_min(x, 5),           1),
-    ('DECAY_LINEAR_5',  lambda x: _decay_linear(x, 5),         1),
+    ('DELTA',           lambda x: _delta(x, 1),                1, 2),
+    ('TS_ARG_MAX_5',    lambda x: _ts_arg_max(x, 5),           1, 5),
+    ('TS_ARG_MIN_5',    lambda x: _ts_arg_min(x, 5),           1, 5),
+    ('DECAY_LINEAR_5',  lambda x: _decay_linear(x, 5),         1, 5),
     # 联网搜索补充 6 个
-    ('SCALE',           lambda x: _scale(x),                   1),
-    ('COVARIANCE_10',   lambda x, y: _ts_covariance(x, y, 10), 2),
-    ('PRODUCT_5',       lambda x: _ts_product(x, 5),           1),
-    ('SIGNED_POWER_2',  lambda x: _signed_power(x, 2.0),       1),
-    ('TS_DECAY_EXP_5',  lambda x: _decay_exp(x, 5, 0.5),       1),
-    ('DELTA_5',         lambda x: _delta(x, 5),                1),
-]
-
-
-# ── Task 3.2 追加：Cross_Sectional 算子（沿 N 维，每时间步跨品种）──────────
-#
-# 追加在既有 44 个算子之后，保持既有算子命名/顺序/行为不变。均为 arity 1，
-# 沿 dim=0（N 维）逐时间步向量化计算，NaN-safe。（R2.1, R2.2, R2.10）
-
-_CROSS_SECTIONAL_OPERATORS = [
-    ('CS_RANK',       _cs_rank,       1),   # 跨品种百分位排名 [0,1]，N=1→0.5
-    ('CS_SCALE',      _cs_scale,      1),   # 跨品种缩放 [0,1]，零跨度/N=1→0.5
-    ('CS_NEUTRALIZE', _cs_neutralize, 1),   # 减跨品种均值，N=1→0
+    ('SCALE',           lambda x: _scale(x),                   1, 200),
+    ('COVARIANCE_10',   lambda x, y: _ts_covariance(x, y, 10), 2, 10),
+    ('PRODUCT_5',       lambda x: _ts_product(x, 5),           1, 5),
+    ('SIGNED_POWER_2',  lambda x: _signed_power(x, 2.0),       1, 1),
+    ('TS_DECAY_EXP_5',  lambda x: _decay_exp(x, 5, 0.5),       1, 5),
+    ('DELTA_5',         lambda x: _delta(x, 5),                1, 6),
 ]
 
 
@@ -439,28 +374,19 @@ def _register_initial_operators(registry: Registry) -> None:
     二元/三元算子经 `_with_shape_check` 包装以在入口校验操作数形状一致性
     （R2.13）；一元算子直接注册。以显式声明的 arity 为准（R2.8）。
     """
-    for name, transform, arity in _INITIAL_OPERATORS:
+    for name, transform, arity, lookback in _INITIAL_OPERATORS:
         fn = _with_shape_check(name, transform) if arity >= 2 else transform
         registry.register_operator(
-            OperatorSpec(name=name, arity=arity, transform=fn)
-        )
-
-
-def _register_cross_sectional_operators(registry: Registry) -> None:
-    """把 Cross_Sectional 算子注册进给定注册表（Task 3.2）。
-
-    均为一元算子（arity 1），沿 N 维逐时间步计算；直接注册（无需形状校验包装）。
-    追加在初始 44 个算子之后，保持既有算子顺序在前、新算子在后（R2.1, R2.2）。
-    """
-    for name, transform, arity in _CROSS_SECTIONAL_OPERATORS:
-        fn = _with_shape_check(name, transform) if arity >= 2 else transform
-        registry.register_operator(
-            OperatorSpec(name=name, arity=arity, transform=fn)
+            OperatorSpec(
+                name=name,
+                arity=arity,
+                transform=fn,
+                lookback=lookback,
+            )
         )
 
 
 _register_initial_operators(OPERATOR_REGISTRY)
-_register_cross_sectional_operators(OPERATOR_REGISTRY)
 
 
 # `OPS_CONFIG` 现为 `OPERATOR_REGISTRY` 的导出视图，保持既有元组结构
@@ -475,24 +401,16 @@ OPS_CONFIG = [
 assert len(OPS_CONFIG) == len(OPERATOR_REGISTRY.operator_specs), (
     "OPS_CONFIG 导出视图与 OPERATOR_REGISTRY 长度不一致"
 )
-_EXPECTED_INITIAL_NAMES = {name for name, _, _ in _INITIAL_OPERATORS}
+_EXPECTED_INITIAL_NAMES = {name for name, _, _, _ in _INITIAL_OPERATORS}
 _REGISTERED_NAMES = set(OPERATOR_REGISTRY.operator_names)
 assert _EXPECTED_INITIAL_NAMES <= _REGISTERED_NAMES, (
     "既有算子未全部注册: "
     f"{_EXPECTED_INITIAL_NAMES - _REGISTERED_NAMES}"
 )
-assert len(OPERATOR_REGISTRY.operator_specs) >= 44, (
-    f"OPERATOR_REGISTRY 至少应含 44 个既有算子，实际 {len(OPERATOR_REGISTRY.operator_specs)}"
-)
-# Task 3.2：Cross_Sectional 算子必须全部在册（总数随之增加）。
-_EXPECTED_CS_NAMES = {name for name, _, _ in _CROSS_SECTIONAL_OPERATORS}
-assert _EXPECTED_CS_NAMES <= _REGISTERED_NAMES, (
-    "Cross_Sectional 算子未全部注册: "
-    f"{_EXPECTED_CS_NAMES - _REGISTERED_NAMES}"
-)
-assert len(OPERATOR_REGISTRY.operator_specs) >= 44 + len(_CROSS_SECTIONAL_OPERATORS), (
-    "OPERATOR_REGISTRY 总数应含既有 44 个 + Cross_Sectional 算子，"
-    f"实际 {len(OPERATOR_REGISTRY.operator_specs)}"
+assert len(OPERATOR_REGISTRY.operator_specs) == len(_INITIAL_OPERATORS), (
+    "初始 operator 声明与注册表计数不一致: "
+    f"expected={len(_INITIAL_OPERATORS)}, "
+    f"actual={len(OPERATOR_REGISTRY.operator_specs)}"
 )
 
 
@@ -536,16 +454,16 @@ def _signed_sqrt(x: torch.Tensor) -> torch.Tensor:
 # 算子列表（追加在既有 47 个之后）
 _TASK33_OPERATORS = [
     # 时序求和（arity 1，因果，R2.3）
-    ('TS_SUM_5',    lambda x: torch.nan_to_num(_ts_sum(x, 5),  nan=0.0), 1),
-    ('TS_SUM_10',   lambda x: torch.nan_to_num(_ts_sum(x, 10), nan=0.0), 1),
-    ('TS_SUM_20',   lambda x: torch.nan_to_num(_ts_sum(x, 20), nan=0.0), 1),
+    ('TS_SUM_5',    lambda x: torch.nan_to_num(_ts_sum(x, 5),  nan=0.0), 1, 5),
+    ('TS_SUM_10',   lambda x: torch.nan_to_num(_ts_sum(x, 10), nan=0.0), 1, 10),
+    ('TS_SUM_20',   lambda x: torch.nan_to_num(_ts_sum(x, 20), nan=0.0), 1, 20),
     # 元素级二元极值（arity 2，天然因果，R2.4）
-    ('MIN', lambda x, y: torch.nan_to_num(torch.minimum(x, y), nan=0.0), 2),
-    ('MAX', lambda x, y: torch.nan_to_num(torch.maximum(x, y), nan=0.0), 2),
+    ('MIN', lambda x, y: torch.nan_to_num(torch.minimum(x, y), nan=0.0), 2, 1),
+    ('MAX', lambda x, y: torch.nan_to_num(torch.maximum(x, y), nan=0.0), 2, 1),
     # 幅度变换（arity 1，天然因果，R2.5）
-    ('POWER',      lambda x: _power_signed(x, 2.0), 1),
-    ('SIGNED_LOG', _signed_log,                      1),
-    ('SQRT',       _signed_sqrt,                     1),
+    ('POWER',      lambda x: _power_signed(x, 2.0), 1, 1),
+    ('SIGNED_LOG', _signed_log,                      1, 1),
+    ('SQRT',       _signed_sqrt,                     1, 1),
 ]
 
 
@@ -555,10 +473,15 @@ def _register_task33_operators(registry: Registry) -> None:
     二元算子（MIN/MAX）经 `_with_shape_check` 包装；一元算子直接注册。
     追加在既有 47 个算子之后，保持既有算子顺序在前（R2.9, R2.10）。
     """
-    for name, transform, arity in _TASK33_OPERATORS:
+    for name, transform, arity, lookback in _TASK33_OPERATORS:
         fn = _with_shape_check(name, transform) if arity >= 2 else transform
         registry.register_operator(
-            OperatorSpec(name=name, arity=arity, transform=fn)
+            OperatorSpec(
+                name=name,
+                arity=arity,
+                transform=fn,
+                lookback=lookback,
+            )
         )
 
 
@@ -571,15 +494,16 @@ OPS_CONFIG = [
 ]
 
 # Task 3.3：新增算子必须全部在册
-_EXPECTED_T33_NAMES = {name for name, _, _ in _TASK33_OPERATORS}
+_EXPECTED_T33_NAMES = {name for name, _, _, _ in _TASK33_OPERATORS}
 _REGISTERED_NAMES_T33 = set(OPERATOR_REGISTRY.operator_names)
 assert _EXPECTED_T33_NAMES <= _REGISTERED_NAMES_T33, (
     "Task 3.3 算子未全部注册: "
     f"{_EXPECTED_T33_NAMES - _REGISTERED_NAMES_T33}"
 )
-assert len(OPERATOR_REGISTRY.operator_specs) >= 44 + len(_CROSS_SECTIONAL_OPERATORS) + len(_TASK33_OPERATORS), (
-    "OPERATOR_REGISTRY 总数应含既有 44 + CS 3 + Task3.3 8 个算子，"
-    f"实际 {len(OPERATOR_REGISTRY.operator_specs)}"
+_EXPECTED_T33_COUNT = len(_INITIAL_OPERATORS) + len(_TASK33_OPERATORS)
+assert len(OPERATOR_REGISTRY.operator_specs) == _EXPECTED_T33_COUNT, (
+    "Task3.3 operator 声明与注册表计数不一致: "
+    f"expected={_EXPECTED_T33_COUNT}, actual={len(OPERATOR_REGISTRY.operator_specs)}"
 )
 
 
@@ -595,18 +519,8 @@ import math as _math  # noqa: E402 — 模块顶部已有 import torch；这里�
 
 
 def _ts_zscore(x: torch.Tensor, w: int) -> torch.Tensor:
-    """因果滚动 z-score（R2.6）：(x - ts_mean) / (ts_std + eps)。
-    窗口 w 期，左侧 zero-pad + unfold，每步 t 只用 [t-w+1..t]。
-    std < eps 时输出 0（常数窗口安全）。
-    """
-    windows = _ts_rolling(x, w)                               # [N, T, w]
-    m = windows.mean(dim=-1)                                   # [N, T]
-    s = ((windows - m.unsqueeze(-1)) ** 2).mean(dim=-1).sqrt() + 1e-9
-    z = (x - m) / s
-    # std < eps（常数窗口）→ 输出 0
-    mask = s < (1e-9 + 1e-9)
-    z = torch.where(mask, torch.zeros_like(z), z)
-    return torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+    """共享因果滚动 z-score；warm-up 排除左侧 padding。"""
+    return causal_rolling_zscore(x, w)
 
 
 def _winsorize(x: torch.Tensor, lo: float = 0.05, hi: float = 0.95) -> torch.Tensor:
@@ -681,17 +595,18 @@ def _if_gt(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
 
 _TASK34_OPERATORS = [
     # 归一化算子（arity 1，因果，R2.6）
-    ('TS_ZSCORE_10',  lambda x: _ts_zscore(x, 10),  1),
-    ('TS_ZSCORE_20',  lambda x: _ts_zscore(x, 20),  1),
-    ('WINSORIZE',     _winsorize,                    1),
-    ('CLIP',          _clip_fixed,                   1),
-    ('SIGMOID',       _sigmoid_squash,               1),
-    ('TANH_SQUASH',   _tanh_squash,                  1),
+    ('TS_ZSCORE_10',  lambda x: _ts_zscore(x, 10),  1, 10),
+    ('TS_ZSCORE_20',  lambda x: _ts_zscore(x, 20),  1, 20),
+    ('WINSORIZE',     _winsorize,                    1, 20),
+    ('CLIP',          _clip_fixed,                   1, 1),
+    ('SIGMOID',       _sigmoid_squash,               1, 1),
+    ('TANH_SQUASH',   _tanh_squash,                  1, 1),
     # 条件/逻辑算子（R2.7）
-    # P1 注意：LT/GT/AND/OR 输出纯 0/1 二值，与 Neutral Band 连续因子语义冲突，
-    # 容易被模型利用来制造稀疏信号刷高训练分，已从词表移除。
-    # IF_GT 输出连续值（条件混合），保留。
-    ('IF_GT', _if_gt, 3),   # where(x>0, y, z) — 输出连续值，保留
+    ('GT',    _gt,    2, 1),
+    ('LT',    _lt,    2, 1),
+    ('AND',   _and,   2, 1),
+    ('OR',    _or,    2, 1),
+    ('IF_GT', _if_gt, 3, 1),
 ]
 
 
@@ -701,10 +616,15 @@ def _register_task34_operators(registry: Registry) -> None:
     二元/三元算子经 `_with_shape_check` 包装；一元算子直接注册。
     追加在既有 55 个算子之后，保持既有算子顺序在前（R2.9, R2.10）。
     """
-    for name, transform, arity in _TASK34_OPERATORS:
+    for name, transform, arity, lookback in _TASK34_OPERATORS:
         fn = _with_shape_check(name, transform) if arity >= 2 else transform
         registry.register_operator(
-            OperatorSpec(name=name, arity=arity, transform=fn)
+            OperatorSpec(
+                name=name,
+                arity=arity,
+                transform=fn,
+                lookback=lookback,
+            )
         )
 
 
@@ -716,15 +636,21 @@ OPS_CONFIG = [
     for spec in OPERATOR_REGISTRY.operator_specs
 ]
 
-# Task 3.4：新增算子必须全部在册（LT/GT/AND/OR 已移除，保留 7 个）
-_EXPECTED_T34_NAMES = {name for name, _, _ in _TASK34_OPERATORS}
+# Task 3.4：新增算子必须全部在册
+_EXPECTED_T34_NAMES = {name for name, _, _, _ in _TASK34_OPERATORS}
 _REGISTERED_NAMES_T34 = set(OPERATOR_REGISTRY.operator_names)
 assert _EXPECTED_T34_NAMES <= _REGISTERED_NAMES_T34, (
     "Task 3.4 算子未全部注册: "
     f"{_EXPECTED_T34_NAMES - _REGISTERED_NAMES_T34}"
 )
-_PREV_COUNT = 44 + len(_CROSS_SECTIONAL_OPERATORS) + len(_TASK33_OPERATORS)
-assert len(OPERATOR_REGISTRY.operator_specs) >= _PREV_COUNT + len(_TASK34_OPERATORS), (
-    f"OPERATOR_REGISTRY 总数应含既有 {_PREV_COUNT} + Task3.4 {len(_TASK34_OPERATORS)} 个算子，"
-    f"实际 {len(OPERATOR_REGISTRY.operator_specs)}"
+_EXPECTED_OPERATOR_COUNT = (
+    len(_INITIAL_OPERATORS) + len(_TASK33_OPERATORS) + len(_TASK34_OPERATORS)
+)
+assert len(OPERATOR_REGISTRY.operator_specs) == _EXPECTED_OPERATOR_COUNT, (
+    "operator 声明与注册表计数不一致: "
+    f"expected={_EXPECTED_OPERATOR_COUNT}, actual={len(OPERATOR_REGISTRY.operator_specs)}"
+)
+
+MAX_OPERATOR_LOOKBACK = max(
+    spec.lookback for spec in OPERATOR_REGISTRY.operator_specs
 )

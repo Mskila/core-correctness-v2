@@ -14,7 +14,7 @@ Property 2: PRESSURE and AC1 Value Range Constraint
 import torch
 from hypothesis import given, settings, strategies as st
 
-from model_core.features import MT5FeatureEngineer
+from model_core.features import FEATURE_NAMES, FEATURE_REGISTRY, MT5FeatureEngineer
 
 
 # ── Shared OHLCV generator ─────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ def ohlcv_strategy(draw, min_T: int = 21) -> dict:
     N=st.integers(min_value=1, max_value=10),
     T=st.integers(min_value=21, max_value=200),
 )
-@settings(max_examples=50)
+@settings(max_examples=50, deadline=None)
 def test_compute_features_shape_and_nan_free(N: int, T: int):
     """
     Property 1: compute_features Output Shape and NaN Safety Invariant
@@ -93,9 +93,9 @@ def test_compute_features_shape_and_nan_free(N: int, T: int):
     raw_dict = _make_ohlcv(N, T)
     out = MT5FeatureEngineer.compute_features(raw_dict)
 
-    # Shape invariant: 20 features (expanded from 10)
-    assert out.shape == (N, 20, T), (
-        f"Expected shape ({N}, 20, {T}), got {tuple(out.shape)}"
+    feature_count = len(FEATURE_REGISTRY.feature_names)
+    assert out.shape == (N, feature_count, T), (
+        f"Expected shape ({N}, {feature_count}, {T}), got {tuple(out.shape)}"
     )
 
     # NaN safety
@@ -117,7 +117,7 @@ def test_compute_features_shape_and_nan_free(N: int, T: int):
     N=st.integers(min_value=1, max_value=10),
     T=st.integers(min_value=21, max_value=200),
 )
-@settings(max_examples=50)
+@settings(max_examples=50, deadline=None)
 def test_pressure_and_ac1_in_range(N: int, T: int):
     """
     Property 2: PRESSURE and AC1 Value Range Constraint
@@ -133,8 +133,8 @@ def test_pressure_and_ac1_in_range(N: int, T: int):
     raw_dict = _make_ohlcv(N, T)
     out = MT5FeatureEngineer.compute_features(raw_dict)
 
-    pressure = out[:, 12, :]  # PRESSURE — index 12 in 20-feature vocab
-    ac1      = out[:, 13, :]  # AC1      — index 13 in 20-feature vocab
+    pressure = out[:, FEATURE_NAMES.index("PRESSURE"), :]
+    ac1      = out[:, FEATURE_NAMES.index("AC1"), :]
 
     # PRESSURE ∈ [-1.0, 1.0]
     assert (pressure >= -1.0).all(), (

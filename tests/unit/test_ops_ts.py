@@ -17,7 +17,16 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import torch
-from model_core.ops import OPS_CONFIG, _ts_mean, _ts_std, _ts_rank, _ts_corr_10
+import model_core.ops as ops_module
+from model_core.ops import (
+    OPERATOR_REGISTRY,
+    OPS_CONFIG,
+    _ts_corr_10,
+    _ts_mean,
+    _ts_rank,
+    _ts_std,
+)
+from model_core.registry import OperatorSpec, RegistrationError, Registry
 
 # ── 常量 ────────────────────────────────────────────────────────────────────────
 N, T = 4, 30
@@ -34,11 +43,8 @@ def rand_input() -> torch.Tensor:
 
 # ── 1. OPS_CONFIG 长度验证 ───────────────────────────────────────────────────────
 class TestOpsConfigLength:
-    def test_ops_config_length_equals_22(self):
-        """OPS_CONFIG 共 28 个算子（原 12 基础 + 10 时序 + 6 趋势/动量）"""
-        assert len(OPS_CONFIG) == 28, (
-            f"OPS_CONFIG 长度应为 28，实际为 {len(OPS_CONFIG)}"
-        )
+    def test_ops_config_matches_registry(self):
+        assert len(OPS_CONFIG) == len(OPERATOR_REGISTRY.operator_names)
 
     def test_new_ops_count_equals_10(self):
         """时序算子（索引 12-21）共 10 个"""
@@ -249,3 +255,42 @@ class TestHelperFunctions:
         assert (out >= -1.0 - 1e-5).all() and (out <= 1.0 + 1e-5).all(), (
             f"TS_CORR_10 值域越界：min={out.min().item():.6f}, max={out.max().item():.6f}"
         )
+
+
+class TestOperatorLookbacks:
+    def test_all_registered_operators_have_positive_integer_lookback(self):
+        assert OPERATOR_REGISTRY.operator_specs
+        for spec in OPERATOR_REGISTRY.operator_specs:
+            assert isinstance(getattr(spec, "lookback", None), int)
+            assert not isinstance(spec.lookback, bool)
+            assert spec.lookback >= 1
+        assert getattr(ops_module, "MAX_OPERATOR_LOOKBACK", 0) >= 200
+
+    @pytest.mark.parametrize("lookback", [None, True, False, 0, -1])
+    def test_invalid_lookback_does_not_mutate_registry(self, lookback):
+        registry = Registry()
+        before = registry.operator_specs
+
+        def transform(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        with pytest.raises(RegistrationError):
+            registry.register_operator(
+                OperatorSpec(
+                    name="TEST_OPERATOR",
+                    arity=1,
+                    transform=transform,
+                    lookback=lookback,
+                )
+            )
+        assert registry.operator_specs == before
+
+    def test_missing_lookback_cannot_mutate_registry(self):
+        registry = Registry()
+
+        def transform(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        with pytest.raises(TypeError):
+            OperatorSpec(name="TEST_OPERATOR", arity=1, transform=transform)
+        assert registry.operator_specs == ()

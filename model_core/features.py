@@ -1,14 +1,7 @@
 ﻿"""
-model_core/features.py -- MT5 Feature Engineering (20 features)
+model_core/features.py -- Core Correctness V2 single-symbol feature library.
 
-Features:
-  Trend (0-4):   RET, RET5, RET20, MA_DIFF, SLOPE20
-  Volatility (5-8): ATR, RVOL, HL_RANGE, VOL_REGIME
-  Reversal (9-13):  DEV, DEV60, RSI14, PRESSURE, AC1
-  Volume (14-16):   VOL_RATIO, VOL_Z, PV_CORR
-  Cross-asset (17-19): REL_RET5, REL_RET20, REL_VOL
-
-Output: [N, 30, T], all normalized, no NaN/Inf. (v3.0: 20→30 features)
+Output: [N, F, T], all finite; F is derived from FEATURE_REGISTRY.
 
 注册化重构（task 5.1）：现有 30 个特征以 `FeatureSpec(name, category, compute)`
 声明条目注册进模块级 `FEATURE_REGISTRY`；`compute_features()` 按注册顺序执行
@@ -17,7 +10,9 @@ Output: [N, 30, T], all normalized, no NaN/Inf. (v3.0: 20→30 features)
 """
 import torch
 
+from .causal import causal_rolling_zscore
 from .registry import FeatureSpec, Registry
+from .semantics import ArtifactCompatibilityError, CORE_SEMANTICS_VERSION
 
 
 class MT5FeatureEngineer:
@@ -135,28 +130,11 @@ class MT5FeatureEngineer:
 
     @staticmethod
     def _robust_norm(x: torch.Tensor, w: int = 200) -> torch.Tensor:
-        """因果滚动 robust 归一化（R1.9, Property 1）。
-
-        每个时间步 t 只使用 [t-w+1..t] 共 w 期数据计算 median/MAD，
-        彻底消除 look-ahead 泄露。w 默认 200（覆盖足够的历史，warm-up
-        期（t<w）用可用数据的局部 median/MAD，填充值为 0 不引入未来）。
-
-        【实现注意】：torch.median 对 float16 有精度问题，统一转 float32 计算
-        后再转回原 dtype。unfold 窗口中有 pad 的 0（warm-up 期），这些 0 会
-        影响局部 median，对极短序列略有偏差，但严格因果、无未来信息。
-        """
-        orig_dtype = x.dtype
-        x32 = x.float()
-        N, T = x32.shape
-        pad = torch.zeros(N, w - 1, device=x32.device, dtype=x32.dtype)
-        wnd = torch.cat([pad, x32], dim=1).unfold(1, w, 1)   # [N, T, w]
-        med = wnd.median(dim=-1).values                       # [N, T]，因果
-        mad = (wnd - med.unsqueeze(-1)).abs().median(dim=-1).values + 1e-6
-        out = torch.clamp((x32 - med) / mad,
-                          -MT5FeatureEngineer._CLIP_BOUND,
-                           MT5FeatureEngineer._CLIP_BOUND)
-        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-        return out.to(orig_dtype)
+        """共享的因果滚动 z-score，warm-up 只统计真实前缀。"""
+        return causal_rolling_zscore(x, w).clamp(
+            -MT5FeatureEngineer._CLIP_BOUND,
+            MT5FeatureEngineer._CLIP_BOUND,
+        )
 
     @staticmethod
     def _clean(x: torch.Tensor) -> torch.Tensor:
@@ -516,23 +494,7 @@ class MT5FeatureEngineer:
         log_vol_ratio = torch.log1p(cls._clean(vol_ratio.clamp(min=-0.99)))
         return cls._clean(torch.clamp(cls._ts_corr(ret, log_vol_ratio, 10), -1.0, 1.0))
 
-    # 跨截面相对强弱 cross_sectional (17-19)
-    @classmethod
-    def _c_rel_ret5(cls, raw: dict) -> torch.Tensor:
-        ret5 = cls._c_ret5(raw)
-        return cls._norm(ret5 - ret5.mean(dim=0, keepdim=True))
-
-    @classmethod
-    def _c_rel_ret20(cls, raw: dict) -> torch.Tensor:
-        ret20 = cls._c_ret20(raw)
-        return cls._norm(ret20 - ret20.mean(dim=0, keepdim=True))
-
-    @classmethod
-    def _c_rel_vol(cls, raw: dict) -> torch.Tensor:
-        rvol = cls._c_rvol(raw)
-        return cls._norm(rvol - rvol.mean(dim=0, keepdim=True))
-
-    # v3.0 新增特征 (20-25)
+    # v3.0 新增特征
     @classmethod
     def _c_vwap_dev(cls, raw: dict) -> torch.Tensor:
         close = raw["close"].float(); high = raw["high"].float()
@@ -1277,46 +1239,6 @@ class MT5FeatureEngineer:
         H = _h(p_pos) + _h(p_neg) + _h(p_zero)    # ≥0
         return cls._clean(torch.clamp(H / math.log(3), 0.0, 1.0))
 
-    # ── task 5.8 跨截面相对强弱类特征（补充）compute ──────────────────────
-
-    @classmethod
-    def _c_cs_rank_ret5(cls, raw: dict) -> torch.Tensor:
-        """5期收益的截面百分位排名（每时间步对 N 品种排名）∈[0,1]。
-
-        N=1 → 0.5；使用 argsort 因果截面排名（不跨时间）。
-        """
-        eps   = cls._EPS
-        close = raw["close"].float()
-        N, T  = close.shape
-        ret5_raw = torch.log(close[:, 5:] / (close[:, :-5] + eps))
-        ret5 = torch.cat([torch.zeros(N, 5, device=close.device, dtype=close.dtype), ret5_raw], dim=1)  # [N, T]
-        if N == 1:
-            return cls._clean(torch.full_like(ret5, 0.5))
-        # 截面排名（每时间步沿 N 维）
-        order = ret5.argsort(dim=0)                 # [N, T] — argsort 沿品种维
-        ranks = torch.zeros_like(ret5)
-        ranks.scatter_(0, order, torch.arange(N, dtype=ret5.dtype, device=ret5.device).unsqueeze(1).expand(N, T))
-        cs_rank = ranks / (N - 1)                  # ∈ [0, 1]
-        return cls._clean(torch.clamp(cs_rank, 0.0, 1.0))
-
-    @classmethod
-    def _c_cs_zscore_ret20(cls, raw: dict) -> torch.Tensor:
-        """20期收益的截面 z-score（每时间步跨品种去均值/除标准差）。
-
-        N=1 → 0；robust_norm 兜底防极端值。
-        """
-        eps   = cls._EPS
-        close = raw["close"].float()
-        N, T  = close.shape
-        ret20_raw = torch.log(close[:, 20:] / (close[:, :-20] + eps))
-        ret20 = torch.cat([torch.zeros(N, 20, device=close.device, dtype=close.dtype), ret20_raw], dim=1)  # [N, T]
-        if N == 1:
-            return cls._clean(torch.zeros_like(ret20))
-        cs_mean = ret20.mean(dim=0, keepdim=True)        # [1, T]
-        cs_std  = ret20.std(dim=0, keepdim=True) + eps   # [1, T]
-        zscore  = (ret20 - cs_mean) / cs_std             # [N, T]
-        return cls._norm(cls._clean(zscore))
-
     # ── main ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -1330,128 +1252,165 @@ class MT5FeatureEngineer:
         return torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# ── FEATURE_REGISTRY：现有 30 特征的声明式注册（task 5.1）────────────────
-# 顺序严格对应重构前 compute_features 的 stack 顺序（0..29），不可变更。
+# ── FEATURE_REGISTRY：Core Correctness V2 单标的声明式注册 ────────────────
+# 顺序即 V2 token 顺序，不可变更。
 # category 用于报告分组与类别覆盖校验（依 vocab.py 注释归类）。
 
 FEATURE_REGISTRY = Registry()
 
 _fe = MT5FeatureEngineer
 
-# (name, category, compute) —— 顺序即 token/特征维顺序
+# (name, category, compute, lookback) —— 顺序即 token/特征维顺序。
+# lookback 包含底层指标窗口及其后的 200 期因果归一化窗口；递推/累积指标
+# 使用保守 warm-up 声明，供最小样本计算和词表身份审计。
 _FEATURE_DEFS = [
     # 趋势类 trend (0-4)
-    ("RET",         "trend",           _fe._c_ret),
-    ("RET5",        "trend",           _fe._c_ret5),
-    ("RET20",       "trend",           _fe._c_ret20),
-    ("MA_DIFF",     "trend",           _fe._c_ma_diff),
-    ("SLOPE20",     "trend",           _fe._c_slope20),
+    ("RET",         "trend",           _fe._c_ret, 201),
+    ("RET5",        "trend",           _fe._c_ret5, 205),
+    ("RET20",       "trend",           _fe._c_ret20, 220),
+    ("MA_DIFF",     "trend",           _fe._c_ma_diff, 229),
+    ("SLOPE20",     "trend",           _fe._c_slope20, 219),
     # 波动类 volatility (5-8)
-    ("ATR",         "volatility",      _fe._c_atr),
-    ("RVOL",        "volatility",      _fe._c_rvol),
-    ("HL_RANGE",    "volatility",      _fe._c_hl_range),
-    ("VOL_REGIME",  "volatility",      _fe._c_vol_regime),
+    ("ATR",         "volatility",      _fe._c_atr, 214),
+    ("RVOL",        "volatility",      _fe._c_rvol, 220),
+    ("HL_RANGE",    "volatility",      _fe._c_hl_range, 200),
+    ("VOL_REGIME",  "volatility",      _fe._c_vol_regime, 233),
     # 反转类 reversal (9-13)
-    ("DEV",         "reversal",        _fe._c_dev),
-    ("DEV60",       "reversal",        _fe._c_dev60),
-    ("RSI14",       "reversal",        _fe._c_rsi14),
-    ("PRESSURE",    "reversal",        _fe._c_pressure),
-    ("AC1",         "reversal",        _fe._c_ac1),
+    ("DEV",         "reversal",        _fe._c_dev, 219),
+    ("DEV60",       "reversal",        _fe._c_dev60, 259),
+    ("RSI14",       "reversal",        _fe._c_rsi14, 15),
+    ("PRESSURE",    "reversal",        _fe._c_pressure, 1),
+    ("AC1",         "reversal",        _fe._c_ac1, 22),
     # 成交量类 volume (14-16)
-    ("VOL_RATIO",   "volume",          _fe._c_vol_ratio),
-    ("VOL_Z",       "volume",          _fe._c_vol_z),
-    ("PV_CORR",     "volume",          _fe._c_pv_corr),
-    # 跨截面相对强弱 cross_sectional (17-19)
-    ("REL_RET5",    "cross_sectional", _fe._c_rel_ret5),
-    ("REL_RET20",   "cross_sectional", _fe._c_rel_ret20),
-    ("REL_VOL",     "cross_sectional", _fe._c_rel_vol),
-    # v3.0 新增特征 (20-25)
-    ("VWAP_DEV",    "volume",          _fe._c_vwap_dev),
-    ("BOLL_POS",    "channel",         _fe._c_boll_pos),
-    ("BOLL_WIDTH",  "volatility",      _fe._c_boll_width),
-    ("MACD_HIST",   "momentum",        _fe._c_macd_hist),
-    ("OBV_SLOPE",   "volume",          _fe._c_obv_slope),
-    ("MFI14",       "volume",          _fe._c_mfi14),
-    # v3.0 Alpha 101 + 互补特征 (26-29)
-    ("WILLR_14",    "reversal",        _fe._c_willr14),
-    ("CCI_14",      "reversal",        _fe._c_cci14),
-    ("ROC_12",      "momentum",        _fe._c_roc12),
-    ("TYPICAL_DEV", "reversal",        _fe._c_typical_dev),
-    # task 5.2 趋势类 trend (30-32)
-    ("EMA_RATIO_12_26",  "trend",      _fe._c_ema_ratio_12_26),
-    ("TREND_STRENGTH_50","trend",      _fe._c_trend_strength_50),
-    ("PRICE_POS_50",     "trend",      _fe._c_price_pos_50),
-    # task 5.2 动量类 momentum (33-36)
-    ("TRIX_15",     "momentum",        _fe._c_trix_15),
-    ("PPO",         "momentum",        _fe._c_ppo),
-    ("ULT_OSC",     "momentum",        _fe._c_ult_osc),
-    ("RET_ACCEL",   "momentum",        _fe._c_ret_accel),
-    # task 5.3 波动类（含 OHLC 估计量）volatility (37-40)
-    ("GK_VOL",          "volatility",  _fe._c_gk_vol),
-    ("PARKINSON_VOL",   "volatility",  _fe._c_parkinson_vol),
-    ("YANG_ZHANG_VOL",  "volatility",  _fe._c_yang_zhang_vol),
-    ("RS_VOL",          "volatility",  _fe._c_rs_vol),
-    # task 5.4 量能/流动性类 volume (41-44)
-    ("AMIHUD_ILLIQ",    "volume",      _fe._c_amihud_illiq),
-    ("KYLE_LAMBDA",     "volume",      _fe._c_kyle_lambda),
-    ("CMF_20",          "volume",      _fe._c_cmf_20),
-    ("AD_LINE_SLOPE",   "volume",      _fe._c_ad_line_slope),
-    # task 5.5 反转/振荡类 reversal/trend/momentum (45-50)
-    ("STOCH_K_14",      "reversal",    _fe._c_stoch_k_14),
-    ("STOCH_D_3",       "reversal",    _fe._c_stoch_d_3),
-    ("AROON_OSC_25",    "reversal",    _fe._c_aroon_osc_25),
-    ("DMI_ADX_14",      "trend",       _fe._c_dmi_adx_14),
-    ("DMI_DIFF_14",     "trend",       _fe._c_dmi_diff_14),
-    ("TRIX_SIGNAL",     "momentum",    _fe._c_trix_signal),
-    # task 5.6 通道/突破类 channel (51-56)
-    ("DONCHIAN_POS_20",     "channel", _fe._c_donchian_pos_20),
-    ("KELTNER_POS_20",      "channel", _fe._c_keltner_pos_20),
-    ("ICHIMOKU_KIJUN_DEV",  "channel", _fe._c_ichimoku_kijun_dev),
-    ("ICHIMOKU_TENKAN_DEV", "channel", _fe._c_ichimoku_tenkan_dev),
-    ("SUPERTREND_DIR",      "channel", _fe._c_supertrend_dir),
-    ("SAR_DIST",            "channel", _fe._c_sar_dist),
-    # task 5.7 统计类 statistical (57-62)
-    ("ROLL_SKEW_20",    "statistical", _fe._c_roll_skew_20),
-    ("ROLL_KURT_20",    "statistical", _fe._c_roll_kurt_20),
-    ("HURST_50",        "statistical", _fe._c_hurst_50),
-    ("FRACTAL_DIM_30",  "statistical", _fe._c_fractal_dim_30),
-    ("AC2",             "statistical", _fe._c_ac2),
-    ("RET_ENTROPY_20",  "statistical", _fe._c_ret_entropy_20),
-    # task 5.8 跨截面相对强弱补充 cross_sectional (63-64)
-    ("CS_RANK_RET5",    "cross_sectional", _fe._c_cs_rank_ret5),
-    ("CS_ZSCORE_RET20", "cross_sectional", _fe._c_cs_zscore_ret20),
+    ("VOL_RATIO",   "volume",          _fe._c_vol_ratio, 219),
+    ("VOL_Z",       "volume",          _fe._c_vol_z, 20),
+    ("PV_CORR",     "volume",          _fe._c_pv_corr, 228),
+    # v3.0 新增特征
+    ("VWAP_DEV",    "volume",          _fe._c_vwap_dev, 219),
+    ("BOLL_POS",    "channel",         _fe._c_boll_pos, 20),
+    ("BOLL_WIDTH",  "volatility",      _fe._c_boll_width, 219),
+    ("MACD_HIST",   "momentum",        _fe._c_macd_hist, 440),
+    ("OBV_SLOPE",   "volume",          _fe._c_obv_slope, 400),
+    ("MFI14",       "volume",          _fe._c_mfi14, 15),
+    # v3.0 Alpha 101 + 互补特征
+    ("WILLR_14",    "reversal",        _fe._c_willr14, 14),
+    ("CCI_14",      "reversal",        _fe._c_cci14, 14),
+    ("ROC_12",      "momentum",        _fe._c_roc12, 212),
+    ("TYPICAL_DEV", "reversal",        _fe._c_typical_dev, 219),
+    # task 5.2 趋势类 trend
+    ("EMA_RATIO_12_26",  "trend",      _fe._c_ema_ratio_12_26, 379),
+    ("TREND_STRENGTH_50","trend",      _fe._c_trend_strength_50, 249),
+    ("PRICE_POS_50",     "trend",      _fe._c_price_pos_50, 50),
+    # task 5.2 动量类 momentum
+    ("TRIX_15",     "momentum",        _fe._c_trix_15, 510),
+    ("PPO",         "momentum",        _fe._c_ppo, 379),
+    ("ULT_OSC",     "momentum",        _fe._c_ult_osc, 28),
+    ("RET_ACCEL",   "momentum",        _fe._c_ret_accel, 210),
+    # task 5.3 波动类（含 OHLC 估计量）volatility
+    ("GK_VOL",          "volatility",  _fe._c_gk_vol, 219),
+    ("PARKINSON_VOL",   "volatility",  _fe._c_parkinson_vol, 219),
+    ("YANG_ZHANG_VOL",  "volatility",  _fe._c_yang_zhang_vol, 220),
+    ("RS_VOL",          "volatility",  _fe._c_rs_vol, 219),
+    # task 5.4 量能/流动性类 volume
+    ("AMIHUD_ILLIQ",    "volume",      _fe._c_amihud_illiq, 220),
+    ("KYLE_LAMBDA",     "volume",      _fe._c_kyle_lambda, 220),
+    ("CMF_20",          "volume",      _fe._c_cmf_20, 20),
+    ("AD_LINE_SLOPE",   "volume",      _fe._c_ad_line_slope, 400),
+    # task 5.5 反转/振荡类 reversal/trend/momentum
+    ("STOCH_K_14",      "reversal",    _fe._c_stoch_k_14, 14),
+    ("STOCH_D_3",       "reversal",    _fe._c_stoch_d_3, 16),
+    ("AROON_OSC_25",    "reversal",    _fe._c_aroon_osc_25, 25),
+    ("DMI_ADX_14",      "trend",       _fe._c_dmi_adx_14, 28),
+    ("DMI_DIFF_14",     "trend",       _fe._c_dmi_diff_14, 15),
+    ("TRIX_SIGNAL",     "momentum",    _fe._c_trix_signal, 518),
+    # task 5.6 通道/突破类 channel
+    ("DONCHIAN_POS_20",     "channel", _fe._c_donchian_pos_20, 20),
+    ("KELTNER_POS_20",      "channel", _fe._c_keltner_pos_20, 153),
+    ("ICHIMOKU_KIJUN_DEV",  "channel", _fe._c_ichimoku_kijun_dev, 225),
+    ("ICHIMOKU_TENKAN_DEV", "channel", _fe._c_ichimoku_tenkan_dev, 208),
+    ("SUPERTREND_DIR",      "channel", _fe._c_supertrend_dir, 400),
+    ("SAR_DIST",            "channel", _fe._c_sar_dist, 545),
+    # task 5.7 统计类 statistical
+    ("ROLL_SKEW_20",    "statistical", _fe._c_roll_skew_20, 220),
+    ("ROLL_KURT_20",    "statistical", _fe._c_roll_kurt_20, 220),
+    ("HURST_50",        "statistical", _fe._c_hurst_50, 51),
+    ("FRACTAL_DIM_30",  "statistical", _fe._c_fractal_dim_30, 31),
+    ("AC2",             "statistical", _fe._c_ac2, 23),
+    ("RET_ENTROPY_20",  "statistical", _fe._c_ret_entropy_20, 21),
 ]
 
-# ── 激活特征白名单（特征剪枝机制，2026-07-04）──────────────────────────
-# 若项目根目录存在 active_features.json（由 prune_features.py 生成），
-# 则只注册白名单内的特征，缩小 vocab 与搜索空间；否则注册全部 65 个特征。
-# 白名单按 _FEATURE_DEFS 原始顺序过滤，保持特征维顺序稳定。
-def _load_active_feature_allowlist() -> set[str] | None:
+# ── 激活特征白名单（严格 V2 合同）──────────────────────────────────────
+# 白名单按 _FEATURE_DEFS 原始顺序过滤；文件不存在表示启用全部 V2 特征。
+def _load_active_feature_allowlist(path=None) -> set[str] | None:
     import json as _json
     import pathlib as _pathlib
-    _path = _pathlib.Path(__file__).resolve().parent.parent / "active_features.json"
-    if not _path.exists():
+
+    active_path = (
+        _pathlib.Path(path)
+        if path is not None
+        else _pathlib.Path(__file__).resolve().parent.parent / "active_features.json"
+    )
+    if not active_path.exists():
         return None
+
     try:
-        data = _json.loads(_path.read_text(encoding="utf-8"))
-        names = data.get("active_features") if isinstance(data, dict) else data
-        allow = {str(n) for n in names}
-        return allow or None
-    except Exception:
-        return None
+        data = _json.loads(active_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, _json.JSONDecodeError) as exc:
+        raise ArtifactCompatibilityError(
+            f"active feature artifact is unreadable: {active_path}: {exc}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ArtifactCompatibilityError(
+            "active feature artifact must be an object with "
+            "core_semantics_version and active_features"
+        )
+
+    actual_version = data.get("core_semantics_version")
+    if actual_version != CORE_SEMANTICS_VERSION:
+        raise ArtifactCompatibilityError(
+            "active feature core_semantics_version mismatch: "
+            f"expected={CORE_SEMANTICS_VERSION!r}, actual={actual_version!r}"
+        )
+
+    names = data.get("active_features")
+    if (
+        not isinstance(names, list)
+        or not names
+        or any(not isinstance(name, str) or not name for name in names)
+    ):
+        raise ArtifactCompatibilityError(
+            "active_features must be a non-empty list of feature names"
+        )
+
+    known_names = {name for name, _, _, _ in _FEATURE_DEFS}
+    unknown = sorted(set(names) - known_names)
+    if unknown:
+        raise ArtifactCompatibilityError(
+            f"active feature artifact contains unknown names: {unknown}"
+        )
+    return set(names)
 
 
 _ACTIVE_FEATURES = _load_active_feature_allowlist()
 
-for _name, _category, _compute in _FEATURE_DEFS:
+for _name, _category, _compute, _lookback in _FEATURE_DEFS:
     if _ACTIVE_FEATURES is not None and _name not in _ACTIVE_FEATURES:
         continue
     FEATURE_REGISTRY.register_feature(
-        FeatureSpec(name=_name, category=_category, compute=_compute)
+        FeatureSpec(
+            name=_name,
+            category=_category,
+            compute=_compute,
+            lookback=_lookback,
+        )
     )
 
 # 由注册表导出有序特征名视图（保持 import 兼容；vocab.py 侧整合见后续任务）
 FEATURE_NAMES = FEATURE_REGISTRY.feature_names
+MAX_FEATURE_LOOKBACK = max(
+    spec.lookback for spec in FEATURE_REGISTRY.feature_specs
+)
 
 # 计数一致性（R1.13）：INPUT_DIM == len(FEATURE_NAMES) == F
 MT5FeatureEngineer.INPUT_DIM = len(FEATURE_REGISTRY.feature_names)

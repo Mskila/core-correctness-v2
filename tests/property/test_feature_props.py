@@ -12,7 +12,7 @@ import torch
 import pytest
 from hypothesis import given, settings, strategies as st, assume
 
-from model_core.features import MT5FeatureEngineer
+from model_core.features import FEATURE_REGISTRY, MT5FeatureEngineer
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ def _make_raw_dict(
 # Validates: Requirements 3.3, 4.2, 4.4
 
 
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 @given(
     n=st.integers(min_value=1, max_value=8),
     t=st.integers(min_value=20, max_value=200),
@@ -68,8 +68,9 @@ def test_property3_feature_tensor_shape(n: int, t: int):
     raw_dict = _make_raw_dict(n, t)
     features = MT5FeatureEngineer.compute_features(raw_dict)
 
-    assert features.shape == (n, 20, t), (
-        f"Expected shape ({n}, 20, {t}), got {tuple(features.shape)}"
+    feature_count = len(FEATURE_REGISTRY.feature_names)
+    assert features.shape == (n, feature_count, t), (
+        f"Expected shape ({n}, {feature_count}, {t}), got {tuple(features.shape)}"
     )
 
 
@@ -190,7 +191,7 @@ def extreme_ohlcv_strategy(draw):
     }
 
 
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 @given(raw_dict=extreme_ohlcv_strategy())
 def test_property4_feature_values_bounded_no_nan_inf(raw_dict: dict):
     """

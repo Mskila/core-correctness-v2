@@ -28,8 +28,8 @@ from hypothesis import strategies as st
 
 from model_core.ops import _ts_rank, _ts_corr_10, _ts_mean, _ts_std, OPS_CONFIG
 
-# ── All 10 new temporal operators from OPS_CONFIG (indices 12–21) ─────────────
-_TS_OPS = OPS_CONFIG[12:]  # list of (name, fn, arity)
+# ── All registered TS_* operators, derived from the live registry view ────────
+_TS_OPS = [entry for entry in OPS_CONFIG if entry[0].startswith("TS_")]
 
 # ── Strategies ────────────────────────────────────────────────────────────────
 

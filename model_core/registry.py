@@ -53,6 +53,10 @@ class InvalidArityError(RegistrationError):
     """arity 非 0..10 整数（R10.8）。"""
 
 
+class InvalidLookbackError(RegistrationError):
+    """lookback 不是正整数。"""
+
+
 # ── 声明条目（frozen dataclass）─────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -61,12 +65,13 @@ class FeatureSpec:
 
     name:     1..64 字符、非空、唯一的字符串标识。
     category: 类别标签（trend/momentum/volatility/volume/reversal/channel/
-              statistical/cross_sectional），用于报告分组与类别覆盖校验。
+              statistical），用于报告分组与类别覆盖校验。
     compute:  计算函数，签名 `(raw_dict: dict) -> Tensor[N, T]`。
     """
     name: str
     category: str
     compute: Callable[[dict], "torch.Tensor"]
+    lookback: int
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,7 @@ class OperatorSpec:
     name: str
     arity: int
     transform: Callable[..., "torch.Tensor"]
+    lookback: int
 
 
 # ── 校验辅助 ────────────────────────────────────────────────────────────
@@ -166,14 +172,21 @@ class Registry:
 
     def register_feature(self, spec: FeatureSpec) -> None:
         """注册单个 Feature（R10.2）。校验全部通过后才追加，否则注册表不变。"""
-        # 1) 必填字段校验（R10.7）：name / category / compute
+        # 1) 必填字段校验（R10.7）：name / category / compute / lookback
         self._require_fields(
             spec,
-            {"name": "name", "category": "category", "compute": "compute"},
+            {
+                "name": "name",
+                "category": "category",
+                "compute": "compute",
+                "lookback": "lookback",
+            },
         )
         # 2) name 合法性（R10.2）
         _validate_name(spec.name)
-        # 3) 重名校验（R10.5）
+        # 3) 历史窗口必须为正整数
+        self._validate_lookback(spec.lookback)
+        # 4) 重名校验（R10.5）
         self._check_duplicate(spec.name)
 
         # 全部通过 -> 原子追加
@@ -182,24 +195,31 @@ class Registry:
 
     def register_operator(self, spec: OperatorSpec) -> None:
         """注册单个 Operator（R10.1）。校验全部通过后才追加，否则注册表不变。"""
-        # 1) 必填字段校验（R10.7）：name / arity / transform
+        # 1) 必填字段校验（R10.7）：name / arity / transform / lookback
         #    arity 为 0 是合法值，故用「是否为 None」判断缺失而非真值判断。
         self._require_fields(
             spec,
-            {"name": "name", "arity": "arity", "transform": "transform"},
+            {
+                "name": "name",
+                "arity": "arity",
+                "transform": "transform",
+                "lookback": "lookback",
+            },
         )
         # 2) name 合法性（R10.1）
         _validate_name(spec.name)
         # 3) arity 类型与范围（R10.8）：必须为 0..10 的整数（bool 不算整数）
         self._validate_arity(spec.arity)
-        # 4) arity 与 transform 实际操作数一致性（R10.6）
+        # 4) 历史窗口必须为正整数
+        self._validate_lookback(spec.lookback)
+        # 5) arity 与 transform 实际操作数一致性（R10.6）
         observed = _observed_arity(spec.transform)
         if observed is not None and observed != spec.arity:
             raise ArityMismatchError(
                 f"算子 '{spec.name}' 声明 arity={spec.arity}，"
                 f"但 transform 实际消费 {observed} 个操作数"
             )
-        # 5) 重名校验（R10.5）
+        # 6) 重名校验（R10.5）
         self._check_duplicate(spec.name)
 
         # 全部通过 -> 原子追加
@@ -226,6 +246,19 @@ class Registry:
         if not (_ARITY_MIN <= arity <= _ARITY_MAX):
             raise InvalidArityError(
                 f"arity 必须为 {_ARITY_MIN}..{_ARITY_MAX} 的整数，实际为 {arity}"
+            )
+
+    @staticmethod
+    def _validate_lookback(lookback) -> None:
+        """校验 lookback 为正整数；bool 虽是 int 子类也必须拒绝。"""
+        if isinstance(lookback, bool) or not isinstance(lookback, int):
+            raise InvalidLookbackError(
+                "lookback 必须为正整数，"
+                f"实际类型为 {type(lookback).__name__}"
+            )
+        if lookback < 1:
+            raise InvalidLookbackError(
+                f"lookback 必须为正整数，实际为 {lookback}"
             )
 
     def _check_duplicate(self, name: str) -> None:
