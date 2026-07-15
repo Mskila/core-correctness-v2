@@ -1,269 +1,447 @@
-# Feature: mt5-alphagpt-refactor, Property 1: MT5DataFetcher 返回规范 DataFrame
-# Feature: mt5-alphagpt-refactor, Property 2: 多品种时间轴对齐不变量
-"""
-Property-based tests for data_pipeline.
-Property 1 Validates: Requirements 2.3, 2.5, 2.6
-Property 2 Validates: Requirements 3.2, 3.3
-"""
+"""Property tests for the V2 market-data contract."""
 
-import sys
-import types
+from __future__ import annotations
+
+import math
+from unittest.mock import MagicMock, patch
+
+from hypothesis import given, settings, strategies as st
 import numpy as np
 import pandas as pd
 import pytest
-from unittest.mock import MagicMock, patch
-from hypothesis import given, settings, strategies as st, assume
+import torch
 
+from data_pipeline.data_manager import MT5DataManager, compute_forward_open_returns
+from data_pipeline.validation import canonicalize_ohlcv
+from model_core.semantics import DataValidationError
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _make_fake_rates(n: int = 5) -> np.ndarray:
-    """Build a fake numpy structured array matching the MT5 rates format."""
-    dtype = np.dtype([
-        ("time", np.int64),
-        ("open", np.float64),
-        ("high", np.float64),
-        ("low", np.float64),
-        ("close", np.float64),
-        ("tick_volume", np.int64),
-        ("spread", np.int32),
-        ("real_volume", np.int64),
-    ])
+    dtype = np.dtype(
+        [
+            ("time", np.int64),
+            ("open", np.float64),
+            ("high", np.float64),
+            ("low", np.float64),
+            ("close", np.float64),
+            ("tick_volume", np.int64),
+            ("spread", np.int32),
+            ("real_volume", np.int64),
+        ]
+    )
     data = np.zeros(n, dtype=dtype)
-    data["time"] = np.arange(n, dtype=np.int64) * 3600
+    data["time"] = 1_700_000_000 + np.arange(n, dtype=np.int64) * 3600
     data["open"] = 1800.0 + np.arange(n, dtype=np.float64)
     data["high"] = data["open"] + 2.0
     data["low"] = data["open"] - 2.0
     data["close"] = data["open"] + 0.5
-    data["tick_volume"] = np.ones(n, dtype=np.int64) * 100
+    data["tick_volume"] = 100
     return data
 
 
-# ── Strategies ────────────────────────────────────────────────────────────────
+def _make_symbol_df(
+    timestamps: list[int], base_price: float = 100.0
+) -> pd.DataFrame:
+    n = len(timestamps)
+    # Alignment is the property under test; keep generated training values
+    # exactly representable in float32 so the canonical downcast gate is not
+    # the competing behavior under test.
+    opens = base_price + np.arange(n, dtype=np.float64) / 8.0
+    return pd.DataFrame(
+        {
+            "time": np.array(timestamps, dtype=np.int64),
+            "open": opens,
+            "high": opens + 2.0,
+            "low": opens - 2.0,
+            "close": opens + 0.5,
+            "tick_volume": np.full(n, 500, dtype=np.int64),
+        }
+    )
 
-# Valid printable ASCII symbol strings (1–12 chars), e.g. "XAUUSD", "EURUSD"
+
 symbol_strategy = st.text(
     alphabet=st.characters(whitelist_categories=("Lu", "Ll", "Nd")),
     min_size=1,
     max_size=12,
 )
-
-# MT5 timeframe constants are positive integers
 timeframe_strategy = st.integers(min_value=1, max_value=49153)
 
 
-# ── Property 1: MT5DataFetcher 返回规范 DataFrame ─────────────────────────────
-# Validates: Requirements 2.3, 2.5, 2.6
-
-EXPECTED_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume"]
-
-
 @settings(max_examples=100)
-@given(
-    symbol=symbol_strategy,
-    timeframe=timeframe_strategy,
-)
-def test_property1_fetcher_returns_canonical_dataframe(symbol: str, timeframe: int):
-    """
-    For any valid symbol / timeframe combination, when MT5DataFetcher.fetch()
-    succeeds, the returned DataFrame must contain exactly the columns
-    [time, open, high, low, close, tick_volume] and at least 1 row.
-
-    Validates: Requirements 2.3, 2.5, 2.6
-    """
+@given(symbol=symbol_strategy, timeframe=timeframe_strategy)
+def test_fetcher_returns_canonical_dataframe_when_mt5_succeeds(
+    symbol: str, timeframe: int
+) -> None:
     fake_rates = _make_fake_rates(n=5)
-
-    # Build a minimal mock mt5 module so _MT5_AVAILABLE is True at runtime
     mock_mt5 = MagicMock()
     mock_mt5.copy_rates_from_pos.return_value = fake_rates
     mock_mt5.initialize.return_value = True
     mock_mt5.last_error.return_value = (0, "No error")
 
-    with patch("data_pipeline.fetcher.mt5", mock_mt5), \
-         patch("data_pipeline.fetcher._MT5_AVAILABLE", True):
-
+    with (
+        patch("data_pipeline.fetcher.mt5", mock_mt5),
+        patch("data_pipeline.fetcher._MT5_AVAILABLE", True),
+        patch("data_pipeline.kline_cache.KlineCache.get", return_value=None),
+    ):
         from data_pipeline.fetcher import MT5DataFetcher
+
         fetcher = MT5DataFetcher()
-        df = fetcher.fetch(symbol, timeframe, count=5)
+        fetcher.connect()
+        frame = fetcher.fetch(symbol, timeframe, count=5)
 
-    # ── Assertions ────────────────────────────────────────────────────────────
-    assert isinstance(df, pd.DataFrame), "fetch() must return a pandas DataFrame"
-    assert list(df.columns) == EXPECTED_COLUMNS, (
-        f"DataFrame columns must be exactly {EXPECTED_COLUMNS}, got {list(df.columns)}"
-    )
-    assert len(df) > 0, "DataFrame must have at least 1 row when MT5 returns data"
-
-    # Also verify copy_rates_from_pos was called with the correct positional args
+    assert list(frame.columns) == [
+        "time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "tick_volume",
+    ]
+    assert len(frame) == 5
     mock_mt5.copy_rates_from_pos.assert_called_once_with(symbol, timeframe, 0, 5)
 
-
-# Feature: mt5-alphagpt-refactor, Property 5: 目标收益率 open-to-open 公式
-# Validates: Requirements 3.4
-
-import math
-import torch
-from data_pipeline.data_manager import MT5DataManager
-
-
-# ── Property 5: target_ret[t] == log(open[t+2] / open[t+1])，边界为 0 ─────────
-# Validates: Requirements 3.4
 
 @settings(max_examples=100)
 @given(
     open_prices=st.lists(
-        st.floats(min_value=0.01, max_value=10000.0, allow_nan=False, allow_infinity=False),
-        min_size=10,
+        st.floats(
+            min_value=0.01,
+            max_value=10_000.0,
+            allow_nan=False,
+            allow_infinity=False,
+        ),
+        min_size=3,
         max_size=200,
     ),
-    n_symbols=st.integers(min_value=1, max_value=2),
+    n_symbols=st.integers(min_value=1, max_value=3),
 )
-def test_property5_target_ret_formula(open_prices: list, n_symbols: int):
-    """
-    For any sequence of positive open prices of length T (T >= 10),
-    MT5DataManager._compute_target_ret() must satisfy:
-      - output shape == (N, T)
-      - target_ret[n, t] == log(open[n, t+2] / open[n, t+1]) for all t in [0, T-3]
-      - target_ret[n, T-2] == 0.0  (boundary)
-      - target_ret[n, T-1] == 0.0  (boundary)
+def test_forward_return_formula_and_mask_hold_for_positive_prices(
+    open_prices: list[float], n_symbols: int
+) -> None:
+    row = torch.tensor(open_prices, dtype=torch.float64)
+    opens = row.unsqueeze(0).expand(n_symbols, len(row)).clone()
 
-    Validates: Requirements 3.4
-    """
-    t = len(open_prices)
-    n = n_symbols
+    returns, valid = compute_forward_open_returns(opens)
 
-    # Build open tensor of shape [N, T] — each symbol row gets the same prices
-    # (we only assert on row 0 for the formula; boundaries apply to all rows)
-    row = torch.tensor(open_prices, dtype=torch.float32)
-    open_tensor = row.unsqueeze(0).expand(n, t).clone()  # [N, T]
-
-    target_ret = MT5DataManager._compute_target_ret(open_tensor)
-
-    # ── Shape invariant ───────────────────────────────────────────────────
-    assert target_ret.shape == (n, t), (
-        f"Expected shape ({n}, {t}), got {target_ret.shape}"
-    )
-
-    # ── Formula correctness for all valid indices (row 0) ─────────────────
-    for idx in range(t - 2):
+    assert returns.shape == valid.shape == opens.shape
+    for idx in range(len(open_prices) - 2):
         expected = math.log(open_prices[idx + 2] / open_prices[idx + 1])
-        actual = target_ret[0, idx].item()
-        assert abs(actual - expected) < 1e-4, (
-            f"target_ret[0, {idx}] = {actual:.6f}, expected log({open_prices[idx+2]}"
-            f" / {open_prices[idx+1]}) = {expected:.6f}"
-        )
-
-    # ── Boundary invariant ────────────────────────────────────────────────
-    assert target_ret[0, t - 2].item() == 0.0, (
-        f"Boundary target_ret[0, T-2] must be 0.0, got {target_ret[0, t - 2].item()}"
-    )
-    assert target_ret[0, t - 1].item() == 0.0, (
-        f"Boundary target_ret[0, T-1] must be 0.0, got {target_ret[0, t - 1].item()}"
-    )
-
-
-# ── Property 2: 多品种时间轴对齐不变量 ───────────────────────────────────────
-# Feature: mt5-alphagpt-refactor, Property 2: 多品种时间轴对齐不变量
-# Validates: Requirements 3.2, 3.3
-
-# Fields that raw_dict must contain
-RAW_DICT_FIELDS = ["open", "high", "low", "close", "volume"]
-
-
-def _make_symbol_df(timestamps: list[int], base_price: float = 100.0) -> pd.DataFrame:
-    """Build a minimal OHLCV DataFrame for a given list of timestamps."""
-    n = len(timestamps)
-    opens = np.full(n, base_price, dtype=np.float64)
-    highs = opens + 2.0
-    lows  = opens - 2.0
-    closes = opens + 0.5
-    volumes = np.ones(n, dtype=np.float64) * 500.0
-    return pd.DataFrame({
-        "time":        np.array(timestamps, dtype=np.int64),
-        "open":        opens,
-        "high":        highs,
-        "low":         lows,
-        "close":       closes,
-        "tick_volume": volumes.astype(np.int64),
-    })
+        assert returns[0, idx].item() == pytest.approx(expected)
+    assert not valid[:, -2:].any()
+    assert torch.equal(returns[:, -2:], torch.zeros_like(returns[:, -2:]))
 
 
 @st.composite
 def multi_symbol_dfs(draw) -> dict[str, pd.DataFrame]:
-    """
-    Generate 2–4 symbols, each with a different set of timestamps.
-    Some symbols share timestamps, some have gaps — modelling real MT5 data.
-    """
-    # Build a common pool of timestamps (sorted integers, step = 3600)
-    pool_size = draw(st.integers(min_value=10, max_value=60))
+    common_size = draw(st.integers(min_value=3, max_value=20))
+    symbol_count = draw(st.integers(min_value=2, max_value=4))
     base_ts = 1_700_000_000
-    all_timestamps = [base_ts + i * 3600 for i in range(pool_size)]
-
-    num_symbols = draw(st.integers(min_value=2, max_value=4))
-
-    dfs: dict[str, pd.DataFrame] = {}
-    for idx in range(num_symbols):
-        symbol = f"SYM{idx}"
-        # Each symbol gets a random subset of the pool (at least 10 timestamps)
-        chosen_count = draw(st.integers(min_value=10, max_value=pool_size))
-        # Always take a contiguous slice so the symbol is "valid" (>= MIN_BARS mock)
-        start = draw(st.integers(min_value=0, max_value=pool_size - chosen_count))
-        timestamps = all_timestamps[start : start + chosen_count]
-        base_price = draw(st.floats(min_value=1.0, max_value=5000.0,
-                                    allow_nan=False, allow_infinity=False))
-        dfs[symbol] = _make_symbol_df(timestamps, base_price=base_price)
-
-    return dfs
+    common = [base_ts + offset * 3600 for offset in range(common_size)]
+    frames: dict[str, pd.DataFrame] = {}
+    for idx in range(symbol_count):
+        prefix = draw(st.integers(min_value=0, max_value=3))
+        suffix = draw(st.integers(min_value=0, max_value=3))
+        unique_prefix = [
+            base_ts - ((idx + 1) * 10 + offset + 1) * 3600
+            for offset in reversed(range(prefix))
+        ]
+        unique_suffix = [
+            base_ts + (common_size + (idx + 1) * 10 + offset) * 3600
+            for offset in range(suffix)
+        ]
+        frame = _make_symbol_df(
+            sorted(unique_prefix + common + unique_suffix),
+            base_price=100.0 + idx * 100.0,
+        )
+        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        frames[f"SYM{idx}"] = frame
+    return frames
 
 
 @settings(max_examples=100)
-@given(raw_dfs=multi_symbol_dfs())
-def test_property2_timeline_alignment_t_dimension_identical(raw_dfs: dict):
-    """
-    For any group of symbol DataFrames with different starting timestamps or
-    gaps, after MT5DataManager._align_timelines() and _build_raw_dict(), all
-    fields in raw_dict must have the same T dimension, i.e., every symbol
-    shares a single common timeline length.
+@given(frames=multi_symbol_dfs())
+def test_alignment_keeps_exact_real_intersection_without_future_fill(
+    frames: dict[str, pd.DataFrame]
+) -> None:
+    fetcher = MagicMock()
+    fetcher.fetch.side_effect = lambda symbol, timeframe, count: frames[symbol].copy()
+    manager = MT5DataManager(fetcher)
 
-    Validates: Requirements 3.2, 3.3
-    """
-    from data_pipeline.data_manager import MT5DataManager
+    manager.load(list(frames))
 
-    # We need a minimal MT5DataFetcher stub — no real MT5 needed
-    mock_fetcher = MagicMock()
+    source_sets = [set(frame["time"].tolist()) for frame in frames.values()]
+    expected_times = set.intersection(*source_sets)
+    expected_ns = {int(value.value) for value in expected_times}
+    actual_ns = set(manager.bar_time[0].tolist())
+    assert actual_ns == expected_ns
+    assert manager.bar_time.shape == manager.target_ret.shape
+    for row in manager.bar_time.tolist():
+        assert set(row) == expected_ns
 
-    mgr = MT5DataManager(fetcher=mock_fetcher)
-    # Manually set _symbols so _build_raw_dict knows the order
-    mgr._symbols = list(raw_dfs.keys())
 
-    # ── Step 1: align timelines ───────────────────────────────────────────
-    aligned = mgr._align_timelines(raw_dfs)
+@settings(max_examples=50)
+@given(
+    offsets=st.lists(
+        st.integers(min_value=0, max_value=100),
+        min_size=3,
+        max_size=30,
+        unique=True,
+    )
+)
+def test_canonicalization_never_invents_timestamps(offsets: list[int]) -> None:
+    timestamps = [1_700_000_000 + offset * 3600 for offset in offsets]
+    frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=17)
 
-    # All aligned DataFrames must have the same number of rows
-    row_counts = {sym: len(df) for sym, df in aligned.items()}
-    assert len(set(row_counts.values())) == 1, (
-        f"Aligned DataFrames have different row counts: {row_counts}"
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="s",
     )
 
-    # ── Step 2: build raw_dict ────────────────────────────────────────────
-    raw_dict = mgr._build_raw_dict(aligned)
+    expected_ns = {value * 1_000_000_000 for value in timestamps}
+    actual_ns = set(result.frame["time"].astype("int64").tolist())
+    assert actual_ns == expected_ns
+    assert len(result.frame) == len(frame)
 
-    # All fields must exist
-    for field in RAW_DICT_FIELDS:
-        assert field in raw_dict, f"raw_dict is missing field '{field}'"
 
-    # Collect T dimension for every field
-    t_dims = {field: raw_dict[field].shape[1] for field in RAW_DICT_FIELDS}
-    unique_t = set(t_dims.values())
+@settings(max_examples=25)
+@given(
+    mutation=st.sampled_from(["duplicate", "nan", "positive_infinity"]),
+    periods=st.integers(min_value=3, max_value=30),
+)
+def test_duplicate_and_non_finite_inputs_raise_domain_errors(
+    mutation: str, periods: int
+) -> None:
+    timestamps = [1_700_000_000 + idx * 3600 for idx in range(periods)]
+    frame = _make_symbol_df(timestamps)
+    if mutation == "duplicate":
+        frame = pd.concat([frame, frame.iloc[[0]]], ignore_index=True)
+    elif mutation == "nan":
+        frame.loc[0, "open"] = float("nan")
+    else:
+        frame["tick_volume"] = frame["tick_volume"].astype("float64")
+        frame.loc[periods - 1, "tick_volume"] = float("inf")
 
-    assert len(unique_t) == 1, (
-        f"raw_dict fields have inconsistent T dimensions: {t_dims}"
-    )
-
-    # ── Step 3: shape must be [N, T] ──────────────────────────────────────
-    n = len(raw_dfs)
-    t = next(iter(unique_t))
-    for field in RAW_DICT_FIELDS:
-        shape = raw_dict[field].shape
-        assert shape == (n, t), (
-            f"raw_dict['{field}'] shape is {shape}, expected ({n}, {t})"
+    with pytest.raises(DataValidationError):
+        canonicalize_ohlcv(
+            frame,
+            symbol="EURUSD",
+            timeframe="H1",
+            numeric_time_unit="s",
         )
+
+
+@settings(max_examples=40)
+@given(
+    unit=st.sampled_from(
+        [
+            ("s", 1_700_000_000, 3_600, 1_000_000_000),
+            ("ms", 1_700_000_000_000, 3_600_000, 1_000_000),
+            ("us", 1_700_000_000_000_000, 3_600_000_000, 1_000),
+            ("ns", 1_700_000_000_000_000_000, 3_600_000_000_000, 1),
+        ]
+    ),
+    gaps=st.lists(
+        st.integers(min_value=1, max_value=24),
+        min_size=2,
+        max_size=12,
+    ),
+)
+def test_integer_epoch_units_preserve_exact_identity_with_long_gaps(
+    unit: tuple[str, int, int, int],
+    gaps: list[int],
+) -> None:
+    name, base, cadence, ns_factor = unit
+    offsets = [0]
+    for gap in gaps:
+        offsets.append(offsets[-1] + gap)
+    timestamps = [base + offset * cadence for offset in offsets]
+    frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=23)
+
+    dataset = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=name,
+    )
+
+    expected_ns = [timestamp * ns_factor for timestamp in timestamps]
+    assert dataset.frame["time"].astype("int64").tolist() == expected_ns
+    assert dataset.identity.start_time_ns == expected_ns[0]
+    assert dataset.identity.end_time_ns == expected_ns[-1]
+    assert dataset.gap_count == sum(gap > 1 for gap in gaps)
+
+
+@st.composite
+def _pure_near_epoch_multiple_case(
+    draw: st.DrawFn,
+) -> tuple[str, list[int], list[int], list[int], int]:
+    unit, unit_ns = draw(
+        st.sampled_from(
+            [("s", 1_000_000_000), ("ms", 1_000_000), ("us", 1_000), ("ns", 1)]
+        )
+    )
+    length = draw(st.integers(min_value=3, max_value=8))
+    gaps = draw(
+        st.lists(
+            st.integers(min_value=2, max_value=32),
+            min_size=length - 1,
+            max_size=length - 1,
+        )
+    )
+    offsets = [0]
+    for gap in gaps:
+        offsets.append(offsets[-1] + gap)
+    base_mode = draw(
+        st.sampled_from(("negative", "epoch_zero", "cross_epoch", "positive"))
+    )
+    if base_mode == "negative":
+        base_ns = -(offsets[-1] + 5) * 3_600_000_000_000
+    elif base_mode == "epoch_zero":
+        base_ns = 0
+    elif base_mode == "cross_epoch":
+        base_ns = -offsets[length // 2] * 3_600_000_000_000
+    else:
+        base_ns = 1_700_000_000_000_000_000
+    semantic_ns = [
+        base_ns + offset * 3_600_000_000_000 for offset in offsets
+    ]
+    encoded = [timestamp_ns // unit_ns for timestamp_ns in semantic_ns]
+    order_mode = draw(st.sampled_from(("forward", "reverse", "rotate")))
+    order = list(range(length))
+    if order_mode == "reverse":
+        order.reverse()
+    elif order_mode == "rotate":
+        pivot = draw(st.integers(min_value=1, max_value=length - 1))
+        order = order[pivot:] + order[:pivot]
+    return unit, encoded, order, semantic_ns, len(gaps)
+
+
+@settings(max_examples=200)
+@given(case=_pure_near_epoch_multiple_case())
+def test_pure_epoch_units_preserve_identity_when_all_gaps_are_multiples(
+    case: tuple[str, list[int], list[int], list[int], int],
+) -> None:
+    unit, encoded, order, semantic_ns, gap_count = case
+    frame = _make_symbol_df(encoded).iloc[order]
+
+    dataset = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
+
+    assert dataset.frame["time"].astype("int64").tolist() == semantic_ns
+    assert dataset.identity.start_time_ns == semantic_ns[0]
+    assert dataset.identity.end_time_ns == semantic_ns[-1]
+    assert dataset.gap_count == gap_count
+
+
+@settings(max_examples=100)
+@given(
+    base_seconds=st.integers(min_value=946_684_800, max_value=2_000_000_000),
+    gap_multiplier=st.integers(min_value=2, max_value=48),
+    units=st.sampled_from(
+        [
+            ("s", "ms", "ms"),
+            ("s", "ms", "us"),
+            ("ms", "s", "ms"),
+            ("ms", "ms", "s"),
+            ("ms", "us", "us"),
+        ]
+    ),
+)
+def test_mixed_epoch_units_are_rejected_at_cadence_multiples(
+    base_seconds: int,
+    gap_multiplier: int,
+    units: tuple[str, str, str],
+) -> None:
+    unit_ns = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000}
+    nominal_ns = 3_600_000_000_000
+    base_ns = base_seconds * 1_000_000_000
+    semantic_ns = [
+        base_ns + index * gap_multiplier * nominal_ns for index in range(3)
+    ]
+    encoded = [
+        timestamp_ns // unit_ns[unit]
+        for timestamp_ns, unit in zip(semantic_ns, units)
+    ]
+
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
+        canonicalize_ohlcv(
+            _make_symbol_df(encoded),
+            symbol="EURUSD",
+            timeframe="H1",
+        )
+
+
+_PROPERTY_TIME_UNIT_NS = {
+    "s": 1_000_000_000,
+    "ms": 1_000_000,
+    "us": 1_000,
+    "ns": 1,
+}
+_PROPERTY_UNIT_PAIRS = [
+    (left, right)
+    for left in _PROPERTY_TIME_UNIT_NS
+    for right in _PROPERTY_TIME_UNIT_NS
+    if left != right
+]
+
+
+@st.composite
+def _mixed_lattice_insertion_case(
+    draw: st.DrawFn,
+) -> tuple[list[int], list[int]]:
+    length = draw(st.integers(min_value=4, max_value=8))
+    multiplier = draw(st.integers(min_value=1, max_value=16))
+    minority_unit, majority_unit = draw(st.sampled_from(_PROPERTY_UNIT_PAIRS))
+    third_unit = draw(
+        st.one_of(
+            st.none(),
+            st.sampled_from(
+                [
+                    unit
+                    for unit in _PROPERTY_TIME_UNIT_NS
+                    if unit not in (minority_unit, majority_unit)
+                ]
+            ),
+        )
+    )
+    base_seconds = draw(
+        st.integers(min_value=946_684_800, max_value=2_000_000_000)
+    )
+    offsets = [0, 2 * multiplier, 3 * multiplier, 4 * multiplier]
+    offsets.extend((5 + index) * multiplier for index in range(length - 4))
+    units = [minority_unit, *([majority_unit] * (length - 1))]
+    if third_unit is not None:
+        units[draw(st.integers(min_value=1, max_value=length - 1))] = third_unit
+
+    nominal_ns = 3_600_000_000_000
+    base_ns = base_seconds * 1_000_000_000
+    encoded = [
+        (base_ns + offset * nominal_ns) // _PROPERTY_TIME_UNIT_NS[unit]
+        for offset, unit in zip(offsets, units)
+    ]
+    order_mode = draw(st.sampled_from(("forward", "reverse", "rotate")))
+    order = list(range(length))
+    if order_mode == "reverse":
+        order.reverse()
+    elif order_mode == "rotate":
+        pivot = draw(st.integers(min_value=1, max_value=length - 1))
+        order = order[pivot:] + order[:pivot]
+    return encoded, order
+
+
+@settings(max_examples=200)
+@given(case=_mixed_lattice_insertion_case())
+def test_mixed_epoch_unit_lattice_insertions_are_rejected_for_arbitrary_lengths(
+    case: tuple[list[int], list[int]],
+) -> None:
+    encoded, order = case
+    frame = _make_symbol_df(encoded).iloc[order]
+
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
