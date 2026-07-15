@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -171,147 +170,17 @@ def _scaled_time_ns(value: int, unit: str) -> int | None:
     return scaled
 
 
-def _mixed_color_masks_for_component(
-    component_rows: list[int],
-    candidates_by_row: dict[int, list[tuple[int, int]]],
-) -> set[int]:
-    """Enumerate all unit-color masks of complete local quotient matchings."""
-    quotients = sorted(
-        {
-            quotient
-            for row in component_rows
-            for quotient, _unit_bit in candidates_by_row[row]
-        }
+def _normalize_numeric_time_unit(value: object) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TIME_UNIT_NS:
+            return normalized
+    raise DataValidationError(
+        "numeric time unit must be one of s, ms, us or ns"
     )
-    quotient_bit = {quotient: 1 << index for index, quotient in enumerate(quotients)}
-    states: dict[int, set[int]] = {0: {0}}
-    for row in sorted(component_rows, key=lambda item: len(candidates_by_row[item])):
-        next_states: dict[int, set[int]] = {}
-        for used_right, color_masks in states.items():
-            for quotient, unit_bit in candidates_by_row[row]:
-                right_bit = quotient_bit[quotient]
-                if used_right & right_bit:
-                    continue
-                destination = next_states.setdefault(used_right | right_bit, set())
-                destination.update(mask | unit_bit for mask in color_masks)
-        states = next_states
-        if not states:
-            return set()
-    return {
-        color_mask
-        for color_masks in states.values()
-        for color_mask in color_masks
-    }
 
 
-def _has_complete_mixed_quotient_matching(
-    candidates_by_row: dict[int, list[tuple[int, int]]],
-) -> bool:
-    """Find a full distinct-quotient matching whose nonzero rows mix units."""
-    rows_by_quotient: dict[int, set[int]] = {}
-    for row, options in candidates_by_row.items():
-        for quotient, _unit_bit in options:
-            rows_by_quotient.setdefault(quotient, set()).add(row)
-
-    remaining_rows = set(candidates_by_row)
-    component_masks: list[set[int]] = []
-    while remaining_rows:
-        start = remaining_rows.pop()
-        component_rows = {start}
-        pending = deque([start])
-        seen_quotients: set[int] = set()
-        while pending:
-            row = pending.popleft()
-            for quotient, _unit_bit in candidates_by_row[row]:
-                if quotient in seen_quotients:
-                    continue
-                seen_quotients.add(quotient)
-                for connected_row in rows_by_quotient[quotient]:
-                    if connected_row not in component_rows:
-                        component_rows.add(connected_row)
-                        remaining_rows.discard(connected_row)
-                        pending.append(connected_row)
-        masks = _mixed_color_masks_for_component(
-            sorted(component_rows),
-            candidates_by_row,
-        )
-        if not masks:
-            return False
-        component_masks.append(masks)
-
-    combined_masks = {0}
-    for masks in component_masks:
-        combined_masks = {left | right for left in combined_masks for right in masks}
-    return any(mask.bit_count() > 1 for mask in combined_masks)
-
-
-def _has_mixed_unit_lattice_evidence(
-    values: list[int],
-    *,
-    nominal_ns: int,
-) -> bool:
-    """Detect any complete mixed-unit interpretation on one cadence lattice."""
-    units = tuple(_TIME_UNIT_NS)
-    lattice: dict[int, dict[int, list[tuple[int, int]]]] = {}
-    for row_index, value in enumerate(values):
-        for unit_index, unit in enumerate(units):
-            timestamp_ns = _scaled_time_ns(value, unit)
-            if timestamp_ns is None:
-                continue
-            remainder = timestamp_ns % nominal_ns
-            quotient = (timestamp_ns - remainder) // nominal_ns
-            unit_bit = 0 if value == 0 else 1 << unit_index
-            lattice.setdefault(remainder, {}).setdefault(row_index, []).append(
-                (quotient, unit_bit)
-            )
-
-    for candidates_by_row in lattice.values():
-        if len(candidates_by_row) != len(values):
-            continue
-        if _has_complete_mixed_quotient_matching(candidates_by_row):
-            return True
-    return False
-
-
-def _select_pure_cadence_multiple_candidate(
-    candidates: list[tuple[str, list[int], int, bool, bool]],
-    *,
-    nominal_ns: int,
-) -> tuple[str, list[int], int, bool, bool] | None:
-    """Select the finest internally aligned pure-unit cadence candidate."""
-    aligned: list[tuple[int, tuple[str, list[int], int, bool, bool]]] = []
-    plausible_spans: list[int] = []
-    for candidate in candidates:
-        ordered_ns = sorted(candidate[1])
-        if len(ordered_ns) < 2:
-            continue
-        deltas = [
-            current - previous
-            for previous, current in zip(ordered_ns, ordered_ns[1:])
-        ]
-        span = ordered_ns[-1] - ordered_ns[0]
-        if candidate[3] or candidate[4]:
-            plausible_spans.append(span)
-        if all(
-            delta >= nominal_ns and delta % nominal_ns == 0
-            for delta in deltas
-        ):
-            aligned.append((span, candidate))
-
-    if not aligned:
-        return None
-    aligned.sort(key=lambda item: item[0])
-    selected_span, selected = aligned[0]
-    if any(span < selected_span for span in plausible_spans):
-        return None
-    return selected
-
-
-def _numeric_time_to_utc(
-    values: pd.Series,
-    *,
-    timeframe: str,
-) -> pd.Series:
+def _numeric_time_to_utc(values: pd.Series, *, unit: str) -> pd.Series:
     integers = _integer_numeric_timestamps(values)
     if not integers:
         return pd.Series(pd.to_datetime([], utc=True)).astype(
@@ -320,84 +189,29 @@ def _numeric_time_to_utc(
     if len(set(integers)) != len(integers):
         raise DataValidationError("duplicate timestamp")
 
-    nominal_ns = _TIMEFRAME_NS.get(timeframe)
-    candidates: list[tuple[str, list[int], int, bool, bool]] = []
-    for unit in _TIME_UNIT_NS:
-        scaled = [_scaled_time_ns(value, unit) for value in integers]
-        if any(value is None for value in scaled):
-            continue
-        scaled_ns = [int(value) for value in scaled if value is not None]
-        ordered_ns = sorted(scaled_ns)
-        deltas = [
-            current - previous
-            for previous, current in zip(ordered_ns, ordered_ns[1:])
-        ]
-        exact_count = (
-            sum(delta == nominal_ns for delta in deltas)
-            if nominal_ns is not None
-            else 0
-        )
-        spacing_valid = nominal_ns is not None and bool(
-            all(delta >= nominal_ns for delta in deltas)
-        )
-        span_aligned = (
-            nominal_ns is not None
-            and len(ordered_ns) > 1
-            and ordered_ns[-1] - ordered_ns[0] >= nominal_ns
-            and (ordered_ns[-1] - ordered_ns[0]) % nominal_ns == 0
-        )
-        candidates.append(
-            (unit, scaled_ns, exact_count, spacing_valid, span_aligned)
-        )
-
-    if not candidates:
-        raise DataValidationError("invalid time: timestamp cannot be converted to UTC")
-    if (
-        nominal_ns is not None
-        and len(integers) > 1
-        and _has_mixed_unit_lattice_evidence(
-            integers,
-            nominal_ns=nominal_ns,
-        )
-    ):
+    scaled = [_scaled_time_ns(value, unit) for value in integers]
+    if any(value is None for value in scaled):
         raise DataValidationError(
-            "mixed numeric timestamp units: values admit multiple epoch units "
-            "on one cadence lattice"
+            f"numeric timestamp is out of range for declared unit {unit}"
         )
-    best_exact = max(candidate[2] for candidate in candidates)
-    if best_exact > 0:
-        plausible = [candidate for candidate in candidates if candidate[2] == best_exact]
-    else:
-        plausible = [
-            candidate for candidate in candidates if candidate[3] or candidate[4]
-        ]
-    if len(plausible) != 1:
-        if nominal_ns is not None:
-            if best_exact == 0:
-                pure_candidate = _select_pure_cadence_multiple_candidate(
-                    candidates,
-                    nominal_ns=nominal_ns,
-                )
-                if pure_candidate is not None:
-                    plausible = [pure_candidate]
-        if len(plausible) == 1:
-            selected = plausible[0]
-        else:
-            raise DataValidationError(
-                "ambiguous numeric timestamp unit: cadence does not uniquely "
-                f"identify one epoch unit for timeframe {timeframe}"
-            )
-    else:
-        selected = plausible[0]
-
-    return pd.Series(pd.to_datetime(selected[1], unit="ns", utc=True)).astype(
+    scaled_ns = [int(value) for value in scaled if value is not None]
+    return pd.Series(pd.to_datetime(scaled_ns, unit="ns", utc=True)).astype(
         "datetime64[ns, UTC]"
     )
 
 
-def _to_utc_time(values: pd.Series, *, timeframe: str) -> pd.Series:
+def _to_utc_time(
+    values: pd.Series,
+    *,
+    numeric_time_unit: str | None,
+) -> pd.Series:
     if pd.api.types.is_numeric_dtype(values.dtype):
-        converted = _numeric_time_to_utc(values, timeframe=timeframe)
+        if numeric_time_unit is None:
+            raise DataValidationError(
+                "numeric timestamp unit provenance is required; pass "
+                "numeric_time_unit as s, ms, us or ns"
+            )
+        converted = _numeric_time_to_utc(values, unit=numeric_time_unit)
     else:
         if pd.api.types.is_object_dtype(values.dtype) and any(
             pd.api.types.is_number(value)
@@ -514,12 +328,18 @@ def canonicalize_ohlcv(
     *,
     symbol: str,
     timeframe: str | int,
+    numeric_time_unit: str | None = None,
 ) -> CanonicalDataset:
     """Validate and canonicalize an OHLCV frame without filling missing bars."""
     if not isinstance(frame, pd.DataFrame):
         raise DataValidationError("OHLCV input must be a pandas DataFrame")
 
     canonical_timeframe = normalize_timeframe_name(timeframe)
+    canonical_numeric_time_unit = (
+        _normalize_numeric_time_unit(numeric_time_unit)
+        if numeric_time_unit is not None
+        else None
+    )
     result = frame.copy()
     result.columns = [str(column).strip().lower() for column in result.columns]
     if result.columns.duplicated().any():
@@ -538,7 +358,7 @@ def canonicalize_ohlcv(
 
     converted_time = _to_utc_time(
         result["time"],
-        timeframe=canonical_timeframe,
+        numeric_time_unit=canonical_numeric_time_unit,
     )
     result["time"] = converted_time.array
     if result["time"].duplicated().any():

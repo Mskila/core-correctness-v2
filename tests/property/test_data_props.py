@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from itertools import product
 import math
 from unittest.mock import MagicMock, patch
 
@@ -15,51 +14,6 @@ import torch
 from data_pipeline.data_manager import MT5DataManager, compute_forward_open_returns
 from data_pipeline.validation import canonicalize_ohlcv
 from model_core.semantics import DataValidationError
-
-
-_H1_NS = 3_600_000_000_000
-_TIME_UNIT_NS = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000, "ns": 1}
-
-
-def _brute_mixed_numeric_interpretation(
-    values: list[int],
-) -> tuple[str, ...] | None:
-    """Exhaust per-row units independently of the production matching DP."""
-    candidates: list[list[tuple[str, int]]] = []
-    for value in values:
-        row = []
-        for unit, scale in _TIME_UNIT_NS.items():
-            timestamp_ns = value * scale
-            if pd.Timestamp.min.value <= timestamp_ns <= pd.Timestamp.max.value:
-                row.append((unit, timestamp_ns))
-        candidates.append(row)
-    common_remainders = set.intersection(
-        *[
-            {timestamp_ns % _H1_NS for _unit, timestamp_ns in row}
-            for row in candidates
-        ]
-    )
-    for remainder in common_remainders:
-        aligned = [
-            [
-                option
-                for option in row
-                if option[1] % _H1_NS == remainder
-            ]
-            for row in candidates
-        ]
-        for assignment in product(*aligned):
-            colors = {
-                unit
-                for value, (unit, _timestamp_ns) in zip(values, assignment)
-                if value != 0
-            }
-            if len(colors) < 2:
-                continue
-            timestamps_ns = [timestamp_ns for _unit, timestamp_ns in assignment]
-            if len(set(timestamps_ns)) == len(timestamps_ns):
-                return tuple(unit for unit, _timestamp_ns in assignment)
-    return None
 
 
 def _make_fake_rates(n: int = 5) -> np.ndarray:
@@ -237,14 +191,13 @@ def test_alignment_keeps_exact_real_intersection_without_future_fill(
 def test_canonicalization_never_invents_timestamps(offsets: list[int]) -> None:
     timestamps = [1_700_000_000 + offset * 3600 for offset in offsets]
     frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=17)
-    witness = _brute_mixed_numeric_interpretation(timestamps)
 
-    if witness is not None:
-        with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
-            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-        return
-
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="s",
+    )
 
     expected_ns = {value * 1_000_000_000 for value in timestamps}
     actual_ns = set(result.frame["time"].astype("int64").tolist())
@@ -271,7 +224,12 @@ def test_duplicate_and_non_finite_inputs_raise_domain_errors(
         frame.loc[periods - 1, "tick_volume"] = float("inf")
 
     with pytest.raises(DataValidationError):
-        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+        canonicalize_ohlcv(
+            frame,
+            symbol="EURUSD",
+            timeframe="H1",
+            numeric_time_unit="s",
+        )
 
 
 @settings(max_examples=40)
@@ -294,20 +252,19 @@ def test_integer_epoch_units_preserve_exact_identity_with_long_gaps(
     unit: tuple[str, int, int, int],
     gaps: list[int],
 ) -> None:
-    _name, base, cadence, ns_factor = unit
+    name, base, cadence, ns_factor = unit
     offsets = [0]
     for gap in gaps:
         offsets.append(offsets[-1] + gap)
     timestamps = [base + offset * cadence for offset in offsets]
     frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=23)
-    witness = _brute_mixed_numeric_interpretation(timestamps)
 
-    if witness is not None:
-        with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
-            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-        return
-
-    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    dataset = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=name,
+    )
 
     expected_ns = [timestamp * ns_factor for timestamp in timestamps]
     assert dataset.frame["time"].astype("int64").tolist() == expected_ns
@@ -319,8 +276,12 @@ def test_integer_epoch_units_preserve_exact_identity_with_long_gaps(
 @st.composite
 def _pure_near_epoch_multiple_case(
     draw: st.DrawFn,
-) -> tuple[list[int], list[int], list[int], int]:
-    unit_ns = draw(st.sampled_from([1_000_000_000, 1_000_000, 1_000, 1]))
+) -> tuple[str, list[int], list[int], list[int], int]:
+    unit, unit_ns = draw(
+        st.sampled_from(
+            [("s", 1_000_000_000), ("ms", 1_000_000), ("us", 1_000), ("ns", 1)]
+        )
+    )
     length = draw(st.integers(min_value=3, max_value=8))
     gaps = draw(
         st.lists(
@@ -354,27 +315,22 @@ def _pure_near_epoch_multiple_case(
     elif order_mode == "rotate":
         pivot = draw(st.integers(min_value=1, max_value=length - 1))
         order = order[pivot:] + order[:pivot]
-    return encoded, order, semantic_ns, len(gaps)
+    return unit, encoded, order, semantic_ns, len(gaps)
 
 
 @settings(max_examples=200)
 @given(case=_pure_near_epoch_multiple_case())
 def test_pure_epoch_units_preserve_identity_when_all_gaps_are_multiples(
-    case: tuple[list[int], list[int], list[int], int],
+    case: tuple[str, list[int], list[int], list[int], int],
 ) -> None:
-    encoded, order, semantic_ns, gap_count = case
+    unit, encoded, order, semantic_ns, gap_count = case
     frame = _make_symbol_df(encoded).iloc[order]
-    witness = _brute_mixed_numeric_interpretation(encoded)
-
-    if witness is not None:
-        with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
-            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-        return
 
     dataset = canonicalize_ohlcv(
         frame,
         symbol="EURUSD",
         timeframe="H1",
+        numeric_time_unit=unit,
     )
 
     assert dataset.frame["time"].astype("int64").tolist() == semantic_ns
@@ -413,7 +369,7 @@ def test_mixed_epoch_units_are_rejected_at_cadence_multiples(
         for timestamp_ns, unit in zip(semantic_ns, units)
     ]
 
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(
             _make_symbol_df(encoded),
             symbol="EURUSD",
@@ -487,5 +443,5 @@ def test_mixed_epoch_unit_lattice_insertions_are_rejected_for_arbitrary_lengths(
     encoded, order = case
     frame = _make_symbol_df(encoded).iloc[order]
 
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")

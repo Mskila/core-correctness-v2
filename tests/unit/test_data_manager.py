@@ -35,6 +35,15 @@ def _make_ohlcv_df(
     )
 
 
+def _make_mt5_seconds_df(offsets: list[int]) -> pd.DataFrame:
+    frame = _make_ohlcv_df(periods=len(offsets))
+    frame["time"] = np.array(
+        [1_700_000_000 + 3_600 * offset for offset in offsets],
+        dtype=np.int64,
+    )
+    return frame
+
+
 def _make_mock_fetcher(return_map: dict[str, pd.DataFrame]) -> MagicMock:
     fetcher = MagicMock()
     fetcher.fetch.side_effect = lambda symbol, timeframe, count: return_map[symbol].copy()
@@ -216,6 +225,46 @@ def test_mt5_manager_uses_only_real_intersection_and_exposes_v2_shapes() -> None
     assert len(manager.data_identities) == 2
     assert [identity.symbol for identity in manager.data_identities] == manager.symbols
     assert all(identity.bars == 4 for identity in manager.data_identities)
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [[0, 1, 2, 3, 4, 5], [0, 1, 3, 4, 8, 11]],
+    ids=["continuous", "legal-gaps"],
+)
+def test_mt5_manager_loads_declared_unix_seconds(offsets: list[int]) -> None:
+    frame = _make_mt5_seconds_df(offsets)
+    manager = MT5DataManager(_make_mock_fetcher({"EURUSD": frame}))
+
+    manager.load(["EURUSD"])
+
+    expected_ns = torch.tensor(
+        [[(1_700_000_000 + 3_600 * offset) * 1_000_000_000 for offset in offsets]],
+        dtype=torch.int64,
+    )
+    assert torch.equal(manager.bar_time, expected_ns)
+    assert manager.raw_dict["open"].shape == (1, len(offsets))
+    assert manager.target_valid[:, -2:].logical_not().all()
+
+
+def test_parquet_inspect_and_load_use_declared_unix_seconds(tmp_path: Path) -> None:
+    frame = _make_mt5_seconds_df([0, 1, 3, 4, 8, 11])
+    path = _write_parquet(tmp_path / "EURUSD_H1.parquet", frame)
+
+    info = inspect_parquet_file(path)
+    manager = ParquetDataManager(path)
+    manager.load()
+
+    expected_ns = torch.tensor(
+        [[
+            (1_700_000_000 + 3_600 * offset) * 1_000_000_000
+            for offset in [0, 1, 3, 4, 8, 11]
+        ]],
+        dtype=torch.int64,
+    )
+    assert info["valid"] is True
+    assert info["bars"] == 6
+    assert torch.equal(manager.bar_time, expected_ns)
 
 
 def test_mt5_manager_rejects_insufficient_intersection_with_coverage() -> None:

@@ -53,6 +53,7 @@ def inspect_parquet_file(path: str | Path) -> dict[str, Any]:
         pd.read_parquet(parquet_path),
         symbol=symbol,
         timeframe=timeframe,
+        numeric_time_unit="s",
     )
     float32_ohlcv_arrays(dataset.frame)
     span_seconds = (
@@ -101,6 +102,7 @@ class ParquetDataManager:
             pd.read_parquet(self.file_path),
             symbol=self.symbol,
             timeframe=self.timeframe,
+            numeric_time_unit="s",
         )
         if self.required_bars is not None:
             assert_minimum_bars(

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
-from itertools import combinations, product
-import random
 import warnings
 
 import numpy as np
@@ -12,8 +10,6 @@ import pytest
 
 from data_pipeline.validation import (
     DatasetIdentity,
-    _has_complete_mixed_quotient_matching,
-    _has_mixed_unit_lattice_evidence,
     assert_minimum_bars,
     canonicalize_ohlcv,
     float32_ohlcv_arrays,
@@ -75,47 +71,6 @@ _UNIQUE_PURE_NUMERIC_TIMES = {
         1_703_780_000_000_000_001,
     ],
 }
-
-
-def _brute_mixed_numeric_interpretation(
-    values: list[int],
-) -> tuple[str, ...] | None:
-    """Enumerate all per-row units without reusing the production DP."""
-    candidates: list[list[tuple[str, int]]] = []
-    for value in values:
-        row = []
-        for unit, scale in _TEST_TIME_UNIT_NS.items():
-            timestamp_ns = value * scale
-            if pd.Timestamp.min.value <= timestamp_ns <= pd.Timestamp.max.value:
-                row.append((unit, timestamp_ns))
-        candidates.append(row)
-    common_remainders = set.intersection(
-        *[
-            {timestamp_ns % _TEST_H1_NS for _unit, timestamp_ns in row}
-            for row in candidates
-        ]
-    )
-    for remainder in common_remainders:
-        aligned = [
-            [
-                option
-                for option in row
-                if option[1] % _TEST_H1_NS == remainder
-            ]
-            for row in candidates
-        ]
-        for assignment in product(*aligned):
-            colors = {
-                unit
-                for value, (unit, _timestamp_ns) in zip(values, assignment)
-                if value != 0
-            }
-            if len(colors) < 2:
-                continue
-            timestamps_ns = [timestamp_ns for _unit, timestamp_ns in assignment]
-            if len(set(timestamps_ns)) == len(timestamps_ns):
-                return tuple(unit for unit, _timestamp_ns in assignment)
-    return None
 
 
 def _frame_with_numeric_times(timestamps: list[int]) -> pd.DataFrame:
@@ -235,8 +190,18 @@ def test_numeric_time_preserves_rows_with_nonmonotonic_input_index() -> None:
     ).iloc[[2, 0, 1]]
     reset = frame.reset_index(drop=True)
 
-    retained_index = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-    reset_index = canonicalize_ohlcv(reset, symbol="EURUSD", timeframe="H1")
+    retained_index = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="s",
+    )
+    reset_index = canonicalize_ohlcv(
+        reset,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="s",
+    )
 
     pd.testing.assert_frame_equal(retained_index.frame, reset_index.frame)
     assert retained_index.identity == reset_index.identity
@@ -262,14 +227,19 @@ def _time_values_for_index_invariance(kind: str) -> list[object]:
         ("us", [(1_700_000_000 + index * 3_600) * 1_000_000 for index in range(6)]),
     ],
 )
-def test_replaced_index_vectors_are_oracle_ambiguous_and_replacements_are_unique(
+def test_numeric_index_vectors_round_trip_with_declared_source_unit(
     unit: str,
     legacy: list[int],
 ) -> None:
-    assert _brute_mixed_numeric_interpretation(legacy) is not None
-    assert (
-        _brute_mixed_numeric_interpretation(_UNIQUE_PURE_NUMERIC_TIMES[unit])
-        is None
+    dataset = canonicalize_ohlcv(
+        _frame_with_numeric_times(legacy),
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
+
+    assert dataset.frame["time"].astype("int64").tolist() == sorted(
+        value * _TEST_TIME_UNIT_NS[unit] for value in legacy
     )
 
 
@@ -293,11 +263,18 @@ def test_canonicalization_is_independent_of_input_index_labels(
     expected_input = frame.copy(deep=True)
     expected_index = frame.index.copy()
 
-    retained_index = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    numeric_time_unit = time_kind if time_kind in _TEST_TIME_UNIT_NS else None
+    retained_index = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=numeric_time_unit,
+    )
     reset_index = canonicalize_ohlcv(
         frame.reset_index(drop=True),
         symbol="EURUSD",
         timeframe="H1",
+        numeric_time_unit=numeric_time_unit,
     )
 
     pd.testing.assert_frame_equal(retained_index.frame, reset_index.frame)
@@ -318,7 +295,12 @@ def test_unsorted_rows_keep_time_ohlcv_and_volume_bound_together() -> None:
     frame.index = ["f", "c", "a", "e", "b", "d"]
     expected_input = frame.copy(deep=True)
 
-    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    dataset = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="ms",
+    )
 
     assert list(
         zip(
@@ -355,78 +337,110 @@ def test_mixed_numeric_timestamp_units_are_rejected() -> None:
         1_700_007_200_000,
     ]
 
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@pytest.mark.parametrize(
+    ("unit", "base", "step", "scale"),
+    [
+        ("s", 1_700_000_000, 3_600, 1_000_000_000),
+        ("ms", 1_700_000_000_000, 3_600_000, 1_000_000),
+        ("us", 1_700_000_000_000_000, 3_600_000_000, 1_000),
+        ("ns", 1_700_000_000_000_000_000, 3_600_000_000_000, 1),
+    ],
+)
+@pytest.mark.parametrize(
+    ("offsets", "expected_gap_count"),
+    [
+        ([0, 1, 2, 3, 4, 5], 0),
+        ([0, 1, 3, 4, 8, 11], 3),
+    ],
+    ids=["continuous", "legal-gaps"],
+)
+def test_explicit_numeric_time_unit_round_trips_real_cadence(
+    unit: str,
+    base: int,
+    step: int,
+    scale: int,
+    offsets: list[int],
+    expected_gap_count: int,
+) -> None:
+    timestamps = [base + step * offset for offset in offsets]
+
+    dataset = canonicalize_ohlcv(
+        _frame_with_numeric_times(timestamps),
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
+
+    assert dataset.frame["time"].astype("int64").tolist() == sorted(
+        value * scale for value in timestamps
+    )
+    assert dataset.gap_count == expected_gap_count
+
+
+@pytest.mark.parametrize(
+    "timestamps",
+    [
+        [1_700_000_000 + 3_600 * index for index in range(6)],
+        [3_600, 10_800_000, 14_400_000],
+        [-568_800_000, -565_200_000, -432_000_000, -255_600, -205_200_000],
+    ],
+    ids=["uniform-seconds", "three-row-mixed", "isolated-mixed"],
+)
+def test_untagged_numeric_time_requires_trusted_unit_provenance(
+    timestamps: list[int],
+) -> None:
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
+        canonicalize_ohlcv(
+            _frame_with_numeric_times(timestamps),
+            symbol="EURUSD",
+            timeframe="H1",
+        )
+
+
+@pytest.mark.parametrize("unit", ["minutes", "", True, 1])
+def test_numeric_time_unit_rejects_unknown_values(unit: object) -> None:
+    with pytest.raises(DataValidationError, match="numeric time unit"):
+        canonicalize_ohlcv(
+            _frame_with_numeric_times([1_700_000_000 + 3_600 * i for i in range(3)]),
+            symbol="EURUSD",
+            timeframe="H1",
+            numeric_time_unit=unit,  # type: ignore[arg-type]
+        )
+
+
+def test_explicit_numeric_time_unit_still_rejects_out_of_range_values() -> None:
+    timestamps = [pd.Timestamp.max.value - 3_600_000_000_000, pd.Timestamp.max.value + 1]
+
+    with pytest.raises(DataValidationError, match=r"range|convert"):
+        canonicalize_ohlcv(
+            _frame_with_numeric_times(timestamps),
+            symbol="EURUSD",
+            timeframe="H1",
+            numeric_time_unit="ns",
+        )
+
+
+def test_incorrect_declared_numeric_unit_still_fails_spacing_validation() -> None:
+    seconds = [1_700_000_000 + 3_600 * index for index in range(3)]
+
+    with pytest.raises(DataValidationError, match="shorter than timeframe"):
+        canonicalize_ohlcv(
+            _frame_with_numeric_times(seconds),
+            symbol="EURUSD",
+            timeframe="H1",
+            numeric_time_unit="ms",
+        )
 
 
 def test_three_bar_mixed_numeric_timestamp_units_near_epoch_are_rejected() -> None:
     frame = _frame_with_numeric_times([3_600, 10_800_000, 14_400_000])
 
-    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-
-
-def test_colored_matching_keeps_unmatched_right_paths() -> None:
-    candidates = {
-        0: [(0, 1), (3, 2)],
-        1: [(1, 1)],
-        2: [(2, 1)],
-    }
-
-    assert _has_complete_mixed_quotient_matching(candidates)
-
-
-def test_colored_matching_keeps_all_masks_for_the_same_used_rights() -> None:
-    candidates = {
-        0: [(0, 1), (0, 2)],
-        1: [(1, 1)],
-    }
-
-    assert _has_complete_mixed_quotient_matching(candidates)
-
-
-def test_colored_matching_combines_unit_colors_across_components() -> None:
-    candidates = {
-        0: [(0, 1)],
-        1: [(10, 2)],
-    }
-
-    assert _has_complete_mixed_quotient_matching(candidates)
-
-
-def test_colored_matching_rejects_quotient_collision_without_a_left_perfect_match() -> None:
-    candidates = {
-        0: [(0, 1)],
-        1: [(0, 2)],
-    }
-
-    assert not _has_complete_mixed_quotient_matching(candidates)
-
-
-def test_colored_matching_treats_raw_zero_as_unit_neutral() -> None:
-    candidates = {
-        0: [(0, 0)],
-        1: [(1, 1)],
-        2: [(2, 1)],
-    }
-
-    assert not _has_complete_mixed_quotient_matching(candidates)
-
-
-def test_colored_matching_is_row_permutation_invariant() -> None:
-    forward = {
-        0: [(0, 1), (3, 2)],
-        1: [(1, 1)],
-        2: [(2, 1)],
-    }
-    permuted = {
-        2: [(2, 1)],
-        0: [(3, 2), (0, 1)],
-        1: [(1, 1)],
-    }
-
-    assert _has_complete_mixed_quotient_matching(forward)
-    assert _has_complete_mixed_quotient_matching(permuted)
 
 
 @pytest.mark.parametrize(
@@ -452,12 +466,10 @@ def test_colored_matching_is_row_permutation_invariant() -> None:
     ],
     ids=["three-bar", "single-isolated", "three-isolated", "isolated-leading"],
 )
-def test_known_mixed_vectors_have_an_independent_bruteforce_witness(
+def test_known_mixed_vectors_require_unit_provenance(
     timestamps: list[int],
 ) -> None:
-    assert _brute_mixed_numeric_interpretation(timestamps) is not None
-
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(
             _frame_with_numeric_times(timestamps),
             symbol="EURUSD",
@@ -490,37 +502,36 @@ def test_known_mixed_vectors_have_an_independent_bruteforce_witness(
         ),
     ],
 )
-def test_four_unique_pure_numeric_controls_have_no_mixed_witness(
+def test_four_numeric_controls_round_trip_with_declared_unit(
     unit: str,
     timestamps: list[int],
 ) -> None:
-    assert _brute_mixed_numeric_interpretation(timestamps) is None
-
     dataset = canonicalize_ohlcv(
         _frame_with_numeric_times(timestamps),
         symbol="EURUSD",
         timeframe="H1",
+        numeric_time_unit=unit,
     )
 
     expected = sorted(value * _TEST_TIME_UNIT_NS[unit] for value in timestamps)
     assert dataset.frame["time"].astype("int64").tolist() == expected
 
 
-def test_colored_dp_matches_independent_bruteforce_on_small_numeric_sets() -> None:
-    values = [-7_200, -3_600, 0, 3_600, 3_600_000, 7_200_000, 1_700_000_000]
-    cases = [list(case) for length in (2, 3) for case in combinations(values, length)]
-    rng = random.Random(16)
-    for _ in range(200):
-        length = rng.randint(2, 6)
-        cases.append(rng.sample(range(-20_000_000, 20_000_000), length))
+@pytest.mark.parametrize("unit", [" S ", "MS", "Us", "nS"])
+def test_numeric_time_unit_is_case_and_whitespace_normalized(unit: str) -> None:
+    normalized = unit.strip().lower()
+    timestamps = _UNIQUE_PURE_NUMERIC_TIMES[normalized]
 
-    for timestamps in cases:
-        expected = _brute_mixed_numeric_interpretation(timestamps) is not None
-        actual = _has_mixed_unit_lattice_evidence(
-            timestamps,
-            nominal_ns=_TEST_H1_NS,
-        )
-        assert actual is expected, timestamps
+    dataset = canonicalize_ohlcv(
+        _frame_with_numeric_times(timestamps),
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
+
+    assert dataset.frame["time"].astype("int64").tolist() == sorted(
+        value * _TEST_TIME_UNIT_NS[normalized] for value in timestamps
+    )
 
 
 @pytest.mark.parametrize(
@@ -541,7 +552,7 @@ def test_colored_dp_matches_independent_bruteforce_on_small_numeric_sets() -> No
 def test_mixed_numeric_timestamp_units_do_not_depend_on_isolated_limits(
     timestamps: list[int],
 ) -> None:
-    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(
             _frame_with_numeric_times(timestamps),
             symbol="EURUSD",
@@ -557,7 +568,7 @@ def test_mixed_numeric_timestamp_units_at_double_cadence_are_rejected() -> None:
         1_700_014_400_000,
     ]
 
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
@@ -585,7 +596,7 @@ def test_mixed_numeric_timestamp_units_with_lattice_insertion_are_rejected() -> 
     )
     assert selected_exact == mixed_exact == 2
 
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(
             _frame_with_numeric_times(timestamps),
             symbol="EURUSD",
@@ -602,7 +613,7 @@ def test_isolated_leading_mixed_numeric_timestamp_unit_is_rejected() -> None:
         1_700_039_600_000_000,
     ]
 
-    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(
             _frame_with_numeric_times(timestamps),
             symbol="EURUSD",
@@ -640,7 +651,7 @@ def test_isolated_mixed_unit_pair_positions_are_rejected(
     units[isolated_position] = isolated_unit
     timestamps = _encode_semantic_times([0, 3, 4, 8, 11], units)
 
-    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(
             _frame_with_numeric_times(timestamps),
             symbol="EURUSD",
@@ -655,7 +666,7 @@ def test_isolated_mixed_unit_rejection_is_input_order_independent() -> None:
     )
     frame = _frame_with_numeric_times(timestamps).iloc[[3, 0, 4, 1, 2]]
 
-    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
@@ -665,7 +676,7 @@ def test_two_isolated_mixed_unit_rows_are_rejected() -> None:
         ["s", "us", "us", "us", "ms"],
     )
 
-    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(
             _frame_with_numeric_times(timestamps),
             symbol="EURUSD",
@@ -683,7 +694,7 @@ def test_two_isolated_mixed_unit_rows_are_rejected() -> None:
     ],
     ids=["modern", "negative", "epoch-zero"],
 )
-def test_epoch_origin_matrix_fails_closed_exactly_when_bruteforce_finds_mixed(
+def test_epoch_origin_matrix_round_trips_declared_unit(
     unit: str,
     base_ns: int,
 ) -> None:
@@ -696,14 +707,13 @@ def test_epoch_origin_matrix_fails_closed_exactly_when_bruteforce_finds_mixed(
         for timestamp_ns in semantic_ns
     ]
     frame = _frame_with_numeric_times(timestamps).iloc[[3, 0, 4, 1, 2]]
-    witness = _brute_mixed_numeric_interpretation(timestamps)
 
-    if witness is not None:
-        with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
-            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-        return
-
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
 
     assert result.frame["time"].astype("int64").tolist() == semantic_ns
     assert result.gap_count == 3
@@ -740,7 +750,10 @@ def test_mixed_epoch_unit_lattice_insertion_matrix_is_rejected() -> None:
                                 timeframe="H1",
                             )
                         except DataValidationError as exc:
-                            if "mixed numeric timestamp units" not in str(exc):
+                            if not (
+                                "provenance" in str(exc)
+                                or "unit provenance is required" in str(exc)
+                            ):
                                 wrong_errors.append(
                                     (
                                         minority_unit,
@@ -780,7 +793,7 @@ def test_three_epoch_unit_lattice_insertions_are_rejected(units: list[str]) -> N
     encoded = _encode_semantic_times([0, 2, 3, 4, 5], units)
     frame = _frame_with_numeric_times(encoded).iloc[[3, 0, 4, 1, 2]]
 
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
@@ -811,21 +824,22 @@ def test_mixed_numeric_timestamp_unit_combinations_at_cadence_multiples_are_reje
     frame = valid_frame().iloc[:3].copy()
     frame["time"] = encoded
 
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
 @pytest.mark.parametrize(
-    ("unit_ns", "gap_multipliers"),
+    ("unit", "unit_ns", "gap_multipliers"),
     [
-        (1_000_000_000, (2, 5)),
-        (1_000_000, (3, 7)),
-        (1_000, (4, 9)),
-        (1, (2, 11)),
+        ("s", 1_000_000_000, (2, 5)),
+        ("ms", 1_000_000, (3, 7)),
+        ("us", 1_000, (4, 9)),
+        ("ns", 1, (2, 11)),
     ],
     ids=["seconds", "milliseconds", "microseconds", "nanoseconds"],
 )
-def test_cadence_multiple_matrix_matches_bruteforce_ambiguity(
+def test_cadence_multiple_matrix_round_trips_declared_unit(
+    unit: str,
     unit_ns: int,
     gap_multipliers: tuple[int, int],
 ) -> None:
@@ -837,14 +851,13 @@ def test_cadence_multiple_matrix_matches_bruteforce_ambiguity(
     encoded = [timestamp_ns // unit_ns for timestamp_ns in semantic_ns]
     frame = valid_frame().iloc[:3].copy()
     frame["time"] = encoded[::-1]
-    witness = _brute_mixed_numeric_interpretation(encoded)
 
-    if witness is not None:
-        with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
-            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-        return
-
-    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    dataset = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
 
     assert dataset.frame["time"].astype("int64").tolist() == semantic_ns
     assert dataset.identity.start_time_ns == semantic_ns[0]
@@ -855,32 +868,32 @@ def test_cadence_multiple_matrix_matches_bruteforce_ambiguity(
 @pytest.mark.parametrize(
     ("unit", "unit_ns"),
     [
-        ("milliseconds", 1_000_000),
-        ("microseconds", 1_000),
-        ("nanoseconds", 1),
+        ("ms", 1_000_000),
+        ("us", 1_000),
+        ("ns", 1),
     ],
 )
-def test_subsecond_negative_triple_cadence_is_rejected_when_bruteforce_is_mixed(
+def test_subsecond_negative_triple_cadence_round_trips_declared_unit(
     unit: str,
     unit_ns: int,
 ) -> None:
     semantic_ns = [-6 * _TEST_H1_NS, -3 * _TEST_H1_NS, 0]
     encoded = [timestamp_ns // unit_ns for timestamp_ns in semantic_ns]
 
-    assert _brute_mixed_numeric_interpretation(encoded) is not None
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
-        canonicalize_ohlcv(
-            _frame_with_numeric_times(encoded),
-            symbol="EURUSD",
-            timeframe="H1",
-        )
+    dataset = canonicalize_ohlcv(
+        _frame_with_numeric_times(encoded),
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
+
+    assert dataset.frame["time"].astype("int64").tolist() == semantic_ns
 
 
-def test_numeric_epoch_matrix_matches_independent_bruteforce_ambiguity() -> None:
+def test_numeric_epoch_matrix_round_trips_generator_declared_unit() -> None:
     failures: list[tuple[object, ...]] = []
     cases = 0
-    ambiguous_cases = 0
-    unique_cases = 0
+    successful_cases = 0
     for unit, unit_ns in _TEST_TIME_UNIT_NS.items():
         for length in range(3, 9):
             gap_patterns = [
@@ -904,7 +917,6 @@ def test_numeric_epoch_matrix_matches_independent_bruteforce_ambiguity() -> None
                         base_ns + offset * _TEST_H1_NS for offset in offsets
                     ]
                     encoded = [value // unit_ns for value in semantic_ns]
-                    witness = _brute_mixed_numeric_interpretation(encoded)
                     orders = [
                         list(range(length)),
                         list(reversed(range(length))),
@@ -918,22 +930,11 @@ def test_numeric_epoch_matrix_matches_independent_bruteforce_ambiguity() -> None
                         cases += 1
                         frame = _frame_with_numeric_times(encoded).iloc[order]
                         try:
-                            if witness is not None:
-                                with pytest.raises(
-                                    DataValidationError,
-                                    match="mixed numeric timestamp units",
-                                ):
-                                    canonicalize_ohlcv(
-                                        frame,
-                                        symbol="EURUSD",
-                                        timeframe="H1",
-                                    )
-                                ambiguous_cases += 1
-                                continue
                             dataset = canonicalize_ohlcv(
                                 frame,
                                 symbol="EURUSD",
                                 timeframe="H1",
+                                numeric_time_unit=unit,
                             )
                             assert (
                                 dataset.frame["time"].astype("int64").tolist()
@@ -942,7 +943,7 @@ def test_numeric_epoch_matrix_matches_independent_bruteforce_ambiguity() -> None
                             assert dataset.identity.start_time_ns == semantic_ns[0]
                             assert dataset.identity.end_time_ns == semantic_ns[-1]
                             assert dataset.gap_count == len(gaps)
-                            unique_cases += 1
+                            successful_cases += 1
                             if expected_identity is None:
                                 expected_identity = dataset.identity
                             else:
@@ -960,10 +961,9 @@ def test_numeric_epoch_matrix_matches_independent_bruteforce_ambiguity() -> None
                             )
 
     assert cases == 1_440
-    assert ambiguous_cases == 1_080
-    assert unique_cases == 360
+    assert successful_cases == 1_440
     assert not failures, (
-        f"numeric-unit oracle mismatches: {len(failures)}/1440; {failures[:5]}"
+        f"declared-unit round-trip mismatches: {len(failures)}/1440; {failures[:5]}"
     )
 
 
@@ -971,7 +971,7 @@ def test_numeric_epoch_matrix_matches_independent_bruteforce_ambiguity() -> None
     ("unit", "unit_ns"),
     list(_TEST_TIME_UNIT_NS.items()),
 )
-def test_long_irregular_numeric_sequences_match_bruteforce_ambiguity(
+def test_long_irregular_numeric_sequences_round_trip_declared_unit(
     unit: str,
     unit_ns: int,
 ) -> None:
@@ -983,14 +983,13 @@ def test_long_irregular_numeric_sequences_match_bruteforce_ambiguity(
     semantic_ns = [base_ns + offset * _TEST_H1_NS for offset in offsets]
     encoded = [value // unit_ns for value in semantic_ns]
     frame = _frame_with_numeric_times(encoded).iloc[[7, 2, 0, 5, 1, 6, 3, 4]]
-    witness = _brute_mixed_numeric_interpretation(encoded)
 
-    if witness is not None:
-        with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
-            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-        return
-
-    dataset = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    dataset = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
 
     assert dataset.frame["time"].astype("int64").tolist() == semantic_ns
     assert dataset.gap_count == sum(gap > 1 for gap in gaps)
@@ -1005,7 +1004,12 @@ def test_consistent_early_milliseconds_can_cross_inference_boundary() -> None:
     ]
     frame["time"] = milliseconds
 
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="ms",
+    )
 
     expected = pd.to_datetime(milliseconds, unit="ms", utc=True).astype(
         "datetime64[ns, UTC]"
@@ -1019,7 +1023,12 @@ def test_epoch_zero_is_unit_neutral_for_consistent_early_milliseconds() -> None:
     milliseconds = [0, 99_999_999_000, 100_003_599_000]
     frame["time"] = milliseconds
 
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="ms",
+    )
 
     expected = pd.to_datetime(milliseconds, unit="ms", utc=True).astype(
         "datetime64[ns, UTC]"
@@ -1047,8 +1056,7 @@ def test_epoch_milliseconds_with_a_mixed_witness_fail_closed(
     frame = valid_frame().iloc[:3].copy()
     frame["time"] = milliseconds
 
-    assert _brute_mixed_numeric_interpretation(milliseconds) is not None
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
@@ -1057,7 +1065,12 @@ def test_numeric_time_unit_preserves_epoch_seconds_with_h1_cadence() -> None:
     seconds = [0, 3_600, 7_200]
     frame["time"] = seconds
 
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="s",
+    )
 
     expected = pd.to_datetime(seconds, unit="s", utc=True).astype(
         "datetime64[ns, UTC]"
@@ -1072,7 +1085,7 @@ def test_ambiguous_epoch_numeric_time_unit_is_rejected() -> None:
     frame = valid_frame().iloc[:3].copy()
     frame["time"] = [0, 1_800_000, 3_600_000]
 
-    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
@@ -1081,7 +1094,7 @@ def test_long_gap_numeric_times_with_a_valid_mixed_interpretation_are_ambiguous(
     milliseconds = [1_000_000, 100_000_000_000, 100_003_600_000]
     frame["time"] = milliseconds
 
-    with pytest.raises(DataValidationError, match=r"mixed|ambiguous"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
@@ -1090,7 +1103,12 @@ def test_uniquely_identified_milliseconds_allow_a_real_long_gap() -> None:
     milliseconds = [1_700_000_000_001, 1_800_000_800_001, 1_800_004_400_001]
     frame["time"] = milliseconds
 
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="ms",
+    )
 
     expected_ns = (
         pd.to_datetime(milliseconds, unit="ms", utc=True)
@@ -1105,21 +1123,30 @@ def test_uniquely_identified_milliseconds_allow_a_real_long_gap() -> None:
 
 
 @pytest.mark.parametrize(
-    "timestamps",
+    ("timestamps", "unit"),
     [
-        [0.0, 3_600.5, 7_200.0],
-        [1.0e18, 1.0e18 + 3_600_000_000_000, 1.0e18 + 7_200_000_000_000],
+        ([0.0, 3_600.5, 7_200.0], "s"),
+        (
+            [1.0e18, 1.0e18 + 3_600_000_000_000, 1.0e18 + 7_200_000_000_000],
+            "ns",
+        ),
     ],
     ids=["fractional", "lossy-float-ns"],
 )
 def test_float_numeric_timestamps_must_be_lossless_integers(
     timestamps: list[float],
+    unit: str,
 ) -> None:
     frame = valid_frame().iloc[:3].copy()
     frame["time"] = timestamps
 
     with pytest.raises(DataValidationError, match=r"integer|lossless"):
-        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+        canonicalize_ohlcv(
+            frame,
+            symbol="EURUSD",
+            timeframe="H1",
+            numeric_time_unit=unit,
+        )
 
 
 def test_out_of_range_integer_numeric_timestamps_are_rejected() -> None:
@@ -1127,8 +1154,13 @@ def test_out_of_range_integer_numeric_timestamps_are_rejected() -> None:
     start = pd.Timestamp.max.value + 1
     frame["time"] = [start, start + 3_600_000_000_000, start + 7_200_000_000_000]
 
-    with pytest.raises(DataValidationError, match="cannot be converted"):
-        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    with pytest.raises(DataValidationError, match=r"range|convert"):
+        canonicalize_ohlcv(
+            frame,
+            symbol="EURUSD",
+            timeframe="H1",
+            numeric_time_unit="ns",
+        )
 
 
 @pytest.mark.parametrize(
@@ -1238,7 +1270,12 @@ def test_extreme_in_range_ns_gap_does_not_overflow_spacing_check() -> None:
     timestamps = [pd.Timestamp.min.value, pd.Timestamp.max.value]
     frame["time"] = timestamps
 
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit="ns",
+    )
 
     assert result.frame["time"].astype("int64").tolist() == timestamps
     assert result.identity.start_time_ns == timestamps[0]
@@ -1283,7 +1320,12 @@ def test_integer_numeric_timestamp_units_have_stable_utc_identity(
     frame = valid_frame().iloc[:3].copy()
     frame["time"] = timestamps[::-1]
 
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="H1",
+        numeric_time_unit=unit,
+    )
 
     expected = [value * expected_ns for value in timestamps]
     assert result.frame["time"].astype("int64").tolist() == expected
@@ -1304,11 +1346,10 @@ def test_integer_numeric_timestamp_units_have_stable_utc_identity(
     ],
     ids=["seconds", "milliseconds", "microseconds"],
 )
-def test_legacy_identity_vectors_are_rejected_with_a_bruteforce_mixed_witness(
+def test_untagged_identity_vectors_are_rejected_without_unit_provenance(
     timestamps: list[int],
 ) -> None:
-    assert _brute_mixed_numeric_interpretation(timestamps) is not None
-    with pytest.raises(DataValidationError, match="mixed numeric timestamp units"):
+    with pytest.raises(DataValidationError, match=r"provenance|unit.*required"):
         canonicalize_ohlcv(
             _frame_with_numeric_times(timestamps),
             symbol="EURUSD",

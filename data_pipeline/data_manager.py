@@ -118,6 +118,7 @@ class MT5DataManager:
                 raw_frame,
                 symbol=symbol,
                 timeframe=timeframe,
+                numeric_time_unit="s",
             )
             canonical_frames[symbol] = dataset.frame
 
