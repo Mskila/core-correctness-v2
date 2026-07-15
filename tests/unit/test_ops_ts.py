@@ -325,6 +325,27 @@ class TestProductFiveFormula:
 
             torch.testing.assert_close(actual, expected, rtol=0, atol=2.0e-7)
 
+    def test_registry_transform_clamps_true_log_sum_at_both_limits(self):
+        target_log_sums = torch.tensor(
+            [12.0, -12.0, 9.5, -9.5], dtype=torch.float64
+        )
+        returns = torch.expm1(target_log_sums / 5.0).unsqueeze(1).repeat(1, 5)
+        product = next(
+            spec.transform
+            for spec in OPERATOR_REGISTRY.operator_specs
+            if spec.name == "PRODUCT_5"
+        )
+
+        raw_log_sums = torch.log1p(returns).sum(dim=1)
+        assert raw_log_sums[0] > 10.0
+        assert raw_log_sums[1] < -10.0
+        assert 9.0 < raw_log_sums[2] < 10.0
+        assert -10.0 < raw_log_sums[3] < -9.0
+
+        expected = torch.expm1(target_log_sums.clamp(-10.0, 10.0))
+        actual = product(returns)[:, -1]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     @pytest.mark.parametrize(
         ("dtype", "atol"),
         [(torch.float32, 2.0e-7), (torch.float64, 2.0e-15)],

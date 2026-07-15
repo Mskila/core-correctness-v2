@@ -197,7 +197,7 @@ def test_large_finite_float32_prefix_has_nonzero_output_and_finite_backward(
     assert torch.isfinite(x.grad).all()
 
 
-def test_large_close_values_apply_absolute_std_threshold_in_scaled_units() -> None:
+def test_large_close_values_use_stable_two_point_population_statistics() -> None:
     x = torch.tensor(
         [[1.0e20, 1.0e20 * (1.0 + 5.0e-7)]],
         dtype=torch.float32,
@@ -207,24 +207,30 @@ def test_large_close_values_apply_absolute_std_threshold_in_scaled_units() -> No
     observed = x.detach().to(torch.float64)
     absolute_centered = observed - observed.mean(dim=1, keepdim=True)
     absolute_std = absolute_centered.square().mean(dim=1).sqrt()
+    assert observed[0, 0].item() != observed[0, 1].item()
     assert absolute_std.item() > 1.0e-6
 
-    scale = x.detach().abs().amax(dim=1, keepdim=True)
-    scaled = x.detach() / scale
-    scaled_centered = scaled - scaled.mean(dim=1, keepdim=True)
-    scaled_std = scaled_centered.square().mean(dim=1).sqrt()
-    expected_second = scaled_centered[0, 1] / scaled_std[0]
-
     output = causal_rolling_zscore(x, window=2)
+    first_gradient = torch.autograd.grad(
+        output[0, 1], x, create_graph=True
+    )[0]
+    second_gradient = torch.autograd.grad(first_gradient.sum(), x)[0]
+
     torch.testing.assert_close(
-        output[0, 1], expected_second, rtol=0, atol=torch.finfo(x.dtype).eps
+        output,
+        torch.tensor([[0.0, 1.0]], dtype=x.dtype),
+        rtol=0,
+        atol=0,
     )
     assert torch.isfinite(output).all()
-    assert output[0, 1].item() != 0.0
-
-    output[0, 1].backward()
-    assert x.grad is not None and torch.isfinite(x.grad).all()
-    assert torch.count_nonzero(x.grad).item() == x.numel()
+    assert torch.isfinite(first_gradient).all()
+    assert torch.isfinite(second_gradient).all()
+    torch.testing.assert_close(
+        first_gradient, torch.zeros_like(x), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        second_gradient, torch.zeros_like(x), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("scale", [1.0e20, 3.0e38])

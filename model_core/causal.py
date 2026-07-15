@@ -86,8 +86,8 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
     # ``window * (2 * max_abs) ** 2`` then remains representable. Build the
     # risk mask causally from detached magnitudes so ordinary float32 keeps the
     # original graph, while a large future value can only switch its own and
-    # later windows to the scaled fallback.
-    use_scaled_fallback = False
+    # later windows to the high-precision fallback.
+    use_high_precision_fallback = False
     unsafe_windows = None
     if work.dtype == torch.float32:
         native_limit = 0.5 * math.sqrt(
@@ -110,7 +110,7 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
                 dim=1,
             )
         unsafe_windows = (risk_prefix - prior_risk) > 0
-        use_scaled_fallback = bool(unsafe_windows.any())
+        use_high_precision_fallback = bool(unsafe_windows.any())
 
     statistics_windows = (
         torch.where(
@@ -118,7 +118,7 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
             windows,
             torch.zeros_like(windows),
         )
-        if use_scaled_fallback
+        if use_high_precision_fallback
         else windows
     )
     means = (statistics_windows * weights).sum(dim=-1) / counts
@@ -127,7 +127,7 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
             "causal_rolling_zscore rolling mean is not finite"
         )
     centered = (statistics_windows - means.unsqueeze(-1)) * weights
-    if use_scaled_fallback:
+    if use_high_precision_fallback:
         safe_windows = ~unsafe_windows
     else:
         safe_windows = None
@@ -151,60 +151,57 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
     active = positive_variance & (
         standard_deviations > CAUSAL_ZSCORE_STD_THRESHOLD
     )
-    if use_scaled_fallback:
+    if use_high_precision_fallback:
         active = active & safe_windows
     denominators = torch.where(
         active, standard_deviations, torch.ones_like(standard_deviations)
     )
     native_means = (
         torch.where(safe_windows, means, work)
-        if use_scaled_fallback
+        if use_high_precision_fallback
         else means
     )
     normalized = (work - native_means) / denominators
     result = torch.where(active, normalized, torch.zeros_like(normalized))
 
-    if use_scaled_fallback:
-        fallback_windows = windows[unsafe_windows]
-        fallback_weights = weights[unsafe_windows]
-        fallback_counts = counts[unsafe_windows]
-        fallback_scales = fallback_windows.abs().amax(dim=-1)
-        scaled_windows = fallback_windows / fallback_scales.unsqueeze(-1)
-        scaled_means = (
-            (scaled_windows * fallback_weights).sum(dim=-1)
+    if use_high_precision_fallback:
+        fallback_windows = windows[unsafe_windows].to(torch.float64)
+        fallback_weights = weights[unsafe_windows].to(torch.float64)
+        fallback_counts = counts[unsafe_windows].to(torch.float64)
+        fallback_means = (
+            (fallback_windows * fallback_weights).sum(dim=-1)
             / fallback_counts
         )
-        scaled_centered = (
-            scaled_windows - scaled_means.unsqueeze(-1)
+        fallback_centered = (
+            fallback_windows - fallback_means.unsqueeze(-1)
         ) * fallback_weights
-        scaled_variances = (
-            scaled_centered.square().sum(dim=-1) / fallback_counts
+        fallback_variances = (
+            fallback_centered.square().sum(dim=-1) / fallback_counts
         )
-        positive_scaled_variance = scaled_variances > 0
-        scaled_sqrt_input = torch.where(
-            positive_scaled_variance,
-            scaled_variances,
-            torch.ones_like(scaled_variances),
+        positive_fallback_variance = fallback_variances > 0
+        fallback_sqrt_input = torch.where(
+            positive_fallback_variance,
+            fallback_variances,
+            torch.ones_like(fallback_variances),
         )
-        scaled_standard_deviations = scaled_sqrt_input.sqrt()
-        scaled_active = positive_scaled_variance & (
-            scaled_standard_deviations
-            > CAUSAL_ZSCORE_STD_THRESHOLD / fallback_scales
+        fallback_standard_deviations = fallback_sqrt_input.sqrt()
+        fallback_active = positive_fallback_variance & (
+            fallback_standard_deviations > CAUSAL_ZSCORE_STD_THRESHOLD
         )
-        scaled_denominators = torch.where(
-            scaled_active,
-            scaled_standard_deviations,
-            torch.ones_like(scaled_standard_deviations),
+        fallback_denominators = torch.where(
+            fallback_active,
+            fallback_standard_deviations,
+            torch.ones_like(fallback_standard_deviations),
         )
-        scaled_current = work[unsafe_windows] / fallback_scales
-        scaled_normalized = (
-            scaled_current - scaled_means
-        ) / scaled_denominators
+        fallback_current = work[unsafe_windows].to(torch.float64)
+        fallback_normalized = (
+            fallback_current - fallback_means
+        ) / fallback_denominators
         fallback_result = torch.where(
-            scaled_active,
-            scaled_normalized,
-            torch.zeros_like(scaled_normalized),
-        )
+            fallback_active,
+            fallback_normalized,
+            torch.zeros_like(fallback_normalized),
+        ).to(result.dtype)
         result = result + torch.zeros_like(result).masked_scatter(
             unsafe_windows, fallback_result
         )
