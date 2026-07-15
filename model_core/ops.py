@@ -271,9 +271,20 @@ def _ts_product(x: torch.Tensor, d: int) -> torch.Tensor:
     """
     x_safe = torch.clamp(x, -0.999, None)
     log_x = torch.log1p(x_safe)
-    w = _ts_rolling(log_x, d)
+    padded = torch.cat(
+        [
+            torch.zeros(
+                x.shape[0], d - 1, dtype=x.dtype, device=x.device
+            ),
+            log_x,
+        ],
+        dim=1,
+    )
+    log_sum = padded[:, :x.shape[1]]
+    for offset in range(1, d):
+        log_sum = log_sum + padded[:, offset:offset + x.shape[1]]
     # clamp 对数累加和防止 expm1 溢出到 float32 边界（>1e38）
-    log_sum = w.sum(dim=-1).clamp(-10.0, 10.0)
+    log_sum = log_sum.clamp(-10.0, 10.0)
     out = torch.expm1(log_sum)
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 

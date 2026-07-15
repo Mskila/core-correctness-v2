@@ -1,3 +1,4 @@
+import pytest
 import torch
 from hypothesis import given, settings, strategies as st
 
@@ -121,6 +122,70 @@ def make_operator_inputs(arity: int, t: int = 64) -> list[torch.Tensor]:
         + 0.25 * (operand + 1)
         for operand in range(arity)
     ]
+
+
+def make_true_append_operator_inputs(
+    arity: int,
+    t: int,
+    seed: int,
+    noncontiguous: bool,
+) -> list[torch.Tensor]:
+    operands = []
+    for operand in range(arity):
+        generator = torch.Generator().manual_seed(seed + 101 * operand)
+        storage_t = t * 2 if noncontiguous else t
+        storage = torch.randn(
+            2, storage_t, dtype=torch.float32, generator=generator
+        )
+        operands.append(storage[:, ::2] if noncontiguous else storage)
+    return operands
+
+
+@pytest.mark.parametrize(
+    ("short_t", "long_t", "seed", "noncontiguous"),
+    [
+        pytest.param(63, 64, 20260715, False, id="adjacent-lengths"),
+        pytest.param(600, 700, 20260715, False, id="reviewer-shape"),
+        pytest.param(600, 700, 20260715, True, id="noncontiguous"),
+        pytest.param(31, 96, 19, False, id="long-tail"),
+    ],
+)
+def test_all_registered_operators_are_invariant_to_true_append(
+    short_t: int,
+    long_t: int,
+    seed: int,
+    noncontiguous: bool,
+) -> None:
+    visited = set()
+    for spec in OPERATOR_REGISTRY.operator_specs:
+        visited.add(spec.name)
+        long_operands = make_true_append_operator_inputs(
+            spec.arity, long_t, seed, noncontiguous
+        )
+        short_operands = [
+            value[:, :short_t]
+            if noncontiguous
+            else value[:, :short_t].clone()
+            for value in long_operands
+        ]
+
+        short_result = spec.transform(*short_operands)
+        long_prefix = spec.transform(*long_operands)[..., :short_t]
+        try:
+            torch.testing.assert_close(
+                short_result,
+                long_prefix,
+                rtol=0,
+                atol=1e-6,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                f"{spec.name} changed under true append "
+                f"(short_t={short_t}, long_t={long_t}, "
+                f"noncontiguous={noncontiguous})"
+            ) from error
+
+    assert visited == set(OPERATOR_REGISTRY.operator_names)
 
 
 @settings(max_examples=25, deadline=None)

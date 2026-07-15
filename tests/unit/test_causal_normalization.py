@@ -153,6 +153,29 @@ def test_ordinary_float32_forward_and_backward_are_finite() -> None:
     assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
+def test_ordinary_float32_backward_does_not_save_float64_rolling_windows() -> None:
+    x = torch.linspace(
+        -2.0, 3.0, 128, dtype=torch.float32
+    ).reshape(2, 64).requires_grad_()
+    window = 7
+    saved = []
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        saved.append((tensor.dtype, tensor.numel(), tuple(tensor.shape)))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        output = causal_rolling_zscore(x, window=window)
+        output.square().sum().backward()
+
+    oversized_float64 = [
+        (dtype, numel, shape)
+        for dtype, numel, shape in saved
+        if dtype == torch.float64 and numel >= x.numel() * window
+    ]
+    assert oversized_float64 == []
+
+
 @pytest.mark.parametrize("amplitude", [1.0e20, 3.0e38])
 def test_large_finite_float32_prefix_has_nonzero_output_and_finite_backward(
     amplitude: float,
@@ -172,6 +195,64 @@ def test_large_finite_float32_prefix_has_nonzero_output_and_finite_backward(
     )
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.parametrize("scale", [1.0e20, 3.0e38])
+def test_large_finite_asymmetric_scale_preserves_output_and_gradient(
+    scale: float,
+) -> None:
+    base = torch.tensor(
+        [[0.2, -0.7, 0.9, -0.4, 0.8]], dtype=torch.float32
+    )
+    weights = torch.tensor(
+        [[0.2, -0.1, 0.7, -0.3, 0.9]], dtype=torch.float32
+    )
+    ordinary = base.clone().requires_grad_()
+    large = (base * scale).requires_grad_()
+
+    ordinary_output = causal_rolling_zscore(ordinary, window=3)
+    large_output = causal_rolling_zscore(large, window=3)
+    (ordinary_output * weights).sum().backward()
+    (large_output * weights).sum().backward()
+
+    torch.testing.assert_close(
+        large_output, ordinary_output, rtol=0, atol=5.0e-7
+    )
+    assert large.grad is not None and torch.isfinite(large.grad).all()
+    assert torch.count_nonzero(large.grad).item() == large.numel()
+    torch.testing.assert_close(
+        large.grad * scale, ordinary.grad, rtol=0, atol=1.0e-6
+    )
+
+
+def test_appended_large_future_preserves_historical_formula_and_gradient() -> None:
+    generator = torch.Generator().manual_seed(77)
+    prefix = torch.randn(2, 256, dtype=torch.float32, generator=generator)
+    future = (
+        torch.randn(2, 64, dtype=torch.float32, generator=generator)
+        * 1.0e30
+    )
+    short = prefix.clone().requires_grad_()
+    long = torch.cat((prefix, future), dim=1).requires_grad_()
+    weights = torch.linspace(-0.7, 0.8, 256).repeat(2, 1)
+
+    short_output = causal_rolling_zscore(short, window=200)
+    long_output = causal_rolling_zscore(long, window=200)
+    short_gradient = torch.autograd.grad(
+        (short_output * weights).sum(), short
+    )[0]
+    long_gradient = torch.autograd.grad(
+        (long_output[:, :256] * weights).sum(), long
+    )[0]
+
+    assert torch.equal(short_output, long_output[:, :256])
+    assert torch.equal(short_gradient, long_gradient[:, :256])
+    torch.testing.assert_close(
+        long_gradient[:, 256:],
+        torch.zeros_like(long_gradient[:, 256:]),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_large_finite_ohlcv_keeps_macd_hist_normalization_informative() -> None:

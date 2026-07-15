@@ -51,12 +51,11 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
             "causal_rolling_zscore requires finite input values"
         )
 
-    # Float64 work values keep every finite float32 square representable while
-    # preserving the threshold in the input's original units. Outputs are cast
-    # back only after the rolling statistics have been validated.
+    # CPU reductions for half types are both more stable and more broadly
+    # supported in float32. Float32/float64 retain their native semantics.
     work_dtype = (
-        torch.float64
-        if x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        torch.float32
+        if x.dtype in (torch.float16, torch.bfloat16)
         else x.dtype
     )
     work = x.to(work_dtype)
@@ -82,18 +81,62 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
     weights = valid.to(work.dtype)
     counts = weights.sum(dim=-1).clamp_min(1.0)
 
-    means = (windows * weights).sum(dim=-1) / counts
-    if not torch.isfinite(means).all():
+    # A native variance reduction is safe when every value in the window is
+    # below half of sqrt(finfo.max / window): even the conservative bound
+    # ``window * (2 * max_abs) ** 2`` then remains representable. Build the
+    # risk mask causally from detached magnitudes so ordinary float32 keeps the
+    # original graph, while a large future value can only switch its own and
+    # later windows to the scaled fallback.
+    use_scaled_fallback = False
+    unsafe_windows = None
+    if work.dtype == torch.float32:
+        native_limit = 0.5 * math.sqrt(
+            torch.finfo(work.dtype).max / window
+        )
+        risky_values = work.detach().abs() >= native_limit
+        risk_prefix = risky_values.to(torch.int64).cumsum(dim=1)
+        if window >= time_steps:
+            prior_risk = torch.zeros_like(risk_prefix)
+        else:
+            prior_risk = torch.cat(
+                (
+                    torch.zeros(
+                        (n_rows, window),
+                        dtype=risk_prefix.dtype,
+                        device=work.device,
+                    ),
+                    risk_prefix[:, :-window],
+                ),
+                dim=1,
+            )
+        unsafe_windows = (risk_prefix - prior_risk) > 0
+        use_scaled_fallback = bool(unsafe_windows.any())
+
+    statistics_windows = (
+        torch.where(
+            (~unsafe_windows).unsqueeze(-1),
+            windows,
+            torch.zeros_like(windows),
+        )
+        if use_scaled_fallback
+        else windows
+    )
+    means = (statistics_windows * weights).sum(dim=-1) / counts
+    if work.dtype == torch.float64 and not torch.isfinite(means).all():
         raise FloatingPointError(
             "causal_rolling_zscore rolling mean is not finite"
         )
-    centered = (windows - means.unsqueeze(-1)) * weights
-    if not torch.isfinite(centered).all():
+    centered = (statistics_windows - means.unsqueeze(-1)) * weights
+    if use_scaled_fallback:
+        safe_windows = ~unsafe_windows
+    else:
+        safe_windows = None
+    if work.dtype == torch.float64 and not torch.isfinite(centered).all():
         raise FloatingPointError(
             "causal_rolling_zscore centered values are not finite"
         )
     variances = centered.square().sum(dim=-1) / counts
-    if not torch.isfinite(variances).all():
+    if work.dtype == torch.float64 and not torch.isfinite(variances).all():
         raise FloatingPointError(
             "causal_rolling_zscore rolling variance is not finite"
         )
@@ -108,11 +151,63 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
     active = positive_variance & (
         standard_deviations > CAUSAL_ZSCORE_STD_THRESHOLD
     )
+    if use_scaled_fallback:
+        active = active & safe_windows
     denominators = torch.where(
         active, standard_deviations, torch.ones_like(standard_deviations)
     )
-    normalized = (work - means) / denominators
+    native_means = (
+        torch.where(safe_windows, means, work)
+        if use_scaled_fallback
+        else means
+    )
+    normalized = (work - native_means) / denominators
     result = torch.where(active, normalized, torch.zeros_like(normalized))
+
+    if use_scaled_fallback:
+        fallback_windows = windows[unsafe_windows]
+        fallback_weights = weights[unsafe_windows]
+        fallback_counts = counts[unsafe_windows]
+        fallback_scales = fallback_windows.abs().amax(dim=-1)
+        scaled_windows = fallback_windows / fallback_scales.unsqueeze(-1)
+        scaled_means = (
+            (scaled_windows * fallback_weights).sum(dim=-1)
+            / fallback_counts
+        )
+        scaled_centered = (
+            scaled_windows - scaled_means.unsqueeze(-1)
+        ) * fallback_weights
+        scaled_variances = (
+            scaled_centered.square().sum(dim=-1) / fallback_counts
+        )
+        positive_scaled_variance = scaled_variances > 0
+        scaled_sqrt_input = torch.where(
+            positive_scaled_variance,
+            scaled_variances,
+            torch.ones_like(scaled_variances),
+        )
+        scaled_standard_deviations = scaled_sqrt_input.sqrt()
+        scaled_active = positive_scaled_variance & (
+            scaled_standard_deviations
+            > CAUSAL_ZSCORE_STD_THRESHOLD / fallback_scales
+        )
+        scaled_denominators = torch.where(
+            scaled_active,
+            scaled_standard_deviations,
+            torch.ones_like(scaled_standard_deviations),
+        )
+        scaled_current = work[unsafe_windows] / fallback_scales
+        scaled_normalized = (
+            scaled_current - scaled_means
+        ) / scaled_denominators
+        fallback_result = torch.where(
+            scaled_active,
+            scaled_normalized,
+            torch.zeros_like(scaled_normalized),
+        )
+        result = result + torch.zeros_like(result).masked_scatter(
+            unsafe_windows, fallback_result
+        )
 
     if not torch.isfinite(result).all():
         raise FloatingPointError(
