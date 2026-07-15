@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections import UserDict
+from collections.abc import Iterator, Mapping
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
 from fractions import Fraction
+from types import MappingProxyType
 import warnings
 
 import numpy as np
@@ -1643,6 +1646,335 @@ def test_fingerprint_is_index_and_timezone_independent_and_content_sensitive() -
     assert left.identity == right.identity
     assert left.identity.data_fingerprint != third.identity.data_fingerprint
     assert left.identity.time_fingerprint == third.identity.time_fingerprint
+
+
+_IDENTITY_FIELDS = (
+    "schema_version",
+    "symbol",
+    "timeframe",
+    "start_time_ns",
+    "end_time_ns",
+    "bars",
+    "data_fingerprint",
+    "time_fingerprint",
+)
+
+
+def valid_identity_payload() -> dict[str, object]:
+    return {
+        "schema_version": DATA_SCHEMA_VERSION,
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "start_time_ns": 1_000,
+        "end_time_ns": 2_000,
+        "bars": 2,
+        "data_fingerprint": "a" * 64,
+        "time_fingerprint": "b" * 64,
+    }
+
+
+class _IdentityLookupMapping(Mapping[str, object]):
+    def __init__(
+        self,
+        values: Mapping[str, object],
+        *,
+        order: tuple[str, ...] = _IDENTITY_FIELDS,
+        failure_field: str | None = None,
+        failure: Exception | None = None,
+    ) -> None:
+        self._values = values
+        self._order = order
+        self._failure_field = failure_field
+        self._failure = failure
+        self.lookups: list[str] = []
+
+    def __getitem__(self, key: str) -> object:
+        self.lookups.append(key)
+        if key == self._failure_field:
+            assert self._failure is not None
+            raise self._failure
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._order)
+
+    def __len__(self) -> int:
+        return len(self._order)
+
+
+@pytest.mark.parametrize("field_name", _IDENTITY_FIELDS)
+def test_dataset_identity_from_dict_wraps_each_key_lookup_failure(
+    field_name: str,
+) -> None:
+    constructor_calls = 0
+
+    class RecordingIdentity(DatasetIdentity):
+        def __init__(self, **values: object) -> None:
+            nonlocal constructor_calls
+            constructor_calls += 1
+            super().__init__(**values)
+
+    cause = KeyError(field_name)
+    payload = _IdentityLookupMapping(
+        valid_identity_payload(),
+        failure_field=field_name,
+        failure=cause,
+    )
+
+    with pytest.raises(DataValidationError) as exc_info:
+        RecordingIdentity.from_dict(payload)
+
+    message = str(exc_info.value)
+    assert f"field={field_name}" in message
+    assert "expected=successful Mapping lookup" in message
+    assert f"actual=KeyError({field_name!r}) (type=KeyError)" in message
+    assert exc_info.value.__cause__ is cause
+    assert constructor_calls == 0
+    failed_index = _IDENTITY_FIELDS.index(field_name)
+    assert payload.lookups == list(_IDENTITY_FIELDS[: failed_index + 1])
+
+
+@pytest.mark.parametrize(
+    ("field_name", "cause"),
+    [
+        ("symbol", TypeError("symbol lookup failed")),
+        ("time_fingerprint", ValueError("fingerprint lookup failed")),
+    ],
+)
+def test_dataset_identity_from_dict_wraps_other_value_lookup_failures(
+    field_name: str,
+    cause: Exception,
+) -> None:
+    payload = _IdentityLookupMapping(
+        valid_identity_payload(),
+        failure_field=field_name,
+        failure=cause,
+    )
+
+    with pytest.raises(DataValidationError) as exc_info:
+        DatasetIdentity.from_dict(payload)
+
+    message = str(exc_info.value)
+    assert f"field={field_name}" in message
+    assert "expected=successful Mapping lookup" in message
+    assert f"actual={cause!r} (type={type(cause).__name__})" in message
+    assert exc_info.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit()])
+def test_dataset_identity_from_dict_does_not_wrap_base_exceptions(
+    interrupt: BaseException,
+) -> None:
+    class InterruptingMapping(_IdentityLookupMapping):
+        def __getitem__(self, key: str) -> object:
+            if key == "bars":
+                raise interrupt
+            return super().__getitem__(key)
+
+    with pytest.raises(type(interrupt)) as exc_info:
+        DatasetIdentity.from_dict(InterruptingMapping(valid_identity_payload()))
+
+    assert exc_info.value is interrupt
+
+
+def test_dataset_identity_from_dict_roundtrips_mappings_once() -> None:
+    payload = valid_identity_payload()
+    reverse_mapping = _IdentityLookupMapping(
+        payload,
+        order=tuple(reversed(_IDENTITY_FIELDS)),
+    )
+
+    mappings = (
+        payload,
+        UserDict(payload),
+        MappingProxyType(payload),
+        reverse_mapping,
+    )
+
+    expected = DatasetIdentity(**payload)  # type: ignore[arg-type]
+    for mapping in mappings:
+        identity = DatasetIdentity.from_dict(mapping)
+        assert identity == expected
+        assert identity.to_dict() == payload
+
+    assert reverse_mapping.lookups == list(_IDENTITY_FIELDS)
+
+
+def test_dataset_identity_from_dict_rejects_unknown_field() -> None:
+    payload = valid_identity_payload()
+    payload["unexpected"] = "silently dropped before repair"
+
+    with pytest.raises(
+        DataValidationError,
+        match=r"expected=.*actual=.*extra=.*unexpected",
+    ):
+        DatasetIdentity.from_dict(payload)
+
+
+def test_dataset_identity_from_dict_rejects_boolean_bars() -> None:
+    payload = valid_identity_payload()
+    payload["bars"] = True
+
+    with pytest.raises(
+        DataValidationError,
+        match=r"field=bars.*expected=.*actual=",
+    ):
+        DatasetIdentity.from_dict(payload)
+
+
+def test_dataset_identity_from_dict_rejects_numeric_string_timestamp() -> None:
+    payload = valid_identity_payload()
+    payload["start_time_ns"] = "1000"
+
+    with pytest.raises(
+        DataValidationError,
+        match=r"field=start_time_ns.*expected=.*actual=",
+    ):
+        DatasetIdentity.from_dict(payload)
+
+
+def test_dataset_identity_to_dict_revalidates_bypassed_mutation() -> None:
+    identity = DatasetIdentity(**valid_identity_payload())  # type: ignore[arg-type]
+    object.__setattr__(identity, "bars", True)
+
+    with pytest.raises(
+        DataValidationError,
+        match=r"field=bars.*expected=.*actual=",
+    ):
+        identity.to_dict()
+
+
+_INVALID_IDENTITY_VALUES = (
+    ("schema_version", 2),
+    ("schema_version", "ohlcv-v1"),
+    ("symbol", 7),
+    ("symbol", True),
+    ("symbol", ""),
+    ("symbol", "   "),
+    ("timeframe", 16_385),
+    ("timeframe", True),
+    ("timeframe", "h1"),
+    ("timeframe", " H1 "),
+    ("timeframe", "H2"),
+    ("start_time_ns", "1000"),
+    ("start_time_ns", True),
+    ("start_time_ns", 2_001),
+    ("end_time_ns", "2000"),
+    ("end_time_ns", True),
+    ("end_time_ns", 999),
+    ("bars", "2"),
+    ("bars", True),
+    ("bars", 0),
+    ("bars", -1),
+    ("data_fingerprint", b"a" * 64),
+    ("data_fingerprint", "A" * 64),
+    ("data_fingerprint", "a" * 63),
+    ("data_fingerprint", "g" * 64),
+    ("time_fingerprint", b"b" * 64),
+    ("time_fingerprint", "B" * 64),
+    ("time_fingerprint", "b" * 63),
+    ("time_fingerprint", "z" * 64),
+)
+
+
+@pytest.mark.parametrize("boundary", ["direct", "from_dict", "to_dict"])
+@pytest.mark.parametrize(("field", "invalid"), _INVALID_IDENTITY_VALUES)
+def test_dataset_identity_rejects_invalid_values_at_every_public_boundary(
+    boundary: str,
+    field: str,
+    invalid: object,
+) -> None:
+    payload = valid_identity_payload()
+    payload[field] = invalid
+
+    with pytest.raises(
+        DataValidationError,
+        match=rf"field={field}.*expected=.*actual=",
+    ):
+        if boundary == "direct":
+            DatasetIdentity(**payload)  # type: ignore[arg-type]
+        elif boundary == "from_dict":
+            DatasetIdentity.from_dict(payload)
+        else:
+            identity = DatasetIdentity(  # type: ignore[arg-type]
+                **valid_identity_payload()
+            )
+            object.__setattr__(identity, field, invalid)
+            identity.to_dict()
+
+
+@pytest.mark.parametrize("boundary", ["direct", "from_dict", "to_dict"])
+@pytest.mark.parametrize("missing_field", _IDENTITY_FIELDS)
+def test_dataset_identity_rejects_each_missing_field_at_every_boundary(
+    boundary: str,
+    missing_field: str,
+) -> None:
+    payload = valid_identity_payload()
+    del payload[missing_field]
+
+    with pytest.raises(
+        DataValidationError,
+        match=rf"expected=.*actual=.*missing=.*{missing_field}",
+    ):
+        if boundary == "direct":
+            DatasetIdentity(**payload)  # type: ignore[arg-type]
+        elif boundary == "from_dict":
+            DatasetIdentity.from_dict(payload)
+        else:
+            identity = DatasetIdentity(  # type: ignore[arg-type]
+                **valid_identity_payload()
+            )
+            object.__delattr__(identity, missing_field)
+            identity.to_dict()
+
+
+@pytest.mark.parametrize("invalid", [None, [], "identity", 3, True])
+def test_dataset_identity_from_dict_requires_a_mapping(invalid: object) -> None:
+    with pytest.raises(
+        DataValidationError,
+        match=r"field=identity.*expected=.*Mapping.*actual=",
+    ):
+        DatasetIdentity.from_dict(invalid)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("boundary", ["direct", "from_dict", "to_dict"])
+def test_dataset_identity_rejects_extra_field_at_every_boundary(
+    boundary: str,
+) -> None:
+    payload = valid_identity_payload()
+    payload["unexpected"] = "state"
+
+    with pytest.raises(
+        DataValidationError,
+        match=r"expected=.*actual=.*extra=.*unexpected",
+    ):
+        if boundary == "direct":
+            DatasetIdentity(**payload)  # type: ignore[arg-type]
+        elif boundary == "from_dict":
+            DatasetIdentity.from_dict(payload)
+        else:
+            identity = DatasetIdentity(  # type: ignore[arg-type]
+                **valid_identity_payload()
+            )
+            object.__setattr__(identity, "unexpected", "state")
+            identity.to_dict()
+
+
+def test_dataset_identity_valid_boundaries_return_fresh_stable_snapshots() -> None:
+    payload = valid_identity_payload()
+    reverse_order = dict(reversed(tuple(payload.items())))
+
+    direct = DatasetIdentity(**payload)  # type: ignore[arg-type]
+    restored = DatasetIdentity.from_dict(reverse_order)
+    first = restored.to_dict()
+    second = restored.to_dict()
+
+    assert direct == restored
+    assert first == payload
+    assert second == payload
+    assert first is not second
+    first["bars"] = 999
+    assert restored.to_dict() == payload
 
 
 def test_identity_round_trip_is_stable_and_frozen() -> None:

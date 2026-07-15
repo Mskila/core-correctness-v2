@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import re
 from typing import Mapping
 import warnings
 
@@ -43,9 +44,118 @@ _TIMEFRAME_NS = {
     "D1": 24 * 60 * 60 * 1_000_000_000,
     "W1": 7 * 24 * 60 * 60 * 1_000_000_000,
 }
+_CANONICAL_TIMEFRAMES = frozenset({*_TIMEFRAME_NS, "MN1"})
+_DATASET_IDENTITY_FIELDS = (
+    "schema_version",
+    "symbol",
+    "timeframe",
+    "start_time_ns",
+    "end_time_ns",
+    "bars",
+    "data_fingerprint",
+    "time_fingerprint",
+)
+_SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
+_MISSING_IDENTITY_FIELD = object()
 
 
-@dataclass(frozen=True)
+def _identity_actual(value: object) -> str:
+    return f"{value!r} (type={type(value).__name__})"
+
+
+def _raise_identity_field_error(
+    field_name: str,
+    *,
+    expected: str,
+    actual: object,
+) -> None:
+    raise DataValidationError(
+        "invalid dataset identity: "
+        f"field={field_name}; expected={expected}; actual={_identity_actual(actual)}"
+    )
+
+
+def _validate_identity_schema(value: Mapping[object, object]) -> None:
+    expected = set(_DATASET_IDENTITY_FIELDS)
+    actual = set(value)
+    missing = sorted(expected - actual)
+    extra = sorted(repr(key) for key in actual - expected)
+    if missing or extra:
+        actual_fields = sorted(repr(key) for key in actual)
+        raise DataValidationError(
+            "invalid dataset identity schema: "
+            f"expected={list(_DATASET_IDENTITY_FIELDS)!r}; "
+            f"actual={actual_fields!r}; missing={missing!r}; extra={extra!r}"
+        )
+
+
+def _validate_dataset_identity_values(value: Mapping[str, object]) -> None:
+    schema_version = value["schema_version"]
+    if type(schema_version) is not str or schema_version != DATA_SCHEMA_VERSION:
+        _raise_identity_field_error(
+            "schema_version",
+            expected=f"exact str {DATA_SCHEMA_VERSION!r}",
+            actual=schema_version,
+        )
+
+    symbol = value["symbol"]
+    if type(symbol) is not str or not symbol.strip():
+        _raise_identity_field_error(
+            "symbol",
+            expected="non-empty non-whitespace exact str",
+            actual=symbol,
+        )
+
+    timeframe = value["timeframe"]
+    if type(timeframe) is not str or timeframe not in _CANONICAL_TIMEFRAMES:
+        _raise_identity_field_error(
+            "timeframe",
+            expected=f"canonical exact str in {sorted(_CANONICAL_TIMEFRAMES)!r}",
+            actual=timeframe,
+        )
+
+    for field_name in ("start_time_ns", "end_time_ns"):
+        timestamp = value[field_name]
+        if type(timestamp) is not int:
+            _raise_identity_field_error(
+                field_name,
+                expected="exact int (bool excluded)",
+                actual=timestamp,
+            )
+
+    start_time_ns = value["start_time_ns"]
+    end_time_ns = value["end_time_ns"]
+    if start_time_ns > end_time_ns:  # type: ignore[operator]
+        raise DataValidationError(
+            "invalid dataset identity: "
+            "field=start_time_ns; expected=<= end_time_ns; "
+            f"actual={start_time_ns!r} > {end_time_ns!r}; "
+            "field=end_time_ns; expected=>= start_time_ns; "
+            f"actual={end_time_ns!r} < {start_time_ns!r}"
+        )
+
+    bars = value["bars"]
+    if type(bars) is not int or bars <= 0:  # type: ignore[operator]
+        _raise_identity_field_error(
+            "bars",
+            expected="positive exact int (bool excluded)",
+            actual=bars,
+        )
+
+    for field_name in ("data_fingerprint", "time_fingerprint"):
+        fingerprint = value[field_name]
+        if (
+            type(fingerprint) is not str
+            or _SHA256_HEX_PATTERN.fullmatch(fingerprint) is None
+        ):
+            _raise_identity_field_error(
+                field_name,
+                expected="64-character lowercase hexadecimal SHA-256 exact str",
+                actual=fingerprint,
+            )
+
+
+@dataclass(frozen=True, init=False)
 class DatasetIdentity:
     schema_version: str
     symbol: str
@@ -56,33 +166,71 @@ class DatasetIdentity:
     data_fingerprint: str
     time_fingerprint: str
 
+    def __init__(
+        self,
+        schema_version: object = _MISSING_IDENTITY_FIELD,
+        symbol: object = _MISSING_IDENTITY_FIELD,
+        timeframe: object = _MISSING_IDENTITY_FIELD,
+        start_time_ns: object = _MISSING_IDENTITY_FIELD,
+        end_time_ns: object = _MISSING_IDENTITY_FIELD,
+        bars: object = _MISSING_IDENTITY_FIELD,
+        data_fingerprint: object = _MISSING_IDENTITY_FIELD,
+        time_fingerprint: object = _MISSING_IDENTITY_FIELD,
+        **extra_fields: object,
+    ) -> None:
+        supplied = {
+            field_name: field_value
+            for field_name, field_value in zip(
+                _DATASET_IDENTITY_FIELDS,
+                (
+                    schema_version,
+                    symbol,
+                    timeframe,
+                    start_time_ns,
+                    end_time_ns,
+                    bars,
+                    data_fingerprint,
+                    time_fingerprint,
+                ),
+                strict=True,
+            )
+            if field_value is not _MISSING_IDENTITY_FIELD
+        }
+        supplied.update(extra_fields)
+        _validate_identity_schema(supplied)
+        _validate_dataset_identity_values(supplied)
+        for field_name in _DATASET_IDENTITY_FIELDS:
+            object.__setattr__(self, field_name, supplied[field_name])
+
     def to_dict(self) -> dict[str, str | int]:
+        state: dict[str, object] = dict(vars(self))
+        _validate_identity_schema(state)
+        _validate_dataset_identity_values(state)
         return {
-            "schema_version": self.schema_version,
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "start_time_ns": self.start_time_ns,
-            "end_time_ns": self.end_time_ns,
-            "bars": self.bars,
-            "data_fingerprint": self.data_fingerprint,
-            "time_fingerprint": self.time_fingerprint,
+            field_name: state[field_name]  # type: ignore[misc]
+            for field_name in _DATASET_IDENTITY_FIELDS
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "DatasetIdentity":
-        try:
-            return cls(
-                schema_version=str(value["schema_version"]),
-                symbol=str(value["symbol"]),
-                timeframe=normalize_timeframe_name(value["timeframe"]),  # type: ignore[arg-type]
-                start_time_ns=int(value["start_time_ns"]),
-                end_time_ns=int(value["end_time_ns"]),
-                bars=int(value["bars"]),
-                data_fingerprint=str(value["data_fingerprint"]),
-                time_fingerprint=str(value["time_fingerprint"]),
+        if not isinstance(value, Mapping):
+            _raise_identity_field_error(
+                "identity",
+                expected="Mapping with exact DatasetIdentity fields",
+                actual=value,
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise DataValidationError(f"invalid dataset identity: {exc}") from exc
+        _validate_identity_schema(value)
+        payload: dict[str, object] = {}
+        for field_name in _DATASET_IDENTITY_FIELDS:
+            try:
+                payload[field_name] = value[field_name]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DataValidationError(
+                    "invalid dataset identity: "
+                    f"field={field_name}; expected=successful Mapping lookup; "
+                    f"actual={_identity_actual(exc)}"
+                ) from exc
+        return cls(**payload)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True, init=False)
