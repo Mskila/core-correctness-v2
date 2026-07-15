@@ -148,14 +148,25 @@ def _integer_numeric_timestamps(values: pd.Series) -> list[int]:
     array = numeric.to_numpy(copy=False)
     if np.iscomplexobj(array):
         raise DataValidationError("numeric timestamps must be real integers")
-    if np.issubdtype(array.dtype, np.floating):
+    if pd.api.types.is_float_dtype(numeric.dtype):
+        numpy_dtype = np.dtype(
+            getattr(numeric.dtype, "numpy_dtype", numeric.dtype)
+        )
+        array = numeric.to_numpy(
+            dtype=numpy_dtype,
+            na_value=np.nan,
+            copy=False,
+        )
         if not np.isfinite(array).all():
             raise DataValidationError("invalid time: non-finite timestamp")
         if not np.equal(array, np.trunc(array)).all():
             raise DataValidationError("numeric timestamps must be integer values")
-        if (np.abs(array) > 2**53).any():
+        precision_bits = np.finfo(numpy_dtype).nmant + 1
+        lossless_integer_limit = np.array(2**precision_bits, dtype=numpy_dtype)
+        if (np.abs(array) > lossless_integer_limit).any():
             raise DataValidationError(
-                "floating numeric timestamps must be lossless integers"
+                "floating numeric timestamps exceed lossless integer precision "
+                f"for source dtype {numeric.dtype}"
             )
     try:
         return [int(value) for value in array]
@@ -225,8 +236,18 @@ def _to_utc_time(
             converted = pd.Series(
                 pd.to_datetime(values, utc=True, errors="coerce")
             )
+            if converted.isna().any():
+                raise DataValidationError(
+                    "invalid time: timestamp cannot be converted to UTC"
+                )
+            return converted.astype("datetime64[ns, UTC]")
+        except DataValidationError:
+            raise
         except Exception as exc:
-            raise DataValidationError(f"invalid time: {exc}") from exc
+            raise DataValidationError(
+                "invalid time: timestamp is out of range for UTC nanoseconds: "
+                f"{exc}"
+            ) from exc
     if converted.isna().any():
         raise DataValidationError("invalid time: timestamp cannot be converted to UTC")
     return converted.astype("datetime64[ns, UTC]")
@@ -239,6 +260,15 @@ def _contains_complex(values: pd.Series) -> bool:
     return any(
         isinstance(value, (complex, np.complexfloating)) for value in array
     )
+
+
+def _integral_source_value(value: object) -> int | None:
+    """Return an exact source integer without relying on its concrete type."""
+    try:
+        integer = int(value)  # type: ignore[arg-type]
+        return integer if bool(value == integer) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _coerce_value_column(values: pd.Series, *, field: str) -> pd.Series:
@@ -258,7 +288,8 @@ def _coerce_value_column(values: pd.Series, *, field: str) -> pd.Series:
     if not np.isfinite(array).all():
         raise DataValidationError(f"non-finite OHLCV value: field={field}")
     for source, float_value in zip(source_values, array, strict=True):
-        if isinstance(source, (int, np.integer)) and int(float_value) != int(source):
+        source_integer = _integral_source_value(source)
+        if source_integer is not None and int(float_value) != source_integer:
             raise DataValidationError(
                 "integer OHLCV value must round-trip exactly through float64: "
                 f"field={field}"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
+from fractions import Fraction
 import warnings
 
 import numpy as np
@@ -1149,6 +1150,140 @@ def test_float_numeric_timestamps_must_be_lossless_integers(
         )
 
 
+@pytest.mark.parametrize(
+    ("dtype", "timestamps", "unit", "timeframe"),
+    [
+        (np.float16, [3_601, 7_201, 10_801], "s", "H1"),
+        (
+            np.float32,
+            [1_700_000_001 + 86_400 * index for index in range(3)],
+            "s",
+            "D1",
+        ),
+        (
+            "Float32",
+            [1_700_000_001 + 86_400 * index for index in range(3)],
+            "s",
+            "D1",
+        ),
+        (
+            np.float64,
+            [2**53 + 1 + 3_600_000_000_000 * index for index in range(3)],
+            "ns",
+            "H1",
+        ),
+        (
+            "Float64",
+            [2**53 + 1 + 3_600_000_000_000 * index for index in range(3)],
+            "ns",
+            "H1",
+        ),
+    ],
+    ids=[
+        "numpy-float16",
+        "numpy-float32",
+        "pandas-Float32",
+        "numpy-float64",
+        "pandas-Float64",
+    ],
+)
+def test_float_timestamp_dtype_must_guarantee_consecutive_integer_identity(
+    dtype: object,
+    timestamps: list[int],
+    unit: str,
+    timeframe: str,
+) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = pd.Series(timestamps, dtype=dtype)
+
+    with pytest.raises(DataValidationError, match=r"lossless|precision"):
+        canonicalize_ohlcv(
+            frame,
+            symbol="EURUSD",
+            timeframe=timeframe,
+            numeric_time_unit=unit,
+        )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "timestamps", "unit"),
+    [
+        (np.float16, [1_920, 1_980, 2_040], "s"),
+        (np.float32, [2**24 - 120, 2**24 - 60, 2**24], "s"),
+        ("Float32", [2**24 - 120, 2**24 - 60, 2**24], "s"),
+        (
+            np.float64,
+            [2**53 - 120_000_000_000, 2**53 - 60_000_000_000, 2**53],
+            "ns",
+        ),
+        (
+            "Float64",
+            [2**53 - 120_000_000_000, 2**53 - 60_000_000_000, 2**53],
+            "ns",
+        ),
+    ],
+    ids=[
+        "numpy-float16",
+        "numpy-float32",
+        "pandas-Float32",
+        "numpy-float64",
+        "pandas-Float64",
+    ],
+)
+def test_float_timestamp_values_within_dtype_precision_remain_valid(
+    dtype: object,
+    timestamps: list[int],
+    unit: str,
+) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = pd.Series(timestamps, dtype=dtype)
+
+    result = canonicalize_ohlcv(
+        frame,
+        symbol="EURUSD",
+        timeframe="M1",
+        numeric_time_unit=unit,
+    )
+
+    scale = _TEST_TIME_UNIT_NS[unit]
+    assert result.frame["time"].astype("int64").tolist() == [
+        timestamp * scale for timestamp in timestamps
+    ]
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [np.float16, np.float32, "Float32", np.float64, "Float64"],
+    ids=[
+        "numpy-float16",
+        "numpy-float32",
+        "pandas-Float32",
+        "numpy-float64",
+        "pandas-Float64",
+    ],
+)
+@pytest.mark.parametrize(
+    ("timestamps", "message"),
+    [([0.0, 60.5, 120.0], "integer"), ([0.0, 60.0, float("inf")], "finite")],
+    ids=["fractional", "nonfinite"],
+)
+def test_float_timestamp_dtype_still_rejects_fractional_and_nonfinite_values(
+    dtype: object,
+    timestamps: list[float],
+    message: str,
+) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = pd.Series(timestamps, dtype=dtype)
+
+    with pytest.raises(DataValidationError, match=message):
+        canonicalize_ohlcv(
+            frame,
+            symbol="EURUSD",
+            timeframe="M1",
+            numeric_time_unit="s",
+        )
+
+
 def test_out_of_range_integer_numeric_timestamps_are_rejected() -> None:
     frame = valid_frame().iloc[:3].copy()
     start = pd.Timestamp.max.value + 1
@@ -1262,6 +1397,99 @@ def test_datetime_like_time_values_remain_valid(timestamps: pd.Series) -> None:
     result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
     expected = pd.date_range("2026-01-01", periods=3, freq="1h", tz="UTC")
+    assert result.frame["time"].tolist() == expected.tolist()
+
+
+@pytest.mark.parametrize(
+    "timestamps",
+    [
+        pd.Series(
+            np.array(
+                [
+                    "3000-01-01T00:00:00",
+                    "3000-01-01T01:00:00",
+                    "3000-01-01T02:00:00",
+                ],
+                dtype="datetime64[us]",
+            )
+        ),
+        pd.Series(
+            np.array(
+                [
+                    "1600-01-01T00:00:00",
+                    "1600-01-01T01:00:00",
+                    "1600-01-01T02:00:00",
+                ],
+                dtype="datetime64[us]",
+            )
+        ),
+        pd.Series(
+            pd.array(
+                [
+                    "3000-01-01T00:00:00Z",
+                    "3000-01-01T01:00:00Z",
+                    "3000-01-01T02:00:00Z",
+                ],
+                dtype="datetime64[us, UTC]",
+            )
+        ),
+        pd.Series(
+            [
+                "1600-01-01T00:00:00Z",
+                "1600-01-01T01:00:00Z",
+                "1600-01-01T02:00:00Z",
+            ],
+            dtype="object",
+        ),
+    ],
+    ids=["upper-naive-us", "lower-naive-us", "upper-utc-us", "lower-strings"],
+)
+def test_datetime_like_values_outside_utc_ns_range_raise_domain_error(
+    timestamps: pd.Series,
+) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = timestamps
+
+    with pytest.raises(DataValidationError, match=r"invalid time|out of range"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@pytest.mark.parametrize(
+    "timestamps",
+    [
+        pd.Series(
+            np.array(
+                [
+                    "2026-01-01T00:00:00",
+                    "2026-01-01T01:00:00",
+                    "2026-01-01T02:00:00",
+                ],
+                dtype="datetime64[us]",
+            )
+        ),
+        pd.Series(
+            pd.array(
+                [
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T01:00:00Z",
+                    "2026-01-01T02:00:00Z",
+                ],
+                dtype="datetime64[us, UTC]",
+            )
+        ),
+    ],
+    ids=["naive-us", "utc-us"],
+)
+def test_in_range_microsecond_datetime_values_convert_to_utc_ns(
+    timestamps: pd.Series,
+) -> None:
+    frame = valid_frame().iloc[:3].copy()
+    frame["time"] = timestamps
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    expected = pd.date_range("2026-01-01", periods=3, freq="1h", tz="UTC")
+    assert str(result.frame["time"].dtype) == "datetime64[ns, UTC]"
     assert result.frame["time"].tolist() == expected.tolist()
 
 
@@ -1454,8 +1682,8 @@ def test_boolean_ohlcv_values_are_rejected_before_numeric_coercion(
 
 @pytest.mark.parametrize(
     "invalid",
-    [Decimal("sNaN"), object(), "not-a-number"],
-    ids=["signaling-decimal", "object", "text"],
+    [Decimal("sNaN"), Fraction(1, 1), object(), "not-a-number"],
+    ids=["signaling-decimal", "fraction", "object", "text"],
 )
 def test_unsafe_object_values_raise_domain_error(invalid: object) -> None:
     frame = valid_frame()
@@ -1506,6 +1734,88 @@ def test_integer_source_kinds_share_the_lossless_float64_guard(
 
     with pytest.raises(DataValidationError, match=r"float64.*field=volume"):
         canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("open", Decimal(2**53 + 1)),
+        ("high", Decimal(2**53 + 3)),
+        ("low", Decimal(2**53 + 1)),
+        ("close", Decimal(2**53 + 1)),
+        ("volume", Decimal(2**53 + 1)),
+        ("volume", Decimal(2**53 + 3)),
+    ],
+)
+def test_integral_decimal_values_must_round_trip_exactly_through_float64(
+    field: str,
+    value: Decimal,
+) -> None:
+    exact = 2**53
+    frame = valid_frame()
+    frame["open"] = [exact + 2] * len(frame)
+    frame["high"] = [exact + 4] * len(frame)
+    frame["low"] = [exact] * len(frame)
+    frame["close"] = [exact + 2] * len(frame)
+    frame[field] = pd.Series([value] * len(frame), dtype="object")
+
+    with pytest.raises(DataValidationError, match=rf"float64.*field={field}"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        Decimal(100),
+        Decimal(2**53),
+        Decimal(2**53 + 2),
+        np.longdouble(str(2**53)),
+    ],
+    ids=[
+        "ordinary-decimal",
+        "decimal-2**53",
+        "decimal-exact-next",
+        "numpy-longdouble",
+    ],
+)
+def test_exact_integral_non_builtin_numeric_values_remain_exact(
+    value: object,
+) -> None:
+    frame = valid_frame()
+    frame["volume"] = pd.Series([value] * len(frame), dtype="object")
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    assert result.frame["volume"].tolist() == [float(value)] * len(frame)
+
+
+def test_non_integral_decimal_behavior_is_unchanged() -> None:
+    frame = valid_frame()
+    frame["volume"] = pd.Series([Decimal("100.25")] * len(frame), dtype="object")
+
+    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+    assert result.frame["volume"].tolist() == [100.25] * len(frame)
+
+
+def test_negative_lossy_integral_decimal_fails_closed() -> None:
+    frame = valid_frame()
+    value = Decimal(-(2**53 + 1))
+    frame["volume"] = pd.Series([value] * len(frame), dtype="object")
+
+    with pytest.raises(DataValidationError, match=r"float64.*field=volume"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
+
+
+def test_distinct_lossy_integral_sources_cannot_share_a_canonical_identity() -> None:
+    values = [Decimal(2**54 + 1), Decimal(2**54 + 2)]
+    assert float(values[0]) == float(values[1])
+
+    for value in values:
+        frame = valid_frame()
+        frame["volume"] = pd.Series([value] * len(frame), dtype="object")
+        with pytest.raises(DataValidationError, match=r"float64.*field=volume"):
+            canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
 @pytest.mark.parametrize("value", [2**53, 2**53 + 2])
