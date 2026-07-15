@@ -6,7 +6,7 @@
 - TS_RANK_5/10/20 值域 ∈ [0, 1)
 - TS_CORR_10 在常数输入时输出 0
 - 所有算子对边界值（全零、极大值 1e8）无 NaN / Inf
-- len(OPS_CONFIG) == 28（原 22 + 新增 6 个趋势/动量算子）
+- OPS_CONFIG 数量与 V2 operator registry 动态保持一致
 
 需求：F2.1~F2.6
 """
@@ -17,7 +17,18 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import torch
-from model_core.ops import OPS_CONFIG, _ts_mean, _ts_std, _ts_rank, _ts_corr_10
+import model_core.ops as ops_module
+from model_core.ops import (
+    OPERATOR_REGISTRY,
+    OPS_CONFIG,
+    _ts_corr_10,
+    _ts_mean,
+    _ts_rank,
+    _ts_std,
+)
+from model_core.registry import OperatorSpec, RegistrationError, Registry
+from model_core.vm import StackVM
+from model_core.vocab import FORMULA_VOCAB, VOCAB_VERSION
 
 # ── 常量 ────────────────────────────────────────────────────────────────────────
 N, T = 4, 30
@@ -34,11 +45,32 @@ def rand_input() -> torch.Tensor:
 
 # ── 1. OPS_CONFIG 长度验证 ───────────────────────────────────────────────────────
 class TestOpsConfigLength:
-    def test_ops_config_length_equals_22(self):
-        """OPS_CONFIG 共 28 个算子（原 12 基础 + 10 时序 + 6 趋势/动量）"""
-        assert len(OPS_CONFIG) == 28, (
-            f"OPS_CONFIG 长度应为 28，实际为 {len(OPS_CONFIG)}"
+    def test_ops_config_matches_registry(self):
+        assert len(OPS_CONFIG) == len(OPERATOR_REGISTRY.operator_names)
+
+    def test_ops_config_is_an_immutable_registry_snapshot(self):
+        expected = tuple(
+            (spec.name, spec.transform, spec.arity)
+            for spec in OPERATOR_REGISTRY.operator_specs
         )
+        assert isinstance(OPS_CONFIG, tuple)
+        assert OPS_CONFIG == expected
+
+        feature = torch.tensor([[[1.0, 2.0, 4.0, 8.0]]])
+        neg_token = FORMULA_VOCAB.operator_offset + 4
+        before = StackVM().execute([0, neg_token], feature)
+        version_before = VOCAB_VERSION
+        original = OPS_CONFIG[4]
+        try:
+            with pytest.raises(TypeError):
+                OPS_CONFIG[4] = ("NEG", lambda x: x, 1)
+        finally:
+            if isinstance(OPS_CONFIG, list):
+                OPS_CONFIG[4] = original
+
+        after = StackVM().execute([0, neg_token], feature)
+        assert VOCAB_VERSION == version_before == FORMULA_VOCAB.version
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
 
     def test_new_ops_count_equals_10(self):
         """时序算子（索引 12-21）共 10 个"""
@@ -249,3 +281,306 @@ class TestHelperFunctions:
         assert (out >= -1.0 - 1e-5).all() and (out <= 1.0 + 1e-5).all(), (
             f"TS_CORR_10 值域越界：min={out.min().item():.6f}, max={out.max().item():.6f}"
         )
+
+
+class TestProductFiveFormula:
+    def test_registry_transform_matches_explicit_causal_compounding(self):
+        cases = (
+            torch.tensor(
+                [
+                    [0.10, -0.20, 0.05, 0.30, -0.10, 0.25, -0.15, 0.40],
+                    [0.20, -1.20, 0.15, -0.30, 0.40, -0.05, 0.25, -0.10],
+                ],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [[-0.99, -0.99, 0.10, -0.20, 0.05]],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [[9.05984497, -0.998884857, -0.879774213, 10.1290340,
+                  89.9148178]],
+                dtype=torch.float32,
+            ),
+        )
+        product = next(
+            spec.transform
+            for spec in OPERATOR_REGISTRY.operator_specs
+            if spec.name == "PRODUCT_5"
+        )
+
+        for x in cases:
+            actual = product(x)
+            safe = x.clamp_min(-0.999)
+            expected = torch.stack(
+                [
+                    torch.prod(
+                        1.0 + safe[:, max(0, end - 4):end + 1], dim=1
+                    )
+                    - 1.0
+                    for end in range(x.shape[1])
+                ],
+                dim=1,
+            )
+
+            torch.testing.assert_close(actual, expected, rtol=0, atol=2.0e-7)
+
+    def test_registry_transform_clamps_true_log_sum_at_both_limits(self):
+        target_log_sums = torch.tensor(
+            [12.0, -12.0, 9.5, -9.5], dtype=torch.float64
+        )
+        returns = torch.expm1(target_log_sums / 5.0).unsqueeze(1).repeat(1, 5)
+        product = next(
+            spec.transform
+            for spec in OPERATOR_REGISTRY.operator_specs
+            if spec.name == "PRODUCT_5"
+        )
+
+        raw_log_sums = torch.log1p(returns).sum(dim=1)
+        assert raw_log_sums[0] > 10.0
+        assert raw_log_sums[1] < -10.0
+        assert 9.0 < raw_log_sums[2] < 10.0
+        assert -10.0 < raw_log_sums[3] < -9.0
+
+        expected = torch.expm1(target_log_sums.clamp(-10.0, 10.0))
+        actual = product(returns)[:, -1]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize(
+        ("dtype", "atol"),
+        [(torch.float32, 2.0e-7), (torch.float64, 2.0e-15)],
+    )
+    def test_registry_transform_preserves_tensor_contract_and_true_append(
+        self, dtype, atol
+    ):
+        prefix = torch.tensor(
+            [
+                [0.10, -0.20, 0.05, 0.30, -0.10, 0.25, -0.15, 0.40],
+                [0.20, -0.35, 0.15, -0.30, 0.40, -0.05, 0.25, -0.10],
+            ],
+            dtype=dtype,
+        )
+        future = torch.tensor(
+            [[0.20, -0.05, 0.10, -0.25], [-0.15, 0.30, -0.20, 0.05]],
+            dtype=dtype,
+        )
+        short = prefix.clone().requires_grad_()
+        long = torch.cat((prefix, future), dim=1).requires_grad_()
+        product = next(
+            spec.transform
+            for spec in OPERATOR_REGISTRY.operator_specs
+            if spec.name == "PRODUCT_5"
+        )
+
+        def explicit_compounding(x):
+            safe = x.clamp_min(-0.999)
+            return torch.stack(
+                [
+                    torch.prod(
+                        1.0 + safe[:, max(0, end - 4):end + 1], dim=1
+                    )
+                    - 1.0
+                    for end in range(x.shape[1])
+                ],
+                dim=1,
+            )
+
+        short_output = product(short)
+        long_output = product(long)
+        for output, operand in ((short_output, short), (long_output, long)):
+            assert output.shape == operand.shape
+            assert output.dtype == operand.dtype
+            assert output.device == operand.device
+            torch.testing.assert_close(
+                output, explicit_compounding(operand), rtol=0, atol=atol
+            )
+        assert torch.equal(short_output, long_output[:, :prefix.shape[1]])
+
+        short_output.sum().backward()
+        long_output[:, :prefix.shape[1]].sum().backward()
+        assert short.grad is not None and torch.isfinite(short.grad).all()
+        assert long.grad is not None and torch.isfinite(long.grad).all()
+        assert torch.count_nonzero(short.grad).item() == short.numel()
+        assert torch.equal(short.grad, long.grad[:, :prefix.shape[1]])
+        torch.testing.assert_close(
+            long.grad[:, prefix.shape[1]:],
+            torch.zeros_like(long.grad[:, prefix.shape[1]:]),
+            rtol=0,
+            atol=0,
+        )
+
+
+class TestOperatorLookbacks:
+    @staticmethod
+    def _spec(name):
+        return next(
+            spec for spec in OPERATOR_REGISTRY.operator_specs if spec.name == name
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "expected_window"),
+        [("EMA_5", 35), ("EMA_20", 139)],
+    )
+    def test_ema_declaration_matches_effective_kernel(
+        self, name, expected_window
+    ):
+        spec = self._spec(name)
+        assert spec.lookback == expected_window, (
+            f"{name} declares {spec.lookback} bars but its 1e-6-truncated "
+            f"EMA kernel requires {expected_window}"
+        )
+
+    @pytest.mark.parametrize(
+        ("span", "expected_window"),
+        [(5, 35), (20, 139)],
+    )
+    def test_ema_window_helper_is_the_registration_source(
+        self, span, expected_window
+    ):
+        helper = getattr(ops_module, "_ema_effective_window", None)
+        assert callable(helper), "EMA implementation has no shared window helper"
+        assert helper(span) == expected_window
+
+    @pytest.mark.parametrize(
+        ("name", "window"),
+        [("EMA_5", 35), ("EMA_20", 139)],
+    )
+    def test_ema_dependency_stops_at_declared_window(self, name, window):
+        spec = self._spec(name)
+        target = window
+        base = torch.zeros(1, window + 1)
+
+        outside = base.clone()
+        outside[0, target - window] = 10_000.0
+        inside = base.clone()
+        inside[0, target - window + 1] = 10_000.0
+
+        baseline_value = spec.transform(base)[0, target]
+        outside_value = spec.transform(outside)[0, target]
+        inside_value = spec.transform(inside)[0, target]
+
+        torch.testing.assert_close(
+            outside_value,
+            baseline_value,
+            rtol=0,
+            atol=0,
+            msg=f"{name} still depends on a value older than {window} bars",
+        )
+        assert not torch.isclose(
+            inside_value,
+            baseline_value,
+            rtol=0,
+            atol=1e-6,
+        ), f"{name} must still depend on the earliest value inside its window"
+
+    def test_all_registered_operators_have_positive_integer_lookback(self):
+        assert OPERATOR_REGISTRY.operator_specs
+        for spec in OPERATOR_REGISTRY.operator_specs:
+            assert isinstance(getattr(spec, "lookback", None), int)
+            assert not isinstance(spec.lookback, bool)
+            assert spec.lookback >= 1
+        assert getattr(ops_module, "MAX_OPERATOR_LOOKBACK", 0) >= 200
+
+    @pytest.mark.parametrize("lookback", [None, True, False, 0, -1])
+    def test_invalid_lookback_does_not_mutate_registry(self, lookback):
+        registry = Registry()
+        before = registry.operator_specs
+
+        def transform(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        with pytest.raises(RegistrationError):
+            registry.register_operator(
+                OperatorSpec(
+                    name="TEST_OPERATOR",
+                    arity=1,
+                    transform=transform,
+                    lookback=lookback,
+                )
+            )
+        assert registry.operator_specs == before
+
+    def test_missing_lookback_cannot_mutate_registry(self):
+        registry = Registry()
+
+        def transform(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        with pytest.raises(TypeError):
+            OperatorSpec(name="TEST_OPERATOR", arity=1, transform=transform)
+        assert registry.operator_specs == ()
+
+    def test_scale_declared_window_is_exactly_enforced(self):
+        spec = self._spec("SCALE")
+        assert spec.lookback == 200
+        target = spec.lookback
+        base = torch.ones(1, target + 1)
+        outside = base.clone()
+        outside[:, target - spec.lookback] = 10_000.0
+        inside = base.clone()
+        inside[:, target - spec.lookback + 1] = 10_000.0
+
+        baseline = spec.transform(base)[0, target]
+        torch.testing.assert_close(
+            spec.transform(outside)[0, target], baseline, rtol=0, atol=0
+        )
+        assert not torch.equal(spec.transform(inside)[0, target], baseline)
+
+
+class TestRegistryHardeningAndShortAxes:
+    def test_non_callable_operator_is_rejected_atomically(self):
+        registry = Registry()
+        before = (registry.operator_specs, registry.operator_names)
+        with pytest.raises(RegistrationError) as error:
+            registry.register_operator(
+                OperatorSpec(
+                    name="NOT_CALLABLE",
+                    arity=1,
+                    transform=42,
+                    lookback=1,
+                )
+            )
+        assert type(error.value) is not RegistrationError
+        assert (registry.operator_specs, registry.operator_names) == before
+
+    def test_local_registry_freeze_rejects_operator_atomically(self):
+        registry = Registry()
+        registry.freeze()
+        before = (registry.operator_specs, registry.operator_names)
+        with pytest.raises(RegistrationError) as error:
+            registry.register_operator(
+                OperatorSpec(
+                    name="AFTER_FREEZE",
+                    arity=1,
+                    transform=lambda x: x,
+                    lookback=1,
+                )
+            )
+        assert type(error.value) is not RegistrationError
+        assert (registry.operator_specs, registry.operator_names) == before
+
+    def test_global_operator_registry_is_frozen(self):
+        assert OPERATOR_REGISTRY.is_frozen
+        before = (OPERATOR_REGISTRY.operator_specs, OPERATOR_REGISTRY.operator_names)
+        with pytest.raises(RegistrationError):
+            OPERATOR_REGISTRY.register_operator(
+                OperatorSpec(
+                    name="GLOBAL_AFTER_FREEZE",
+                    arity=1,
+                    transform=lambda x: x,
+                    lookback=1,
+                )
+            )
+        assert (OPERATOR_REGISTRY.operator_specs, OPERATOR_REGISTRY.operator_names) == before
+
+    @pytest.mark.parametrize("length", [1, 19])
+    def test_every_operator_preserves_nonempty_short_axis(self, length):
+        for spec in OPERATOR_REGISTRY.operator_specs:
+            operands = [torch.ones(2, length) for _ in range(spec.arity)]
+            assert spec.transform(*operands).shape == (2, length), spec.name
+
+    def test_every_operator_rejects_empty_time_axis_consistently(self):
+        for spec in OPERATOR_REGISTRY.operator_specs:
+            operands = [torch.ones(2, 0) for _ in range(spec.arity)]
+            with pytest.raises(ValueError, match=r"non-empty.*\[N,T\]"):
+                spec.transform(*operands)

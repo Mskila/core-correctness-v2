@@ -4,11 +4,11 @@ tests/unit/test_e2e_pipeline.py -- 端到端流水线集成测试（Task 14.1）
 验证整条流水线可以端到端运行（requirements 3.1, 4.1, 5.2, 6.1, 7.3, 7.4, 7.8）：
   features → vm → evaluator（score/prune/report/select）→ vocab/version 校验
 
-关键数字（当前扩展后）：
-  - 特征数  F = 65（8 大类）
-  - 算子数  O = 66
-  - vocab size  = F + O = 131
-  - feat_offset = 65
+关键数字（Core Correctness V2）：
+  - 特征数  F = 60（单标的特征）
+  - 算子数  O = 63（不含横截面算子）
+  - vocab size  = F + O = 123
+  - feat_offset = 60
   - VOCAB_VERSION 为确定性哈希（"v" + sha256[:12]）
 """
 import os
@@ -18,11 +18,17 @@ import pytest
 import torch
 
 # ── 被测模块 ─────────────────────────────────────────────────────────────
-from model_core.features import MT5FeatureEngineer, FEATURE_NAMES
+from model_core.features import MT5FeatureEngineer, FEATURE_NAMES, FEATURE_REGISTRY
 from model_core.vm import StackVM
 from model_core.evaluator import EffectivenessEvaluator
 from model_core.vocab import FORMULA_VOCAB, VOCAB_VERSION, VocabVersionMismatchError
-from model_core.ops import OPS_CONFIG
+from model_core.ops import OPS_CONFIG, OPERATOR_REGISTRY
+
+
+REMOVED = {
+    "REL_RET5", "REL_RET20", "REL_VOL", "CS_RANK_RET5",
+    "CS_ZSCORE_RET20", "CS_RANK", "CS_SCALE", "CS_NEUTRALIZE",
+}
 
 
 # ── 辅助：生成随机 OHLCV ─────────────────────────────────────────────────
@@ -45,27 +51,15 @@ def _make_ohlcv(N: int = 3, T: int = 200, seed: int = 42) -> dict:
 # ─────────────────────────────────────────────────────────────────────────
 
 class TestKeyNumbers:
-    def test_feature_count(self):
-        """特征数应 == 65（8 大类全覆盖，R1.1）。"""
-        assert len(FEATURE_NAMES) == 65, (
-            f"期望 65 个特征，实际 {len(FEATURE_NAMES)}"
-        )
+    def test_v2_vocab_is_single_symbol_only(self):
+        names = set(FORMULA_VOCAB.token_names)
+        assert names.isdisjoint(REMOVED)
+        assert len(FEATURE_REGISTRY.feature_names) == 60
+        assert len(OPERATOR_REGISTRY.operator_names) == 63
+        assert FORMULA_VOCAB.size == 123
 
-    def test_operator_count(self):
-        """算子数应 == 66（含 CS_RANK/CS_SCALE/CS_NEUTRALIZE 等新增）。"""
-        assert len(OPS_CONFIG) == 66, (
-            f"期望 66 个算子，实际 {len(OPS_CONFIG)}"
-        )
-
-    def test_vocab_size(self):
-        """词表总大小 == 65 + 66 == 131。"""
-        assert FORMULA_VOCAB.size == 131, (
-            f"期望 vocab size=131，实际 {FORMULA_VOCAB.size}"
-        )
-
-    def test_feat_offset(self):
-        """feat_offset == 65（feature token id ∈ [0,64]，operator id ∈ [65,130]）。"""
-        assert FORMULA_VOCAB.operator_offset == 65
+    def test_feat_offset_matches_feature_registry(self):
+        assert FORMULA_VOCAB.operator_offset == len(FEATURE_REGISTRY.feature_names)
 
     def test_vocab_version_format(self):
         """VOCAB_VERSION 以 'v' 开头，后跟 12 位十六进制。"""
@@ -73,23 +67,48 @@ class TestKeyNumbers:
         assert len(VOCAB_VERSION) == 1 + 12, f"版本长度错误: {VOCAB_VERSION!r}"
 
     def test_vocab_version_deterministic(self):
-        """相同 token 列表两次派生出相同版本（确定性）。"""
+        """相同 V2 声明两次派生出相同版本（确定性）。"""
         from model_core.vocab import compute_vocab_version
-        v1 = compute_vocab_version(FORMULA_VOCAB.token_names)
-        v2 = compute_vocab_version(FORMULA_VOCAB.token_names)
+        feature_entries = tuple(
+            (spec.name, spec.lookback) for spec in FEATURE_REGISTRY.feature_specs
+        )
+        operator_entries = tuple(
+            (spec.name, spec.arity, spec.lookback)
+            for spec in OPERATOR_REGISTRY.operator_specs
+        )
+        v1 = compute_vocab_version(feature_entries, operator_entries)
+        v2 = compute_vocab_version(feature_entries, operator_entries)
         assert v1 == v2
+
+    def test_vocab_version_changes_with_lookback_or_order(self):
+        from model_core.vocab import compute_vocab_version
+        feature_entries = tuple(
+            (spec.name, spec.lookback) for spec in FEATURE_REGISTRY.feature_specs
+        )
+        operator_entries = tuple(
+            (spec.name, spec.arity, spec.lookback)
+            for spec in OPERATOR_REGISTRY.operator_specs
+        )
+        baseline = compute_vocab_version(feature_entries, operator_entries)
+        changed_window = (
+            (feature_entries[0][0], feature_entries[0][1] + 1),
+            *feature_entries[1:],
+        )
+        changed_order = (feature_entries[1], feature_entries[0], *feature_entries[2:])
+        assert compute_vocab_version(changed_window, operator_entries) != baseline
+        assert compute_vocab_version(changed_order, operator_entries) != baseline
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 步骤 2：compute_features → [3, 65, 200]
+# 步骤 2：compute_features → [3, F, 200]
 # ─────────────────────────────────────────────────────────────────────────
 
 class TestComputeFeatures:
     def test_shape(self):
         raw = _make_ohlcv(N=3, T=200)
         feats = MT5FeatureEngineer.compute_features(raw)
-        assert feats.shape == (3, 65, 200), (
-            f"features 形状期望 [3,65,200]，实际 {tuple(feats.shape)}"
+        assert feats.shape == (3, len(FEATURE_NAMES), 200), (
+            f"features 形状期望 [3,{len(FEATURE_NAMES)},200]，实际 {tuple(feats.shape)}"
         )
 
     def test_nan_safe(self):
@@ -108,7 +127,7 @@ class TestStackVM:
         raw = _make_ohlcv(N=3, T=200)
         feats = MT5FeatureEngineer.compute_features(raw)
         vm = StackVM()
-        # [feat0, feat1, ADD]：feat0=RET(0), feat1=RET5(1), ADD(token=65+0=65)
+        # [feat0, feat1, ADD]：算子偏移动态来自 V2 feature_count。
         formula = [0, 1, vm.feat_offset + 0]   # feat0, feat1, ADD
         result = vm.execute(formula, feats)
         assert result is not None, "vm.execute 返回 None"
@@ -118,13 +137,13 @@ class TestStackVM:
         assert not torch.isnan(result).any()
         assert not torch.isinf(result).any()
 
-    def test_feat_offset_is_65(self):
+    def test_feat_offset_matches_vocab(self):
         vm = StackVM()
-        assert vm.feat_offset == 65
+        assert vm.feat_offset == FORMULA_VOCAB.feature_count
 
-    def test_op_map_size_is_66(self):
+    def test_op_map_size_matches_registry(self):
         vm = StackVM()
-        assert len(vm.op_map) == 66
+        assert len(vm.op_map) == len(OPERATOR_REGISTRY.operator_names)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -139,7 +158,7 @@ class TestEvaluatorPipeline:
         torch.manual_seed(0)
         self.N, self.T = 3, 200
         raw = _make_ohlcv(N=self.N, T=self.T)
-        feats = MT5FeatureEngineer.compute_features(raw)   # [3, 65, 200]
+        feats = MT5FeatureEngineer.compute_features(raw)   # [3, F, 200]
         vm = StackVM()
 
         # 候选因子：用 [feat0, feat1, ADD] 公式
@@ -271,9 +290,9 @@ def test_full_pipeline_smoke(tmp_path):
     # 1. 构造随机 OHLCV（N=3, T=200）
     raw = _make_ohlcv(N=3, T=200, seed=99)
 
-    # 2. compute_features → [3, 65, 200]
+    # 2. compute_features → [3, F, 200]
     feats = MT5FeatureEngineer.compute_features(raw)
-    assert feats.shape == (3, 65, 200), f"特征形状错误: {tuple(feats.shape)}"
+    assert feats.shape == (3, len(FEATURE_NAMES), 200), f"特征形状错误: {tuple(feats.shape)}"
     assert not torch.isnan(feats).any()
 
     # 3. VM 执行简单公式 → [3, 200]

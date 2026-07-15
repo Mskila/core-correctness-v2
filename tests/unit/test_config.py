@@ -7,19 +7,24 @@ Requirements: 11.1
 import pytest
 import sys
 import os
+import ast
+from pathlib import Path
 
 # 确保项目根目录在 sys.path 中
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from config import Config
+from model_core.config import ModelConfig
+from model_core.vocab import FORMULA_VOCAB
 
 
 class TestConfigInputDim:
-    def test_input_dim_equals_6(self):
-        assert Config.INPUT_DIM == 20   # expanded from 10 to 20 features
+    def test_root_config_has_no_executable_input_dim(self):
+        assert not hasattr(Config, "INPUT_DIM")
 
-    def test_input_dim_is_int(self):
-        assert isinstance(Config.INPUT_DIM, int)
+    def test_model_input_dim_is_derived_from_v2_vocab(self):
+        assert ModelConfig.INPUT_DIM == FORMULA_VOCAB.feature_count
+        assert isinstance(ModelConfig.INPUT_DIM, int)
 
 
 class TestConfigCostRate:
@@ -56,11 +61,27 @@ class TestConfigSymbols:
 
 
 class TestConfigDataParams:
-    def test_min_bars_equals_100(self):
-        assert Config.MIN_BARS == 3000   # updated for 5-symbol portfolio
+    def test_root_config_has_no_fixed_min_bars(self):
+        assert not hasattr(Config, "MIN_BARS")
 
     def test_bars_count_equals_2000(self):
         assert Config.BARS_COUNT >= 100   # 只断言合理下界，不固定具体值
+
+    def test_formal_python_paths_do_not_read_config_min_bars(self):
+        root = Path(__file__).resolve().parents[2]
+        paths = list(root.glob("*.py")) + list((root / "model_core").glob("*.py"))
+        offenders = []
+        for path in paths:
+            tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "MIN_BARS"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "Config"
+                ):
+                    offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+        assert offenders == []
 
 
 class TestConfigStrategyParams:

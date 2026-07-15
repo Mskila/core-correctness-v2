@@ -9,12 +9,12 @@ model_core/vocab.py -- Formula_Vocabulary 集成与确定性版本（R3）
   - token id 分段：feature id ∈ [0, F-1]，operator id ∈ [F, F+O-1]，两段严格
     不相交（`operator_offset == feature_count`，R3.3）。
   - 构建时用集合校验 token 名称全局唯一、无缺失/重复/多余（R3.1、R3.2）。
-  - `VOCAB_VERSION` 由有序 token 名称列表确定性派生（R3.4、R3.5）：
-        VOCAB_VERSION = "v" + sha256("\n".join(token_names)).hexdigest()[:12]
-    相同有序列表 → 相同版本；任意组成/顺序变化 → 不同版本。
+  - `VOCAB_VERSION` 对核心语义版本、schema tag、有序 feature 名/lookback 和
+    有序 operator 名/arity/lookback 的规范 JSON 做稳定 SHA-256 哈希。
+    相同 V2 声明 → 相同版本；任意窗口、组成或顺序变化 → 不同版本。
   - `FORMULA_VOCAB.verify(artifact_version)`：版本不匹配抛
     `VocabVersionMismatchError`，拒绝且不消费任何 token（R3.7）。
-  - `VOCAB_SCHEMA_TAG`：人类可读的 schema 标签，仅供日志展示，不参与兼容判定。
+  - `VOCAB_SCHEMA_TAG`：人类可读的 schema 标签，同时参与兼容身份哈希。
 
 import 方向说明：`features.py` / `ops.py` 只依赖 `.registry`，本模块从二者读取
 注册表视图不构成循环依赖。下游 `vm.py` / `config.py` /
@@ -24,13 +24,15 @@ import 方向说明：`features.py` / `ops.py` 只依赖 `.registry`，本模块
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 
 from .features import FEATURE_REGISTRY
 from .ops import OPERATOR_REGISTRY
+from .semantics import CORE_SEMANTICS_VERSION
 
-# 人类可读 schema 标签（仅供日志/报告展示，不参与兼容性判定，R3.5）
-VOCAB_SCHEMA_TAG = "4.0-registry"
+# 人类可读 schema 标签，同时参与稳定 V2 身份哈希。
+VOCAB_SCHEMA_TAG = "5.0-core-correctness-v2"
 
 
 # ── 版本层异常（R3.7）───────────────────────────────────────────────────
@@ -45,16 +47,33 @@ class VocabVersionMismatchError(Exception):
 
 # ── 确定性版本派生（R3.4、R3.5）─────────────────────────────────────────
 
-def compute_vocab_version(token_names: tuple[str, ...]) -> str:
-    """由有序 token 名称列表确定性派生紧凑版本标识。
-
-    VOCAB_VERSION = "v" + sha256("\n".join(token_names)).hexdigest()[:12]
-
-    性质：相同的有序列表 → 相同版本；任意组成或顺序变化 → 不同版本。使用换行
-    作为稳定分隔符，避免名称拼接歧义。
-    """
-    joined = "\n".join(token_names)
-    digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()
+def compute_vocab_version(
+    feature_entries: tuple[tuple[str, int], ...],
+    operator_entries: tuple[tuple[str, int, int], ...],
+    *,
+    core_semantics_version: str = CORE_SEMANTICS_VERSION,
+    schema_tag: str = VOCAB_SCHEMA_TAG,
+) -> str:
+    """Hash ordered V2 declarations, including windows and operator arity."""
+    payload = {
+        "core_semantics_version": core_semantics_version,
+        "schema_tag": schema_tag,
+        "features": [
+            {"name": name, "lookback": lookback}
+            for name, lookback in feature_entries
+        ],
+        "operators": [
+            {"name": name, "arity": arity, "lookback": lookback}
+            for name, arity, lookback in operator_entries
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
     return "v" + digest[:12]
 
 
@@ -62,6 +81,9 @@ def compute_vocab_version(token_names: tuple[str, ...]) -> str:
 class FormulaVocab:
     feature_names: tuple[str, ...]
     operator_names: tuple[str, ...]
+    feature_lookbacks: tuple[int, ...]
+    operator_arities: tuple[int, ...]
+    operator_lookbacks: tuple[int, ...]
 
     @property
     def feature_count(self) -> int:
@@ -82,8 +104,17 @@ class FormulaVocab:
 
     @property
     def version(self) -> str:
-        """当前词表组成确定性派生的 VOCAB_VERSION（R3.4）。"""
-        return compute_vocab_version(self.token_names)
+        """当前有序 V2 声明确定性派生的 VOCAB_VERSION。"""
+        return compute_vocab_version(
+            tuple(zip(self.feature_names, self.feature_lookbacks)),
+            tuple(
+                zip(
+                    self.operator_names,
+                    self.operator_arities,
+                    self.operator_lookbacks,
+                )
+            ),
+        )
 
     def verify(self, artifact_version: str) -> None:
         """校验产物版本与当前派生版本一致（R3.7）。
@@ -102,7 +133,10 @@ class FormulaVocab:
 
 # ── 构建 FORMULA_VOCAB（由 registry 派生）与完整性校验（R3.1、R3.2）──────
 
-def _build_formula_vocab() -> FormulaVocab:
+def _build_formula_vocab(
+    feature_registry=FEATURE_REGISTRY,
+    operator_registry=OPERATOR_REGISTRY,
+) -> FormulaVocab:
     """由 FEATURE_REGISTRY / OPERATOR_REGISTRY 构建词表并做完整性校验。
 
     校验（用集合，R3.1、R3.2）：
@@ -111,8 +145,10 @@ def _build_formula_vocab() -> FormulaVocab:
       - size == F + O（无缺失/多余）。
     任一校验失败即抛错，不产出不一致的词表。
     """
-    feature_names = tuple(FEATURE_REGISTRY.feature_names)
-    operator_names = tuple(OPERATOR_REGISTRY.operator_names)
+    feature_specs = tuple(feature_registry.feature_specs)
+    operator_specs = tuple(operator_registry.operator_specs)
+    feature_names = tuple(spec.name for spec in feature_specs)
+    operator_names = tuple(spec.name for spec in operator_specs)
 
     feat_set = set(feature_names)
     op_set = set(operator_names)
@@ -130,7 +166,13 @@ def _build_formula_vocab() -> FormulaVocab:
     if overlap:
         raise ValueError(f"feature 与 operator 名称冲突: {sorted(overlap)}")
 
-    vocab = FormulaVocab(feature_names=feature_names, operator_names=operator_names)
+    vocab = FormulaVocab(
+        feature_names=feature_names,
+        operator_names=operator_names,
+        feature_lookbacks=tuple(spec.lookback for spec in feature_specs),
+        operator_arities=tuple(spec.arity for spec in operator_specs),
+        operator_lookbacks=tuple(spec.lookback for spec in operator_specs),
+    )
 
     # 计数一致性：size == F + O，无缺失/重复/多余（R3.2）
     expected = len(feature_names) + len(operator_names)
@@ -150,7 +192,7 @@ FORMULA_VOCAB = _build_formula_vocab()
 # 由注册表导出有序特征名视图（保持下游 import 兼容）
 FEATURE_NAMES = FORMULA_VOCAB.feature_names
 
-# 词表版本：由有序 token 名称列表确定性派生（R3.4、R3.5）。
+# 词表版本：由核心语义/schema 身份和有序 V2 完整声明确定性派生（R3.4、R3.5）。
 # 特征/算子的组成或顺序变化都会改变本值，旧 checkpoint / best_strategy.json 将
 # 因版本不匹配而被 verify() 拒绝加载。
 VOCAB_VERSION = FORMULA_VOCAB.version
