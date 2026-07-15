@@ -283,6 +283,112 @@ class TestHelperFunctions:
         )
 
 
+class TestProductFiveFormula:
+    def test_registry_transform_matches_explicit_causal_compounding(self):
+        cases = (
+            torch.tensor(
+                [
+                    [0.10, -0.20, 0.05, 0.30, -0.10, 0.25, -0.15, 0.40],
+                    [0.20, -1.20, 0.15, -0.30, 0.40, -0.05, 0.25, -0.10],
+                ],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [[-0.99, -0.99, 0.10, -0.20, 0.05]],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [[9.05984497, -0.998884857, -0.879774213, 10.1290340,
+                  89.9148178]],
+                dtype=torch.float32,
+            ),
+        )
+        product = next(
+            spec.transform
+            for spec in OPERATOR_REGISTRY.operator_specs
+            if spec.name == "PRODUCT_5"
+        )
+
+        for x in cases:
+            actual = product(x)
+            safe = x.clamp_min(-0.999)
+            expected = torch.stack(
+                [
+                    torch.prod(
+                        1.0 + safe[:, max(0, end - 4):end + 1], dim=1
+                    )
+                    - 1.0
+                    for end in range(x.shape[1])
+                ],
+                dim=1,
+            )
+
+            torch.testing.assert_close(actual, expected, rtol=0, atol=2.0e-7)
+
+    @pytest.mark.parametrize(
+        ("dtype", "atol"),
+        [(torch.float32, 2.0e-7), (torch.float64, 2.0e-15)],
+    )
+    def test_registry_transform_preserves_tensor_contract_and_true_append(
+        self, dtype, atol
+    ):
+        prefix = torch.tensor(
+            [
+                [0.10, -0.20, 0.05, 0.30, -0.10, 0.25, -0.15, 0.40],
+                [0.20, -0.35, 0.15, -0.30, 0.40, -0.05, 0.25, -0.10],
+            ],
+            dtype=dtype,
+        )
+        future = torch.tensor(
+            [[0.20, -0.05, 0.10, -0.25], [-0.15, 0.30, -0.20, 0.05]],
+            dtype=dtype,
+        )
+        short = prefix.clone().requires_grad_()
+        long = torch.cat((prefix, future), dim=1).requires_grad_()
+        product = next(
+            spec.transform
+            for spec in OPERATOR_REGISTRY.operator_specs
+            if spec.name == "PRODUCT_5"
+        )
+
+        def explicit_compounding(x):
+            safe = x.clamp_min(-0.999)
+            return torch.stack(
+                [
+                    torch.prod(
+                        1.0 + safe[:, max(0, end - 4):end + 1], dim=1
+                    )
+                    - 1.0
+                    for end in range(x.shape[1])
+                ],
+                dim=1,
+            )
+
+        short_output = product(short)
+        long_output = product(long)
+        for output, operand in ((short_output, short), (long_output, long)):
+            assert output.shape == operand.shape
+            assert output.dtype == operand.dtype
+            assert output.device == operand.device
+            torch.testing.assert_close(
+                output, explicit_compounding(operand), rtol=0, atol=atol
+            )
+        assert torch.equal(short_output, long_output[:, :prefix.shape[1]])
+
+        short_output.sum().backward()
+        long_output[:, :prefix.shape[1]].sum().backward()
+        assert short.grad is not None and torch.isfinite(short.grad).all()
+        assert long.grad is not None and torch.isfinite(long.grad).all()
+        assert torch.count_nonzero(short.grad).item() == short.numel()
+        assert torch.equal(short.grad, long.grad[:, :prefix.shape[1]])
+        torch.testing.assert_close(
+            long.grad[:, prefix.shape[1]:],
+            torch.zeros_like(long.grad[:, prefix.shape[1]:]),
+            rtol=0,
+            atol=0,
+        )
+
+
 class TestOperatorLookbacks:
     @staticmethod
     def _spec(name):
