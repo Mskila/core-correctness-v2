@@ -121,16 +121,23 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
         if use_high_precision_fallback
         else windows
     )
-    means = (statistics_windows * weights).sum(dim=-1) / counts
+    if use_high_precision_fallback:
+        safe_windows = ~unsafe_windows
+        native_anchors = torch.where(
+            safe_windows, work.detach(), torch.zeros_like(work)
+        )
+    else:
+        safe_windows = None
+        native_anchors = work.detach()
+    shifted_windows = (
+        statistics_windows - native_anchors.unsqueeze(-1)
+    ) * weights
+    means = shifted_windows.sum(dim=-1) / counts
     if work.dtype == torch.float64 and not torch.isfinite(means).all():
         raise FloatingPointError(
             "causal_rolling_zscore rolling mean is not finite"
         )
-    centered = (statistics_windows - means.unsqueeze(-1)) * weights
-    if use_high_precision_fallback:
-        safe_windows = ~unsafe_windows
-    else:
-        safe_windows = None
+    centered = (shifted_windows - means.unsqueeze(-1)) * weights
     if work.dtype == torch.float64 and not torch.isfinite(centered).all():
         raise FloatingPointError(
             "causal_rolling_zscore centered values are not finite"
@@ -156,12 +163,13 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
     denominators = torch.where(
         active, standard_deviations, torch.ones_like(standard_deviations)
     )
+    native_values = work - native_anchors
     native_means = (
-        torch.where(safe_windows, means, work)
+        torch.where(safe_windows, means, native_values)
         if use_high_precision_fallback
         else means
     )
-    normalized = (work - native_means) / denominators
+    normalized = (native_values - native_means) / denominators
     result = torch.where(active, normalized, torch.zeros_like(normalized))
 
     if use_high_precision_fallback:

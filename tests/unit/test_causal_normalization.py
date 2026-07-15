@@ -233,6 +233,74 @@ def test_large_close_values_use_stable_two_point_population_statistics() -> None
     )
 
 
+def test_moderate_offset_two_point_population_statistics_are_exact() -> None:
+    x = torch.tensor(
+        [[15.0, 15.03]], dtype=torch.float32, requires_grad=True
+    )
+    observed = x.detach().to(torch.float64)
+    assert observed[0, 1].item() == 15.029999732971191
+    assert observed[0, 0].item() != observed[0, 1].item()
+
+    output = causal_rolling_zscore(x, window=2)
+    first_gradient = torch.autograd.grad(
+        output[0, 1], x, create_graph=True
+    )[0]
+    second_gradient = torch.autograd.grad(first_gradient.sum(), x)[0]
+
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[0.0, 1.0]], dtype=x.dtype),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        first_gradient, torch.zeros_like(x), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        second_gradient, torch.zeros_like(x), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("window", [2, 4])
+def test_moderate_local_differences_are_translation_invariant(window: int) -> None:
+    translated_values = torch.tensor(
+        [[15.0, 15.03, 15.07, 15.11, 15.18]], dtype=torch.float32
+    )
+    local_values = translated_values - translated_values[:, :1]
+    assert torch.equal(
+        local_values + translated_values[:, :1], translated_values
+    )
+
+    local = local_values.detach().requires_grad_()
+    translated = translated_values.detach().requires_grad_()
+    local_output = causal_rolling_zscore(local, window)
+    translated_output = causal_rolling_zscore(translated, window)
+    tolerance = torch.finfo(torch.float32).eps
+
+    torch.testing.assert_close(
+        local_output,
+        _prefix_reference(local, window),
+        rtol=0,
+        atol=tolerance,
+    )
+    torch.testing.assert_close(
+        translated_output,
+        _prefix_reference(translated, window),
+        rtol=0,
+        atol=tolerance,
+    )
+    assert torch.equal(local_output, translated_output)
+
+    weights = torch.linspace(-0.4, 0.7, local.shape[1]).unsqueeze(0)
+    local_gradient = torch.autograd.grad(
+        (local_output * weights).sum(), local
+    )[0]
+    translated_gradient = torch.autograd.grad(
+        (translated_output * weights).sum(), translated
+    )[0]
+    assert torch.equal(local_gradient, translated_gradient)
+
+
 @pytest.mark.parametrize("scale", [1.0e20, 3.0e38])
 def test_large_finite_asymmetric_scale_preserves_output_and_gradient(
     scale: float,
