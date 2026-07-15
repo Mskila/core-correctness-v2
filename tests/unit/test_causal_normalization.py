@@ -153,6 +153,56 @@ def test_ordinary_float32_forward_and_backward_are_finite() -> None:
     assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
+@pytest.mark.parametrize("amplitude", [1.0e20, 3.0e38])
+def test_large_finite_float32_prefix_has_nonzero_output_and_finite_backward(
+    amplitude: float,
+) -> None:
+    x = torch.tensor(
+        [[amplitude, -amplitude]], dtype=torch.float32, requires_grad=True
+    )
+
+    output = causal_rolling_zscore(x, window=2)
+    output.square().sum().backward()
+
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[0.0, -1.0]], dtype=torch.float32),
+        rtol=0,
+        atol=1.0e-6,
+    )
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
+def test_large_finite_ohlcv_keeps_macd_hist_normalization_informative() -> None:
+    index = torch.arange(256, dtype=torch.float32).unsqueeze(0)
+    close = 100.0 + 0.08 * index + torch.sin(index / 4.0)
+    open_ = close + 0.1 * torch.cos(index / 5.0)
+    spread = 0.5 + 0.05 * torch.sin(index / 7.0).abs()
+    raw = {
+        "open": open_,
+        "high": torch.maximum(open_, close) + spread,
+        "low": torch.minimum(open_, close) - spread,
+        "close": close,
+        "volume": 1000.0 + 3.0 * index + 25.0 * torch.cos(index / 6.0),
+    }
+    scaled = {name: value * 1.0e20 for name, value in raw.items()}
+
+    ordinary = MT5FeatureEngineer._c_macd_hist(raw)
+    large = MT5FeatureEngineer._c_macd_hist(scaled)
+
+    assert torch.isfinite(large).all()
+    assert torch.count_nonzero(ordinary).item() == 255
+    assert torch.count_nonzero(large).item() >= 250
+
+
+def test_unsupported_finite_float64_variance_fails_closed() -> None:
+    x = torch.tensor([[1.0e200, -1.0e200]], dtype=torch.float64)
+
+    with pytest.raises(FloatingPointError, match="variance"):
+        causal_rolling_zscore(x, window=2)
+
+
 def test_ordinary_float64_gradcheck_and_gradgradcheck() -> None:
     x = torch.tensor(
         [[0.25, 1.0, 2.0, -1.0, 3.0]],

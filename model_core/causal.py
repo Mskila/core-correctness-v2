@@ -51,11 +51,12 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
             "causal_rolling_zscore requires finite input values"
         )
 
-    # CPU reductions for half types are both more stable and more broadly
-    # supported in float32. Float32/float64 retain their native semantics.
+    # Float64 work values keep every finite float32 square representable while
+    # preserving the threshold in the input's original units. Outputs are cast
+    # back only after the rolling statistics have been validated.
     work_dtype = (
-        torch.float32
-        if x.dtype in (torch.float16, torch.bfloat16)
+        torch.float64
+        if x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         else x.dtype
     )
     work = x.to(work_dtype)
@@ -82,8 +83,20 @@ def causal_rolling_zscore(x: torch.Tensor, window: int = 200) -> torch.Tensor:
     counts = weights.sum(dim=-1).clamp_min(1.0)
 
     means = (windows * weights).sum(dim=-1) / counts
+    if not torch.isfinite(means).all():
+        raise FloatingPointError(
+            "causal_rolling_zscore rolling mean is not finite"
+        )
     centered = (windows - means.unsqueeze(-1)) * weights
+    if not torch.isfinite(centered).all():
+        raise FloatingPointError(
+            "causal_rolling_zscore centered values are not finite"
+        )
     variances = centered.square().sum(dim=-1) / counts
+    if not torch.isfinite(variances).all():
+        raise FloatingPointError(
+            "causal_rolling_zscore rolling variance is not finite"
+        )
 
     # Avoid sqrt(0) in the graph: torch.where selects values in forward, but
     # an unsafe inactive expression can still poison backward with 0 * inf.
