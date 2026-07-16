@@ -586,7 +586,11 @@ def test_atomic_write_precommit_failures_leave_both_originals_byte_identical(
     new = canonical_dataset(1_700_000_000, 3, price_offset=20.0)
     path, metadata_path, parquet_before, metadata_before = seeded_cache(cache, old)
     if failure_stage == "serialization":
-        monkeypatch.setattr(pd.DataFrame, "to_parquet", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("serialize")))
+        monkeypatch.setattr(
+            pd.DataFrame,
+            "to_parquet",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("serialize")),
+        )
     else:
         original_write_text = Path.write_text
 

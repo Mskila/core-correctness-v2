@@ -8,6 +8,7 @@ from pyarrow.lib import ArrowInvalid
 import data_pipeline.kline_cache as kline_cache_module
 from data_pipeline.fetcher import MT5DataFetcher
 from data_pipeline.kline_cache import KlineCache
+from data_pipeline.validation import canonicalize_ohlcv
 from model_core.semantics import DataValidationError
 
 
@@ -419,14 +420,23 @@ def test_cache_update_or_write_oserror_propagates_without_direct_retry(
 ) -> None:
     cache = KlineCache(tmp_path, timeframe=16385)
     path = cache._cache_path("EURUSD")
-    pd.DataFrame(
-        [
-            (1_700_000_000 + index * 3_600, 10.0 + index, 11.0 + index,
-             9.0 + index, 10.5 + index, 100 + index)
-            for index in range(6)
-        ],
-        columns=["time", "open", "high", "low", "close", "tick_volume"],
-    ).to_parquet(path, index=False)
+    initial = canonicalize_ohlcv(
+        pd.DataFrame(
+            [
+                (1_700_000_000 + index * 3_600, 10.0 + index, 11.0 + index,
+                 9.0 + index, 10.5 + index, 100 + index)
+                for index in range(6)
+            ],
+            columns=["time", "open", "high", "low", "close", "tick_volume"],
+        ),
+        symbol="EURUSD",
+        timeframe=16385,
+        numeric_time_unit="s",
+    )
+    cache._atomic_write("EURUSD", initial)
+    metadata_path = cache._metadata_path("EURUSD")
+    parquet_before = path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
     fake = FakeMT5()
     if failure_source == "atomic-write":
         revision_rates = np.array(
@@ -468,6 +478,8 @@ def test_cache_update_or_write_oserror_propagates_without_direct_retry(
 
     expected_calls = 0 if failure_source == "incremental" else 1
     assert len(fake.calls) == expected_calls
+    assert path.read_bytes() == parquet_before
+    assert metadata_path.read_bytes() == metadata_before
 
 
 @pytest.mark.parametrize("rates_value", [None, []])
