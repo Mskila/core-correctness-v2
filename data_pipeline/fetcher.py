@@ -7,6 +7,15 @@ data_pipeline/fetcher.py — MT5 数据获取模块
 import pandas as pd
 from loguru import logger
 
+from data_pipeline.kline_cache import (
+    CacheReadError,
+    KlineCache,
+    _canonicalize_closed_rates,
+    _closed_rates_are_empty,
+    _copy_closed_rates,
+    _empty_canonical_frame,
+)
+
 try:
     import MetaTrader5 as mt5
     _MT5_AVAILABLE = True
@@ -14,8 +23,8 @@ except ImportError:
     _MT5_AVAILABLE = False
     mt5 = None  # type: ignore
 
-# DataFrame 返回列定义
-_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume"]
+# 公共 DataFrame 返回列定义
+_COLUMNS = ["time", "open", "high", "low", "close", "volume"]
 
 
 class MT5DataFetcher:
@@ -73,14 +82,13 @@ class MT5DataFetcher:
             count:     要获取的 K 线数量。
 
         Returns:
-            包含列 time, open, high, low, close, tick_volume 的 DataFrame。
+            包含规范列 time UTC, open, high, low, close, volume 的 DataFrame。
             若品种不可用，返回空 DataFrame（列名相同）。
         """
         # ── 优先读本地缓存 ────────────────────────────────────────────
         # 使用本地缓存的全部历史数据，不再用 tail(count) 截断。
         # count 仅用于无本地缓存时从 MT5 全量下载的最大根数。
         try:
-            from data_pipeline.kline_cache import KlineCache
             cache = KlineCache(timeframe=timeframe, bars_count=count)
             mt5_connected = (
                 not self.offline
@@ -92,25 +100,30 @@ class MT5DataFetcher:
             if df is not None and not df.empty:
                 # 本地有数据，返回全部历史（不截断）
                 return df.reset_index(drop=True)
-        except Exception as exc:
+        except CacheReadError as exc:
             logger.debug(f"[Fetcher] Cache read failed for {symbol}: {exc}, falling back to MT5")
 
         # ── 缓存不足时从 MT5 直接拉 ──────────────────────────────────
         if self.offline or not _MT5_AVAILABLE or mt5 is None or not self._mt5_initialized:
             logger.warning(f"{'Offline mode' if self.offline else 'MT5 not available'}, "
                            f"returning empty DataFrame for {symbol}.")
-            return pd.DataFrame(columns=_COLUMNS)
+            return _empty_canonical_frame()
 
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)  # type: ignore[union-attr]
+        rates = _copy_closed_rates(mt5, symbol, timeframe, count)
 
-        if rates is None or len(rates) == 0:
+        if _closed_rates_are_empty(rates):
             logger.warning(
                 f"Symbol '{symbol}' returned no data (possibly unavailable). "
                 f"MT5 error: {mt5.last_error()}"  # type: ignore[union-attr]
             )
-            return pd.DataFrame(columns=_COLUMNS)
+            return _empty_canonical_frame()
 
-        df = pd.DataFrame(rates)[_COLUMNS]
+        dataset = _canonicalize_closed_rates(
+            rates,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        df = dataset.frame
         logger.debug(f"Fetched {len(df)} bars for {symbol} (timeframe={timeframe}) from MT5.")
         return df
 
