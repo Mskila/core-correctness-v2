@@ -11,12 +11,13 @@ import pandas as pd
 import pytest
 import torch
 
+import data_pipeline.validation as validation
 from data_pipeline.data_manager import MT5DataManager, compute_forward_open_returns
 from data_pipeline.validation import canonicalize_ohlcv
 from model_core.semantics import DataValidationError
 
 
-def _make_fake_rates(n: int = 5) -> np.ndarray:
+def _make_fake_rates(n: int = 5, *, spacing_seconds: int = 3600) -> np.ndarray:
     dtype = np.dtype(
         [
             ("time", np.int64),
@@ -30,12 +31,15 @@ def _make_fake_rates(n: int = 5) -> np.ndarray:
         ]
     )
     data = np.zeros(n, dtype=dtype)
-    data["time"] = 1_700_000_000 + np.arange(n, dtype=np.int64) * 3600
+    data["time"] = (
+        1_700_000_000
+        + np.arange(n, dtype=np.int64) * spacing_seconds
+    )
     data["open"] = 1800.0 + np.arange(n, dtype=np.float64)
     data["high"] = data["open"] + 2.0
     data["low"] = data["open"] - 2.0
     data["close"] = data["open"] + 0.5
-    data["tick_volume"] = 100
+    data["tick_volume"] = 100 + np.arange(n, dtype=np.int64)
     return data
 
 
@@ -64,24 +68,105 @@ symbol_strategy = st.text(
     min_size=1,
     max_size=12,
 )
-timeframe_strategy = st.integers(min_value=1, max_value=49153)
+SUPPORTED_TIMEFRAMES = (
+    ("M1", 1, 60),
+    ("M5", 5, 5 * 60),
+    ("M15", 15, 15 * 60),
+    ("M30", 30, 30 * 60),
+    ("H1", 16385, 60 * 60),
+    ("H4", 16388, 4 * 60 * 60),
+    ("D1", 16408, 24 * 60 * 60),
+    ("W1", 32769, 7 * 24 * 60 * 60),
+    ("MN1", 49153, 31 * 24 * 60 * 60),
+)
+timeframe_strategy = st.sampled_from(SUPPORTED_TIMEFRAMES)
+INVALID_TIMEFRAMES = (0, -1, 2, 16384, 32770, 49154)
+VALID_TIMEFRAME_BOUNDARIES = (
+    ("M1", "M1"),
+    ("H1", "H1"),
+    ("MN1", "MN1"),
+    (1, "M1"),
+    (16385, "H1"),
+    (49153, "MN1"),
+)
+COERCIBLE_INVALID_TIMEFRAMES = (
+    1.0,
+    16385.0,
+    49153.0,
+    "1",
+    "16385",
+    "49153",
+    False,
+    True,
+)
+TOO_SHORT_CADENCES = (
+    ("M1", 1, 59),
+    ("M5", 5, 60),
+    ("M15", 15, 5 * 60),
+    ("M30", 30, 15 * 60),
+    ("H1", 16385, 30 * 60),
+    ("H4", 16388, 60 * 60),
+    ("D1", 16408, 4 * 60 * 60),
+    ("W1", 32769, 24 * 60 * 60),
+)
+
+
+@pytest.mark.parametrize(("timeframe", "expected"), VALID_TIMEFRAME_BOUNDARIES)
+def test_timeframe_normalization_accepts_only_canonical_names_or_builtin_ints(
+    timeframe: str | int,
+    expected: str,
+) -> None:
+    assert validation.normalize_timeframe_name(timeframe) == expected
+
+
+@pytest.mark.parametrize("timeframe", COERCIBLE_INVALID_TIMEFRAMES)
+def test_timeframe_normalization_rejects_coercible_non_contract_values(
+    timeframe: object,
+) -> None:
+    with pytest.raises(DataValidationError) as exc_info:
+        validation.normalize_timeframe_name(timeframe)  # type: ignore[arg-type]
+
+    assert str(exc_info.value) == f"unknown timeframe: {timeframe!r}"
 
 
 @settings(max_examples=100)
-@given(symbol=symbol_strategy, timeframe=timeframe_strategy)
+@given(symbol=symbol_strategy, timeframe_case=timeframe_strategy)
 def test_fetcher_returns_canonical_dataframe_when_mt5_succeeds(
-    symbol: str, timeframe: int
+    symbol: str, timeframe_case: tuple[str, int, int]
 ) -> None:
-    fake_rates = _make_fake_rates(n=5)
+    timeframe_name, timeframe, spacing_seconds = timeframe_case
+    fake_rates = _make_fake_rates(n=5, spacing_seconds=spacing_seconds)
     mock_mt5 = MagicMock()
     mock_mt5.copy_rates_from_pos.return_value = fake_rates
     mock_mt5.initialize.return_value = True
     mock_mt5.last_error.return_value = (0, "No error")
 
+    canonicalization_calls: list[tuple[int, str]] = []
+
+    def record_canonicalization(
+        frame: pd.DataFrame,
+        *,
+        symbol: str,
+        timeframe: int,
+        numeric_time_unit: str | None = None,
+    ):
+        dataset = canonicalize_ohlcv(
+            frame,
+            symbol=symbol,
+            timeframe=timeframe,
+            numeric_time_unit=numeric_time_unit,
+        )
+        canonicalization_calls.append((timeframe, dataset.identity.timeframe))
+        return dataset
+
     with (
         patch("data_pipeline.fetcher.mt5", mock_mt5),
         patch("data_pipeline.fetcher._MT5_AVAILABLE", True),
         patch("data_pipeline.kline_cache.KlineCache.get", return_value=None),
+        patch(
+            "data_pipeline.kline_cache.canonicalize_ohlcv",
+            side_effect=record_canonicalization,
+        ),
     ):
         from data_pipeline.fetcher import MT5DataFetcher
 
@@ -95,10 +180,132 @@ def test_fetcher_returns_canonical_dataframe_when_mt5_succeeds(
         "high",
         "low",
         "close",
-        "tick_volume",
+        "volume",
     ]
+    assert "tick_volume" not in frame.columns
     assert len(frame) == 5
-    mock_mt5.copy_rates_from_pos.assert_called_once_with(symbol, timeframe, 0, 5)
+    assert isinstance(frame["time"].dtype, pd.DatetimeTZDtype)
+    assert str(frame["time"].dt.tz) == "UTC"
+    assert frame["time"].is_monotonic_increasing
+    assert frame["time"].is_unique
+    for column in ("open", "high", "low", "close", "volume"):
+        assert pd.api.types.is_numeric_dtype(frame[column])
+        assert np.isfinite(frame[column].to_numpy()).all()
+    assert frame["volume"].tolist() == fake_rates["tick_volume"].astype(float).tolist()
+    assert canonicalization_calls == [(timeframe, timeframe_name)]
+
+    mock_mt5.copy_rates_from_pos.assert_called_once_with(symbol, timeframe, 1, 5)
+    call_args = mock_mt5.copy_rates_from_pos.call_args.args
+    assert call_args[2] == 1
+    assert call_args[3] == 5
+
+
+@pytest.mark.parametrize("timeframe", INVALID_TIMEFRAMES)
+def test_fetcher_rejects_representative_invalid_timeframes(timeframe: int) -> None:
+    mock_mt5 = MagicMock()
+    mock_mt5.copy_rates_from_pos.return_value = _make_fake_rates(n=5)
+    mock_mt5.initialize.return_value = True
+    mock_mt5.last_error.return_value = (0, "No error")
+
+    with (
+        patch("data_pipeline.fetcher.mt5", mock_mt5),
+        patch("data_pipeline.fetcher._MT5_AVAILABLE", True),
+        patch("data_pipeline.kline_cache.KlineCache.get", return_value=None),
+    ):
+        from data_pipeline.fetcher import MT5DataFetcher
+
+        fetcher = MT5DataFetcher()
+        fetcher.connect()
+        with pytest.raises(DataValidationError) as exc_info:
+            fetcher.fetch("EURUSD", timeframe, count=5)
+
+    assert str(exc_info.value) == f"unknown timeframe: {timeframe!r}"
+
+
+@settings(max_examples=50)
+@given(
+    symbol=symbol_strategy,
+    timeframe=st.integers(min_value=-100_000, max_value=100_000).filter(
+        lambda value: value not in {case[1] for case in SUPPORTED_TIMEFRAMES}
+    ),
+)
+def test_fetcher_rejects_unsupported_timeframe(
+    symbol: str, timeframe: int
+) -> None:
+    mock_mt5 = MagicMock()
+    mock_mt5.copy_rates_from_pos.return_value = _make_fake_rates(n=5)
+    mock_mt5.initialize.return_value = True
+    mock_mt5.last_error.return_value = (0, "No error")
+
+    with (
+        patch("data_pipeline.fetcher.mt5", mock_mt5),
+        patch("data_pipeline.fetcher._MT5_AVAILABLE", True),
+        patch("data_pipeline.kline_cache.KlineCache.get", return_value=None),
+    ):
+        from data_pipeline.fetcher import MT5DataFetcher
+
+        fetcher = MT5DataFetcher()
+        fetcher.connect()
+        with pytest.raises(DataValidationError, match="unknown timeframe"):
+            fetcher.fetch(symbol, timeframe, count=5)
+
+
+@pytest.mark.parametrize(
+    ("timeframe_name", "timeframe", "spacing_seconds"),
+    TOO_SHORT_CADENCES,
+)
+def test_fetcher_rejects_cadence_shorter_than_requested_identity(
+    timeframe_name: str,
+    timeframe: int,
+    spacing_seconds: int,
+) -> None:
+    mock_mt5 = MagicMock()
+    mock_mt5.copy_rates_from_pos.return_value = _make_fake_rates(
+        n=5,
+        spacing_seconds=spacing_seconds,
+    )
+    mock_mt5.initialize.return_value = True
+    mock_mt5.last_error.return_value = (0, "No error")
+    canonicalization_arguments: list[int] = []
+
+    def record_canonicalization(
+        frame: pd.DataFrame,
+        *,
+        symbol: str,
+        timeframe: int,
+        numeric_time_unit: str | None = None,
+    ):
+        canonicalization_arguments.append(timeframe)
+        return canonicalize_ohlcv(
+            frame,
+            symbol=symbol,
+            timeframe=timeframe,
+            numeric_time_unit=numeric_time_unit,
+        )
+
+    with (
+        patch("data_pipeline.fetcher.mt5", mock_mt5),
+        patch("data_pipeline.fetcher._MT5_AVAILABLE", True),
+        patch("data_pipeline.kline_cache.KlineCache.get", return_value=None),
+        patch(
+            "data_pipeline.kline_cache.canonicalize_ohlcv",
+            side_effect=record_canonicalization,
+        ),
+    ):
+        from data_pipeline.fetcher import MT5DataFetcher
+
+        fetcher = MT5DataFetcher()
+        fetcher.connect()
+        with pytest.raises(
+            DataValidationError,
+            match=rf"shorter than timeframe {timeframe_name}",
+        ):
+            fetcher.fetch("EURUSD", timeframe, count=5)
+
+    assert canonicalization_arguments == [timeframe]
+    mock_mt5.copy_rates_from_pos.assert_called_once_with(
+        "EURUSD", timeframe, 1, 5
+    )
 
 
 @settings(max_examples=100)

@@ -6,8 +6,9 @@ tests/unit/test_fetcher.py — MT5DataFetcher 边界条件单元测试
   - Req 2.7: symbol 不可用（copy_rates_from_pos 返回 None 或空列表）时记录 WARNING 并返回空 DataFrame
 """
 
-import pytest
+import numpy as np
 import pandas as pd
+import pytest
 from unittest.mock import MagicMock, patch
 
 
@@ -22,6 +23,9 @@ def _make_mt5_mock(**kwargs) -> MagicMock:
     mock.copy_rates_from_pos.return_value = kwargs.get("copy_rates_from_pos", None)
     mock.shutdown.return_value = None
     return mock
+
+
+V2_SCHEMA = ("time", "open", "high", "low", "close", "volume")
 
 
 # ── 测试 1：mt5.initialize() 返回 False → 抛出 ConnectionError ────────────────
@@ -63,97 +67,42 @@ class TestConnectRaisesOnFailure:
                str(error_tuple) in str(exc_info.value)
 
 
-# ── 测试 2：copy_rates_from_pos 返回 None → 返回空 DataFrame ─────────────────
+# ── 测试 2：空 MT5 结果 → 固定 V2 schema 的空 DataFrame ─────────────────────
 
-class TestFetchReturnsEmptyDataFrameOnNone:
-    """Req 2.7: symbol 不可用时返回含正确列的空 DataFrame。"""
+@pytest.mark.parametrize(
+    ("rates", "symbol", "timeframe", "count"),
+    [
+        (None, "NOSUCHSYMBOL", 1, 100),
+        (None, "XAUUSD", 16385, 500),
+        ([], "NOSUCHSYMBOL", 1, 100),
+        (np.array([]), "EURUSD", 16385, 200),
+        ([], "US500", 16408, 1000),
+    ],
+    ids=("none-m1", "none-h1", "empty-list-m1", "empty-array-h1", "empty-list-d1"),
+)
+def test_empty_mt5_results_return_exact_v2_schema(
+    rates,
+    symbol: str,
+    timeframe: int,
+    count: int,
+) -> None:
+    mt5_mock = _make_mt5_mock(copy_rates_from_pos=rates)
 
-    EXPECTED_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume"]
+    with (
+        patch("data_pipeline.fetcher.mt5", mt5_mock),
+        patch("data_pipeline.fetcher._MT5_AVAILABLE", True),
+        patch("data_pipeline.kline_cache.KlineCache.get", return_value=None),
+    ):
+        from data_pipeline.fetcher import MT5DataFetcher
 
-    def test_returns_empty_dataframe_when_rates_is_none(self):
-        """copy_rates_from_pos 返回 None 时，fetch() 应返回空 DataFrame。"""
-        mt5_mock = _make_mt5_mock(
-            initialize=True,
-            copy_rates_from_pos=None,
-            last_error=(0, "OK"),
-        )
+        fetcher = MT5DataFetcher()
+        fetcher.connect()
+        frame = fetcher.fetch(symbol, timeframe, count)
 
-        with patch("data_pipeline.fetcher.mt5", mt5_mock), \
-             patch("data_pipeline.fetcher._MT5_AVAILABLE", True):
-
-            from data_pipeline.fetcher import MT5DataFetcher
-            fetcher = MT5DataFetcher()
-            df = fetcher.fetch("NOSUCHSYMBOL", 1, 100)
-
-        assert isinstance(df, pd.DataFrame)
-        assert df.empty
-        assert list(df.columns) == self.EXPECTED_COLUMNS
-
-    def test_empty_dataframe_has_correct_columns_when_rates_is_none(self):
-        """返回的空 DataFrame 列顺序必须与 _COLUMNS 定义一致。"""
-        mt5_mock = _make_mt5_mock(copy_rates_from_pos=None)
-
-        with patch("data_pipeline.fetcher.mt5", mt5_mock), \
-             patch("data_pipeline.fetcher._MT5_AVAILABLE", True):
-
-            from data_pipeline.fetcher import MT5DataFetcher
-            fetcher = MT5DataFetcher()
-            df = fetcher.fetch("XAUUSD", 16385, 500)
-
-        assert set(df.columns) == set(self.EXPECTED_COLUMNS)
-        assert len(df) == 0
-
-
-# ── 测试 3：copy_rates_from_pos 返回空列表/数组 → 返回空 DataFrame ────────────
-
-class TestFetchReturnsEmptyDataFrameOnEmptyRates:
-    """Req 2.7: copy_rates_from_pos 返回空列表时同样返回空 DataFrame。"""
-
-    EXPECTED_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume"]
-
-    def test_returns_empty_dataframe_when_rates_is_empty_list(self):
-        """copy_rates_from_pos 返回空列表 [] 时，fetch() 应返回空 DataFrame。"""
-        mt5_mock = _make_mt5_mock(copy_rates_from_pos=[])
-
-        with patch("data_pipeline.fetcher.mt5", mt5_mock), \
-             patch("data_pipeline.fetcher._MT5_AVAILABLE", True):
-
-            from data_pipeline.fetcher import MT5DataFetcher
-            fetcher = MT5DataFetcher()
-            df = fetcher.fetch("NOSUCHSYMBOL", 1, 100)
-
-        assert isinstance(df, pd.DataFrame)
-        assert df.empty
-        assert list(df.columns) == self.EXPECTED_COLUMNS
-
-    def test_returns_empty_dataframe_when_rates_is_empty_array(self):
-        """copy_rates_from_pos 返回空 numpy 数组时，fetch() 应返回空 DataFrame。"""
-        import numpy as np
-        empty_array = np.array([])
-        mt5_mock = _make_mt5_mock(copy_rates_from_pos=empty_array)
-
-        with patch("data_pipeline.fetcher.mt5", mt5_mock), \
-             patch("data_pipeline.fetcher._MT5_AVAILABLE", True):
-
-            from data_pipeline.fetcher import MT5DataFetcher
-            fetcher = MT5DataFetcher()
-            df = fetcher.fetch("EURUSD", 16385, 200)
-
-        assert isinstance(df, pd.DataFrame)
-        assert df.empty
-        assert list(df.columns) == self.EXPECTED_COLUMNS
-
-    def test_empty_dataframe_columns_match_spec(self):
-        """列名必须完全匹配规范定义的六列，不多不少。"""
-        mt5_mock = _make_mt5_mock(copy_rates_from_pos=[])
-
-        with patch("data_pipeline.fetcher.mt5", mt5_mock), \
-             patch("data_pipeline.fetcher._MT5_AVAILABLE", True):
-
-            from data_pipeline.fetcher import MT5DataFetcher
-            fetcher = MT5DataFetcher()
-            df = fetcher.fetch("US500", 16408, 1000)
-
-        assert len(df.columns) == 6
-        for col in ["time", "open", "high", "low", "close", "tick_volume"]:
-            assert col in df.columns, f"缺少列: {col}"
+    assert isinstance(frame, pd.DataFrame)
+    assert frame.empty
+    assert tuple(frame.columns) == V2_SCHEMA
+    assert "tick_volume" not in frame.columns
+    mt5_mock.copy_rates_from_pos.assert_called_once_with(
+        symbol, timeframe, 1, count
+    )
