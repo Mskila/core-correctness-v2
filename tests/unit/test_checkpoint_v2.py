@@ -14,6 +14,7 @@ from model_core.artifacts import (
     sha256_json,
 )
 from model_core.engine import AlphaEngine
+from model_core.config import ModelConfig
 import model_core.engine as engine_module
 from tests.unit.test_artifacts import artifact_identity
 
@@ -79,6 +80,93 @@ def test_checkpoint_v2_round_trip_restores_complete_state_and_rng(tmp_path) -> N
     actual = (random.random(), np.random.random(), torch.rand(3))
     assert expected[0] == actual[0] and expected[1] == actual[1]
     assert torch.equal(expected[2], actual[2])
+
+
+@pytest.mark.parametrize("configured_device", ["cpu", "cuda"])
+def test_checkpoint_deserialization_keeps_cpu_rng_on_cpu_for_configured_device(
+    monkeypatch, tmp_path, configured_device
+) -> None:
+    identity = run_identity()
+    source = engine(identity)
+    with torch.no_grad():
+        for parameter in source.model.parameters():
+            parameter.fill_(0.125)
+    source.opt.zero_grad()
+    sum(parameter.square().sum() for parameter in source.model.parameters()).backward()
+    source.opt.step()
+    expected_optimizer = _clone_nested(source.opt.state_dict())
+    torch.manual_seed(12701)
+    path = tmp_path / "candidate.pt"
+    source.save_checkpoint(2, str(path))
+    expected_next = torch.rand(4)
+    target = engine(identity)
+    with torch.no_grad():
+        for parameter in target.model.parameters():
+            parameter.zero_()
+    real_load = torch.load
+    real_tensor_to = torch.Tensor.to
+    requested_locations = []
+    optimizer_destinations = []
+
+    def cpu_host_cuda_contract(path_arg, *, map_location, weights_only):
+        requested_locations.append(str(map_location))
+        payload = real_load(
+            path_arg, map_location="cpu", weights_only=weights_only
+        )
+        if str(map_location).startswith("cuda"):
+            payload["torch_cpu_rng_state"] = payload[
+                "torch_cpu_rng_state"
+            ].to("meta")
+        return payload
+
+    def record_tensor_destination(tensor, *args, **kwargs):
+        destination = kwargs.get("device", args[0] if args else None)
+        if destination is not None:
+            rendered = str(destination)
+            optimizer_destinations.append(rendered)
+            if rendered.startswith("cuda"):
+                return tensor
+        return real_tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(ModelConfig, "DEVICE", torch.device(configured_device))
+    monkeypatch.setattr(torch, "load", cpu_host_cuda_contract)
+    monkeypatch.setattr(torch.Tensor, "to", record_tensor_destination)
+
+    assert target.load_checkpoint(str(path)) == 3
+    assert requested_locations == ["cpu"]
+    assert all(
+        torch.equal(target.model.state_dict()[name], value)
+        for name, value in source.model.state_dict().items()
+    )
+    assert target.opt.state
+    _assert_nested_exact(target.opt.state_dict(), expected_optimizer)
+    assert optimizer_destinations
+    assert all(not destination.startswith("cuda") for destination in optimizer_destinations)
+    for parameter, state in target.opt.state.items():
+        for value in state.values():
+            if type(value) is torch.Tensor:
+                assert value.device == parameter.device
+    assert torch.equal(torch.rand(4), expected_next)
+
+
+def test_checkpoint_install_rejects_non_cpu_cpu_rng_before_mutation(
+    tmp_path
+) -> None:
+    identity = run_identity()
+    source = engine(identity)
+    path = tmp_path / "candidate.pt"
+    source.save_checkpoint(2, str(path))
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["torch_cpu_rng_state"] = payload["torch_cpu_rng_state"].to("meta")
+    target = engine(identity)
+    before = _complete_engine_snapshot(target)
+
+    with pytest.raises(
+        ArtifactCompatibilityError,
+        match="torch_cpu_rng_state.*one-dimensional CPU uint8 Tensor",
+    ):
+        target._install_checkpoint_v2_atomically(payload, str(path), identity)
+    _assert_complete_snapshot(target, before)
 
 
 def test_checkpoint_identity_mismatch_is_rejected_before_mutation(tmp_path) -> None:
@@ -983,6 +1071,7 @@ def test_checkpoint_pool_device_migration_failure_is_atomic(
     assert target._previous_initial_distribution is prior
     _assert_complete_snapshot(target, before)
     assert path.read_bytes() == old_bytes
+
 
 class _CheckpointSaveAbort(BaseException):
     pass
