@@ -18,32 +18,165 @@ symbol_consistency 规则：
   - 全部品种 Sortino > 0 → 额外奖励
 """
 import math
+import sys
+
 import torch
 from torch import Tensor
 
-from strategy_manager.signal import compute_target_positions_stateless
+from config import Config
 from .config import ModelConfig
+from .execution import ExecutionResult, performance_metrics, run_execution
+from .semantics import DataValidationError
+from .walk_forward import MIN_SCORABLE_FOLD_OBSERVATIONS
 
-_H1_PERIODS_PER_YEAR = 6240
 _SORTINO_CLIP        = 20.0
+_TURNOVER_EVENT_THRESHOLD = 0.0
+_FOLD_INDEX_MIN = -sys.maxsize - 1
+_FOLD_INDEX_MAX = sys.maxsize
+
+
+class _ScaleBoundedPearsonIC(torch.autograd.Function):
+    """Pearson IC with an exact forward and scale-bounded surrogate backward."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor, y: Tensor) -> Tensor:
+        work_dtype = (
+            torch.float64
+            if x.dtype in {torch.float16, torch.bfloat16, torch.float32}
+            else x.dtype
+        )
+        x_work = x.to(work_dtype)
+        y_work = y.to(work_dtype)
+        x_scaled = x_work / x_work.abs().max()
+        y_scaled = y_work / y_work.abs().max()
+        x_centered = x_scaled - x_scaled.mean()
+        y_centered = y_scaled - y_scaled.mean()
+        x_norm = torch.linalg.vector_norm(x_centered)
+        y_norm = torch.linalg.vector_norm(y_centered)
+        correlation = (x_centered * y_centered).sum() / (x_norm * y_norm)
+        ctx.save_for_backward(x_centered, y_centered, x_norm, y_norm, correlation)
+        ctx.x_dtype = x.dtype
+        ctx.y_dtype = y.dtype
+        return correlation.to(dtype=x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, Tensor]:
+        x_centered, y_centered, x_norm, y_norm, correlation = ctx.saved_tensors
+        upstream = grad_output.to(dtype=x_centered.dtype)
+        grad_x = (
+            y_centered / (x_norm * y_norm)
+            - correlation * x_centered / x_norm.square()
+        )
+        grad_y = (
+            x_centered / (x_norm * y_norm)
+            - correlation * y_centered / y_norm.square()
+        )
+        return (
+            (upstream * grad_x).to(dtype=ctx.x_dtype),
+            (upstream * grad_y).to(dtype=ctx.y_dtype),
+        )
+
+
+def compute_ic_metrics(
+    factors: Tensor,
+    target_ret: Tensor,
+    target_valid: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Return mean same-index Pearson IC and cross-symbol stability.
+
+    Centered vectors are normalized by their own magnitudes before norms are
+    taken, so finite proportional inputs are scale invariant. Only exact zero
+    centered magnitude is unscorable. With one IC, or no cross-symbol
+    dispersion, stability is the bounded mean IC itself.
+    """
+    if target_ret.shape != factors.shape or target_valid.shape != factors.shape:
+        raise ValueError("factors, target_ret and target_valid must share shape")
+    if target_valid.dtype is not torch.bool:
+        raise ValueError("target_valid must be a boolean mask")
+
+    ic_values = []
+    for symbol in range(factors.shape[0]):
+        valid = target_valid[symbol]
+        x = factors[symbol, valid]
+        y = target_ret[symbol, valid]
+        if x.numel() < 2:
+            continue
+        work_dtype = (
+            torch.float64
+            if x.dtype in {torch.float16, torch.bfloat16, torch.float32}
+            else x.dtype
+        )
+        x_work = x.to(work_dtype)
+        y_work = y.to(work_dtype)
+        if not bool(torch.isfinite(x_work).all()) or not bool(
+            torch.isfinite(y_work).all()
+        ):
+            raise DataValidationError("IC inputs must be finite")
+        x_scale = x_work.abs().max()
+        y_scale = y_work.abs().max()
+        if bool(x_scale == 0) or bool(y_scale == 0):
+            continue
+        x_scaled = x_work / x_scale
+        y_scaled = y_work / y_scale
+        x_unit = x_scaled - x_scaled.mean()
+        y_unit = y_scaled - y_scaled.mean()
+        x_norm = torch.linalg.vector_norm(x_unit)
+        y_norm = torch.linalg.vector_norm(y_unit)
+        if bool(x_norm == 0) or bool(y_norm == 0):
+            continue
+        correlation = _ScaleBoundedPearsonIC.apply(x, y)
+        if not bool(torch.isfinite(correlation)):
+            raise DataValidationError("non-finite IC rejected after stable normalization")
+        ic_values.append(correlation)
+
+    if not ic_values:
+        zero = factors.new_zeros(())
+        return zero, zero
+
+    ic_tensor = torch.stack(ic_values)
+    mean_ic = ic_tensor.mean()
+    if ic_tensor.numel() < 2:
+        return mean_ic, mean_ic
+    dispersion = ic_tensor.std(unbiased=False)
+    stability = (
+        mean_ic
+        if bool(dispersion == 0)
+        else torch.clamp(mean_ic / dispersion, -3.0, 3.0)
+    )
+    return mean_ic, stability
 
 
 class MT5Backtest:
     """MT5 组合级回测评估器。"""
 
-    def __init__(
-        self,
-        cost_rate:        float = 0.0001,
-        periods_per_year: int   = _H1_PERIODS_PER_YEAR,
-    ):
-        self.cost_rate        = cost_rate
-        self.periods_per_year = periods_per_year
+    def __init__(self, cost_rate: float = 0.0001):
+        self.cost_rate = cost_rate
+
+    @staticmethod
+    def _promoted_finite_metric(
+        name: str, value: float, reference: Tensor
+    ) -> Tensor:
+        if not math.isfinite(value):
+            raise DataValidationError(
+                f"public backtest metric must be finite: field={name} actual={value!r}"
+            )
+        return torch.tensor(value, dtype=torch.float64, device=reference.device)
+
+    @staticmethod
+    def _require_finite_public_score(score: Tensor) -> Tensor:
+        if score.shape != torch.Size([]) or not bool(torch.isfinite(score).item()):
+            raise DataValidationError(
+                "public backtest score must be a finite scalar in the promoted domain"
+            )
+        return score
 
     # ──────────────────────────────────────────────────────────────────────
     # 基础统计
     # ──────────────────────────────────────────────────────────────────────
 
-    def _sortino(self, pnl: Tensor, eps: float = 1e-8) -> Tensor:
+    def _sortino(
+        self, pnl: Tensor, periods_per_year: float, eps: float = 1e-8
+    ) -> Tensor:
         flat     = pnl.reshape(-1)
         mean_pnl = flat.mean()
         downside = flat[flat < 0]
@@ -54,13 +187,15 @@ class MT5Backtest:
         full_std       = flat.std(unbiased=False).clamp(min=eps)
         floor          = torch.clamp(full_std * 0.2, min=eps)
         downside_std   = torch.clamp(raw_std, min=floor)
-        sortino        = mean_pnl / downside_std * math.sqrt(self.periods_per_year)
+        sortino        = mean_pnl / downside_std * math.sqrt(periods_per_year)
         return torch.clamp(sortino, -_SORTINO_CLIP, _SORTINO_CLIP)
 
-    def _calmar(self, pnl: Tensor, eps: float = 1e-8) -> Tensor:
+    def _calmar(
+        self, pnl: Tensor, periods_per_year: float, eps: float = 1e-8
+    ) -> Tensor:
         """Calmar = annualized_return / max_drawdown（截断到 [-10, 10]）。"""
         flat      = pnl.reshape(-1)
-        ann_ret   = flat.mean() * self.periods_per_year
+        ann_ret   = flat.mean() * periods_per_year
         cum       = torch.cumsum(flat, dim=0)
         peak      = torch.cummax(cum, dim=0).values
         drawdown  = (peak - cum).max()
@@ -72,39 +207,21 @@ class MT5Backtest:
     # 组合级评分组件
     # ──────────────────────────────────────────────────────────────────────
 
-    def _ts_ic_stability(self, factors: Tensor, target_ret: Tensor) -> float:
-        """时序 IC 稳定性：每个品种内部 factor[t] 与 ret[t+1] 的相关性均值。
+    def _ts_ic_stability(
+        self,
+        factors: Tensor,
+        target_ret: Tensor,
+        target_valid: Tensor,
+    ) -> float:
+        """时序 IC 稳定性：同一有效索引上的 factor[t] 与 target_ret[t]。
 
         比横截面 IC 更适合 5 品种宇宙（横截面 N=5 统计意义弱）。
 
         Returns:
             float，约 [-1, 1]，正值代表因子有预测力。
         """
-        N, T = factors.shape
-        if T < 10:
-            return 0.0
-
-        ic_list = []
-        for n in range(N):
-            x = factors[n, :-1]
-            y = target_ret[n, 1:]
-            xm = x - x.mean()
-            ym = y - y.mean()
-            sx = (xm ** 2).mean().sqrt()
-            sy = (ym ** 2).mean().sqrt()
-            if sx < 1e-6 or sy < 1e-6:
-                continue
-            ic = (xm * ym).mean() / (sx * sy + 1e-8)
-            ic_list.append(ic.item())
-
-        if not ic_list:
-            return 0.0
-
-        ic_mean = sum(ic_list) / len(ic_list)
-        ic_std  = (sum((v - ic_mean) ** 2 for v in ic_list) / len(ic_list)) ** 0.5
-        # 稳定性 = IC均值 / IC标准差（IR，截断到 [-3, 3]）
-        stability = ic_mean / (ic_std + 1e-6)
-        return float(max(-3.0, min(3.0, stability)))
+        _, stability = compute_ic_metrics(factors, target_ret, target_valid)
+        return float(stability.item())
 
     def _symbol_consistency(
         self,
@@ -165,51 +282,90 @@ class MT5Backtest:
 
         return float(score)
 
+    def _run_execution(
+        self,
+        factors: Tensor,
+        target_ret: Tensor,
+        target_valid: Tensor,
+        bar_time_ns: Tensor,
+        *,
+        cost_rate: float | None = None,
+    ) -> ExecutionResult:
+        """Delegate scoring execution to the shared V2 implementation."""
+        return run_execution(
+            factors=factors,
+            target_ret=target_ret,
+            target_valid=target_valid,
+            bar_time_ns=bar_time_ns,
+            cost_rate=self.cost_rate if cost_rate is None else cost_rate,
+            min_exposure=Config.MIN_TRADE_EXPOSURE,
+        )
+
     def _cost_stress(
         self,
-        position:   Tensor,
+        factors: Tensor,
         target_ret: Tensor,
+        target_valid: Tensor,
+        bar_time_ns: Tensor,
         stress_mult: float = 2.0,
     ) -> float:
-        """成本压力测试：2 倍成本下的 Sortino 是否还 > 0。
+        """Re-run shared execution at a stressed cost rate."""
+        stressed = self._run_execution(
+            factors,
+            target_ret,
+            target_valid,
+            bar_time_ns,
+            cost_rate=self.cost_rate * stress_mult,
+        )
+        return float(max(-5.0, min(5.0, performance_metrics(stressed).sortino)))
 
-        Returns:
-            float，压力测试 Sortino（截断到 [-5, 5]）。
+    @staticmethod
+    def _turnover_activity(
+        result: ExecutionResult,
+    ) -> tuple[int, list[int], list[int]]:
+        """Count activity from shared turnover and runs from explicit signs.
+
+        Shared execution already applies the neutral exposure band, so any
+        published turnover above zero is an activity event. Final liquidation
+        remains separate and is not reconstructed here.
         """
-        prev_pos = torch.roll(position, 1, dims=1)
-        prev_pos[:, 0] = 0.0
-        turnover = torch.abs(position - prev_pos)
-        stressed_pnl = position * target_ret - turnover * self.cost_rate * stress_mult
-        sortino = self._sortino(stressed_pnl)
-        return float(torch.clamp(sortino, -5.0, 5.0))
+        total_bars = 0
+        event_counts = []
+        all_runs = []
+        for symbol in range(result.position.shape[0]):
+            valid = result.target_valid[symbol]
+            positions = result.position[symbol, valid]
+            turnover = result.turnover[symbol, valid]
+            total_bars += positions.numel()
+            event_counts.append(
+                int((turnover > _TURNOVER_EVENT_THRESHOLD).sum().item())
+            )
 
-    def _turnover_quality(self, position: Tensor) -> float:
+            current_direction = 0
+            current_length = 0
+            for position in positions.tolist():
+                direction = 1 if position > 0.0 else -1 if position < 0.0 else 0
+                if direction == current_direction and direction != 0:
+                    current_length += 1
+                else:
+                    if current_length:
+                        all_runs.append(current_length)
+                    current_direction = direction
+                    current_length = 1 if direction else 0
+            if current_length:
+                all_runs.append(current_length)
+        return total_bars, event_counts, all_runs
+
+    def _turnover_quality(
+        self, activity: tuple[int, list[int], list[int]]
+    ) -> float:
         """交易频率质量奖励（每天约 1 笔为最优）。
 
         目标：每 12 bar 一笔（H1 每天约一笔）。
         """
-        N, T = position.shape
-        pos_2d = position.tolist()
-        all_runs, total_trades = [], 0
+        total_bars, event_counts, all_runs = activity
+        total_trades = sum(event_counts)
 
-        for n in range(N):
-            runs, cur_len, cur_dir = [], 0, 0
-            for p in pos_2d[n]:
-                pi = int(p)
-                if pi != 0:
-                    if pi == cur_dir:
-                        cur_len += 1
-                    else:
-                        if cur_len > 0: runs.append(cur_len)
-                        cur_dir, cur_len = pi, 1
-                else:
-                    if cur_len > 0: runs.append(cur_len)
-                    cur_dir, cur_len = 0, 0
-            if cur_len > 0: runs.append(cur_len)
-            all_runs.extend(runs)
-            total_trades += len(runs)
-
-        total_bars    = N * T
         target_trades = total_bars / 12.0
         actual_ratio  = total_trades / max(target_trades, 1.0)
 
@@ -234,7 +390,9 @@ class MT5Backtest:
 
         return float(freq_score + hold_bonus)
 
-    def _beta_neutral_penalty(self, position: Tensor) -> float:
+    def _beta_neutral_penalty(
+        self, position: Tensor, target_valid: Tensor
+    ) -> float:
         """Beta 中性惩罚：多空比例严重失衡时扣分。
 
         因子输出 >85% 同方向时，说明不是 alpha 因子而是 beta 因子
@@ -243,7 +401,7 @@ class MT5Backtest:
         Returns:
             float，惩罚值（负数或零）
         """
-        flat = position.reshape(-1)
+        flat = position[target_valid]
         long_ratio = (flat > 0.05).float().mean().item()
         short_ratio = (flat < -0.05).float().mean().item()
         max_ratio = max(long_ratio, short_ratio)
@@ -257,7 +415,12 @@ class MT5Backtest:
             return -0.5 * excess  # 最多 -0.5
         return 0.0
 
-    def _half_consistency_bonus(self, pnl: Tensor) -> float:
+    def _half_consistency_bonus(
+        self,
+        pnl: Tensor,
+        target_valid: Tensor,
+        periods_per_year: float,
+    ) -> float:
         """前后一致性奖励：前半段和后半段 Sortino 同号时加分。
 
         防止因子只在某一段市场环境（如牛市）有效。
@@ -265,25 +428,30 @@ class MT5Backtest:
         Returns:
             float，奖励/惩罚值
         """
-        T = pnl.shape[1]
-        if T < 20:
+        if int(target_valid.sum().item()) < 20:
             return 0.0
-        half = T // 2
-        s1 = self._sortino(pnl[:, :half]).item()
-        s2 = self._sortino(pnl[:, half:]).item()
+        midpoint = pnl.shape[1] // 2
+        first_half = pnl[:, :midpoint][target_valid[:, :midpoint]]
+        second_half = pnl[:, midpoint:][target_valid[:, midpoint:]]
+        if first_half.numel() == 0 or second_half.numel() == 0:
+            return 0.0
+        s1 = self._sortino(first_half, periods_per_year).item()
+        s2 = self._sortino(second_half, periods_per_year).item()
         if s1 > 0 and s2 > 0:
             return 0.5  # 前后都赚钱，奖励
         elif s1 * s2 < 0:
             return -1.0  # 前后相反，重罚（如 index 组的 beta 因子）
         return 0.0  # 一正一零或两零，不奖不罚
 
-    def _exposure_penalty(self, position: Tensor) -> float:
+    def _exposure_penalty(
+        self, position: Tensor, target_valid: Tensor
+    ) -> float:
         """在场时间惩罚（仅下限，无上限）：收益优先模式。
 
         只惩罚极稀疏交易（<10%在场），不惩罚高在场时间。
         高在场时间（满仓趋势跟踪）是外汇市场最赚钱的形态之一，不应受罚。
         """
-        flat = position.reshape(-1).abs()
+        flat = position[target_valid].abs()
         exposure = flat.mean().item()   # 连续仓位：均值即平均持仓量
         if exposure < 0.10:
             # 极稀疏：平均持仓 < 10% → 线性惩罚 [-2, 0)
@@ -304,10 +472,177 @@ class MT5Backtest:
     # Walk-Forward 辅助接口
     # ──────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _validate_fold_request(
+        factors: Tensor,
+        target_ret: Tensor,
+        target_valid: Tensor,
+        bar_time_ns: Tensor,
+        train_start: int,
+        train_end: int,
+        val_start: int,
+        val_end: int,
+    ) -> None:
+        inputs = (
+            ("factors", factors),
+            ("target_ret", target_ret),
+            ("target_valid", target_valid),
+            ("bar_time_ns", bar_time_ns),
+        )
+        for field, value in inputs:
+            if not isinstance(value, torch.Tensor):
+                raise DataValidationError(
+                    "evaluate_fold invalid input: "
+                    f"field={field}; expected=torch.Tensor; "
+                    f"actual={type(value).__name__}"
+                )
+            if value.ndim != 2:
+                raise DataValidationError(
+                    "evaluate_fold invalid input: "
+                    f"field={field}; expected=rank 2; actual=rank {value.ndim}"
+                )
+
+        shapes = [tuple(value.shape) for _, value in inputs]
+        common_shape = max(shapes, key=shapes.count)
+        for (field, _), shape in zip(inputs, shapes):
+            if shape != common_shape:
+                raise DataValidationError(
+                    "evaluate_fold invalid input: "
+                    f"field={field}; expected=shape {common_shape}; "
+                    f"actual=shape {shape}"
+                )
+
+        supported_float_dtypes = {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        }
+        for field, value in (("factors", factors), ("target_ret", target_ret)):
+            if (
+                not value.is_floating_point()
+                or value.dtype not in supported_float_dtypes
+            ):
+                raise DataValidationError(
+                    "evaluate_fold invalid input: "
+                    f"field={field}; expected=floating tensor; actual={value.dtype}"
+                )
+        if target_ret.dtype != factors.dtype:
+            raise DataValidationError(
+                "evaluate_fold invalid input: "
+                f"field=target_ret; expected={factors.dtype}; actual={target_ret.dtype}"
+            )
+        if target_valid.dtype is not torch.bool:
+            raise DataValidationError(
+                "evaluate_fold invalid input: "
+                f"field=target_valid; expected=torch.bool; actual={target_valid.dtype}"
+            )
+        if bar_time_ns.dtype is not torch.int64:
+            raise DataValidationError(
+                "evaluate_fold invalid input: "
+                f"field=bar_time_ns; expected=torch.int64; actual={bar_time_ns.dtype}"
+            )
+
+        expected_device = factors.device
+        for field, value in inputs[1:]:
+            if value.device != expected_device:
+                raise DataValidationError(
+                    "evaluate_fold invalid input: "
+                    f"field={field}; expected=device {expected_device}; "
+                    f"actual=device {value.device}"
+                )
+        if expected_device.type not in {"cpu", "cuda"}:
+            raise DataValidationError(
+                "evaluate_fold invalid input: "
+                "field=factors; expected=device type cpu or cuda; "
+                f"actual=device {expected_device}"
+            )
+
+        bounds = (
+            ("train_start", train_start),
+            ("train_end", train_end),
+            ("val_start", val_start),
+            ("val_end", val_end),
+        )
+        for field, value in bounds:
+            if type(value) is not int:
+                raise ValueError(
+                    "evaluate_fold invalid boundary: "
+                    f"field={field}; expected=exact built-in int; "
+                    f"actual_type={type(value).__name__}"
+                )
+        for field, value in bounds:
+            if value < _FOLD_INDEX_MIN or value > _FOLD_INDEX_MAX:
+                raise ValueError(
+                    "evaluate_fold invalid boundary: "
+                    f"field={field}; expected=exact built-in int within "
+                    "operational bounds; actual=out of operational bounds"
+                )
+        valid_order = (
+            0 <= train_start < train_end
+            and train_end < val_start < val_end
+        )
+        if not valid_order:
+            actual_bounds = tuple(value for _, value in bounds)
+            raise ValueError(
+                "evaluate_fold invalid boundary: field=fold_bounds; "
+                "expected=0 <= train_start < train_end < "
+                "val_start < val_end; "
+                f"actual={actual_bounds}"
+            )
+
+        segment_lengths = (
+            ("train_bars", train_end - train_start),
+            ("val_bars", val_end - val_start),
+        )
+        for field, length in segment_lengths:
+            if length < MIN_SCORABLE_FOLD_OBSERVATIONS:
+                raise ValueError(
+                    "evaluate_fold invalid boundary: "
+                    f"field={field}; expected=at least "
+                    f"{MIN_SCORABLE_FOLD_OBSERVATIONS} observations; "
+                    f"actual={length}"
+                )
+
+        common_length = common_shape[1]
+        for field, end in (("train_end", train_end), ("val_end", val_end)):
+            if end + 2 > common_length:
+                raise ValueError(
+                    "evaluate_fold invalid boundary: "
+                    f"field={field}; expected={field} + 2 <= common length "
+                    f"{common_length}; actual={end}"
+                )
+
+    @staticmethod
+    def _fold_segment(
+        factors: Tensor,
+        target_ret: Tensor,
+        target_valid: Tensor,
+        bar_time_ns: Tensor,
+        start: int,
+        end: int,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Isolate one fold segment while retaining only its exit timestamps."""
+        if start < 0 or end <= start or end + 2 > factors.shape[1]:
+            raise ValueError("fold segment must leave two exit timestamps")
+        segment_factors = factors[:, start:end]
+        segment_target = target_ret[:, start:end]
+        segment_valid = target_valid[:, start:end]
+        padding = torch.zeros_like(segment_factors[:, :2])
+        valid_padding = torch.zeros_like(segment_valid[:, :2])
+        return (
+            torch.cat([segment_factors, padding], dim=1),
+            torch.cat([segment_target, padding], dim=1),
+            torch.cat([segment_valid, valid_padding], dim=1),
+            bar_time_ns[:, start:end + 2].clone(),
+        )
+
     def evaluate_fold(
         self,
         factors:     Tensor,
         target_ret:  Tensor,
+        target_valid: Tensor,
+        bar_time_ns: Tensor,
         train_start: int,
         train_end:   int,
         val_start:   int,
@@ -320,36 +655,43 @@ class MT5Backtest:
           - OOS Sortino <= 0：乘以 0.1~0.5 惩罚，强制冠军必须在验证段盈利
           - OOS Sortino > 0：乘以最多 1.2 奖励
         """
-        position = compute_target_positions_stateless(factors)  # neutral band
-
-        prev_pos = torch.roll(position, 1, dims=1)
-        prev_pos[:, 0] = 0.0
-        turnover = torch.abs(position - prev_pos)
-        pnl      = position * target_ret - turnover * self.cost_rate
-
-        pnl_train = pnl[:, train_start:train_end]
-        pnl_val   = pnl[:, val_start:val_end]
-
-        # 训练段：多目标 + 换手率惩罚
-        train_bars = train_end - train_start
-        train_score = self._multi_objective(
-            factors[:, train_start:train_end],
-            target_ret[:, train_start:train_end],
-            pnl_train,
-            position[:, train_start:train_end],
-            eval_bars=train_bars,
-        ) + self._turnover_penalty(turnover[:, train_start:train_end])
-
-        # 验证段：多目标 × OOS Sortino 门控
-        val_bars = val_end - val_start
-        base_val    = self._multi_objective(
-            factors[:, val_start:val_end],
-            target_ret[:, val_start:val_end],
-            pnl_val,
-            position[:, val_start:val_end],
-            eval_bars=val_bars,
+        self._validate_fold_request(
+            factors,
+            target_ret,
+            target_valid,
+            bar_time_ns,
+            train_start,
+            train_end,
+            val_start,
+            val_end,
         )
-        oos_sor = self._sortino(pnl_val).item()
+        train_values = self._fold_segment(
+            factors,
+            target_ret,
+            target_valid,
+            bar_time_ns,
+            train_start,
+            train_end,
+        )
+        val_values = self._fold_segment(
+            factors,
+            target_ret,
+            target_valid,
+            bar_time_ns,
+            val_start,
+            val_end,
+        )
+        train_result = self._run_execution(*train_values)
+        val_result = self._run_execution(*val_values)
+        train_score = self._multi_objective(
+            *train_values, train_result, eval_bars=train_end - train_start
+        ) + self._turnover_penalty(
+            train_result.turnover[train_result.target_valid]
+        )
+        base_val = self._multi_objective(
+            *val_values, val_result, eval_bars=val_end - val_start
+        )
+        oos_sor = performance_metrics(val_result).sortino
         if oos_sor <= 0:
             # OOS亏损：重惩罚（Sortino=-1 → mult=0.1；Sortino=0 → mult=0.5）
             mult = max(0.1, 0.5 + oos_sor * 0.4)
@@ -358,9 +700,14 @@ class MT5Backtest:
             mult = min(1.2, 1.0 + oos_sor * 0.1)
         val_score = base_val * mult
 
-        return train_score, val_score
+        return (
+            self._require_finite_public_score(train_score),
+            self._require_finite_public_score(val_score),
+        )
 
-    def _reversal_bonus(self, factors: Tensor) -> Tensor:
+    def _reversal_bonus(
+        self, factors: Tensor, target_valid: Tensor
+    ) -> Tensor:
         """反转奖励：鼓励因子有低/负自相关（均值回归特征）。
 
         计算每个品种的 lag-1 自相关系数，越接近 0 或负值 = 越好。
@@ -371,8 +718,9 @@ class MT5Backtest:
         N = factors.shape[0]
         scores = []
         for n in range(N):
-            x = factors[n, :-1]     # t=0..T-2
-            y = factors[n, 1:]      # t=1..T-1
+            values = factors[n, target_valid[n]]
+            x = values[:-1]
+            y = values[1:]
             xm = x - x.mean(); ym = y - y.mean()
             sx = (xm**2).mean().sqrt(); sy = (ym**2).mean().sqrt()
             ac1 = (xm*ym).mean() / (sx*sy + 1e-8) if sx > 1e-6 and sy > 1e-6 else torch.tensor(0.0)
@@ -384,14 +732,17 @@ class MT5Backtest:
             scores.append(bonus)
         return torch.stack(scores).mean()
 
-    def _symmetry_check(self, position: Tensor) -> Tensor:
+    def _symmetry_check(
+        self, position: Tensor, target_valid: Tensor
+    ) -> Tensor:
         """多空对称性检查：奖励 50/50 多空分布。
 
         均值回归策略应该在多空之间大致平衡，
         过度偏向某一侧 = 趋势跟踪特征，应惩罚。
         """
-        long_ratio  = (position > 0).float().mean()
-        short_ratio = (position < 0).float().mean()
+        valid_position = position[target_valid]
+        long_ratio  = (valid_position > 0).float().mean()
+        short_ratio = (valid_position < 0).float().mean()
         # 理想值：long_ratio ≈ 0.5, short_ratio ≈ 0.5
         # 偏差：|long_ratio - 0.5| + |short_ratio - 0.5|
         deviation = torch.abs(long_ratio - 0.5) + torch.abs(short_ratio - 0.5)
@@ -403,8 +754,9 @@ class MT5Backtest:
         self,
         factors:    Tensor,
         target_ret: Tensor,
-        pnl:        Tensor,
-        position:   Tensor,
+        target_valid: Tensor,
+        bar_time_ns: Tensor,
+        result: ExecutionResult,
         eval_bars:  int = 0,
     ) -> Tensor:
         """收益优先的多目标评分（2026-07-04 重构）。
@@ -417,22 +769,29 @@ class MT5Backtest:
 
         2026-07-08: 新增 forex 模式 — 偏向均值回归策略。
         """
-        N = pnl.shape[0]
-
-        # ── 绝对收益（年化 log return）──────────────────────────────────
-        # 连续仓位 pnl = position * target_ret - turnover * cost。
-        # pnl.mean() 已是单 bar 平均收益，因此年化只乘每年 bar 数；不能再除以样本长度。
-        ann_ret = pnl.mean() * self.periods_per_year   # 标量张量，无截断
-
-        port_sortino = self._sortino(pnl)
-        port_calmar  = self._calmar(pnl)
-        ts_ic        = self._ts_ic_stability(factors, target_ret)
-        tq           = self._turnover_quality(position)
-        exp_pen      = self._exposure_penalty(position)
+        N = factors.shape[0]
+        metrics = performance_metrics(result)
+        position = result.position
+        pnl = result.net_pnl
+        ann_ret = self._promoted_finite_metric(
+            "annualized_return", metrics.annualized_return, factors
+        )
+        port_sortino = self._promoted_finite_metric(
+            "sortino", metrics.sortino, factors
+        )
+        port_calmar = self._promoted_finite_metric(
+            "calmar", metrics.calmar, factors
+        )
+        _, ts_ic = compute_ic_metrics(factors, target_ret, target_valid)
+        turnover_activity = self._turnover_activity(result)
+        tq = self._turnover_quality(turnover_activity)
+        exp_pen = self._exposure_penalty(position, target_valid)
 
         if N == 1:
-            beta_pen = self._beta_neutral_penalty(position)
-            consist = self._half_consistency_bonus(pnl)
+            beta_pen = self._beta_neutral_penalty(position, target_valid)
+            consist = self._half_consistency_bonus(
+                pnl, target_valid, metrics.periods_per_year
+            )
 
             if ModelConfig.REWARD_MODE == "forex":
                 # Forex 均值回归模式：
@@ -440,8 +799,8 @@ class MT5Backtest:
                 #   - 提 IC 权重 (0.03→0.25)：信号质量是核心
                 #   - 新增反转奖励 (0.20)：奖励低/负因子自相关
                 #   - 新增对称检查 (0.15)：奖励 50/50 多空平衡
-                rev_bonus = self._reversal_bonus(factors)
-                sym_bonus = self._symmetry_check(position)
+                rev_bonus = self._reversal_bonus(factors, target_valid)
+                sym_bonus = self._symmetry_check(position, target_valid)
                 return (
                     0.25 * ann_ret           # 年化收益（降权，外汇趋势噪声大）
                     + 0.05 * port_sortino    # 风险调整辅助
@@ -478,23 +837,40 @@ class MT5Backtest:
                 + consist                # 前后一致性奖惩
             )
 
+        result_position = result.position
+        result_turnover = result.turnover
+        result_gross = result.gross_pnl
+        result_cost = result.cost
+        result_net = result.net_pnl
+        result_valid = result.target_valid
+        result_time = result.bar_time_ns
+        result_liquidation = result.final_liquidation_cost
         per_sym_sortino     = []
         per_sym_trade_count = []
         for n in range(N):
-            per_sym_sortino.append(self._sortino(pnl[n]).item())
-            # 连续仓位下，用 |position| 变化来估算交易次数
-            pos_n = position[n].abs()
-            # 视 tanh 输出均值作为持仓量，换手次数用前后差异估计
-            diff = (pos_n[1:] - pos_n[:-1]).abs()
-            trades = int((diff > 0.1).sum().item())
-            per_sym_trade_count.append(trades)
+            symbol_result = ExecutionResult(
+                position=result_position[n:n + 1],
+                turnover=result_turnover[n:n + 1],
+                gross_pnl=result_gross[n:n + 1],
+                cost=result_cost[n:n + 1],
+                net_pnl=result_net[n:n + 1],
+                target_valid=result_valid[n:n + 1],
+                bar_time_ns=result_time[n:n + 1],
+                final_liquidation_cost=result_liquidation[n:n + 1],
+            )
+            per_sym_sortino.append(performance_metrics(symbol_result).sortino)
+            per_sym_trade_count.append(turnover_activity[1][n])
 
         sym_cons = self._symbol_consistency(
             per_sym_sortino, per_sym_trade_count, eval_bars=eval_bars
         )
-        cost_s   = self._cost_stress(position, target_ret)
-        beta_pen = self._beta_neutral_penalty(position)
-        consist  = self._half_consistency_bonus(pnl)
+        cost_s = self._cost_stress(
+            factors, target_ret, target_valid, bar_time_ns
+        )
+        beta_pen = self._beta_neutral_penalty(position, target_valid)
+        consist = self._half_consistency_bonus(
+            pnl, target_valid, metrics.periods_per_year
+        )
 
         if ModelConfig.REWARD_MODE == "ftmo":
             # FTMO 专属：年化收益 0.75（提权），Calmar 0.10（对齐 10% Max Loss）
@@ -525,40 +901,26 @@ class MT5Backtest:
         )
 
     # ──────────────────────────────────────────────────────────────────────
-    # 公开接口（非 Walk-Forward 模式）
+    # 公开接口（单片段诊断，不代表样本外）
     # ──────────────────────────────────────────────────────────────────────
 
-    def evaluate(
+    def evaluate_segment(
         self,
         factors:    Tensor,
-        raw_dict:   dict,
         target_ret: Tensor,
-    ) -> tuple[Tensor, float]:
-        """评估一组 Alpha 因子（含 OOS 80/20 门控）。"""
-        position = compute_target_positions_stateless(factors)
-
-        prev_pos = torch.roll(position, 1, dims=1)
-        prev_pos[:, 0] = 0.0
-        turnover = torch.abs(position - prev_pos)
-        pnl      = position * target_ret - turnover * self.cost_rate
-
-        T     = factors.shape[1]
-        split = int(math.floor(T * 0.8))
-
+        target_valid: Tensor,
+        bar_time_ns: Tensor,
+    ) -> Tensor:
+        """Score one explicitly supplied segment using shared V2 execution."""
+        result = self._run_execution(
+            factors, target_ret, target_valid, bar_time_ns
+        )
         score = self._multi_objective(
-            factors[:, :split], target_ret[:, :split],
-            pnl[:, :split], position[:, :split],
-            eval_bars=split,
-        ) + self._turnover_penalty(turnover[:, :split])
-
-        # OOS 门控（最后 20%）
-        pnl_oos = pnl[:, split:]
-        oos_sor = self._sortino(pnl_oos).item()
-        if oos_sor <= 0:
-            mult = max(0.1, 0.5 + oos_sor * 0.4)
-            score = score * mult
-        else:
-            score = score * min(1.2, 1.0 + oos_sor * 0.1)
-
-        mean_oos = pnl_oos.mean().item()
-        return score, mean_oos
+            factors,
+            target_ret,
+            target_valid,
+            bar_time_ns,
+            result,
+            eval_bars=int(target_valid.sum(dim=1).max().item()),
+        ) + self._turnover_penalty(result.turnover[result.target_valid])
+        return self._require_finite_public_score(score)

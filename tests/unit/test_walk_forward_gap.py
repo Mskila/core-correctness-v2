@@ -1,177 +1,397 @@
-"""
-单元测试：_build_walk_forward_folds 的 gap 机制
+"""Strict walk-forward gap and minimum-data contracts."""
 
-验证以下需求：
-  T2.1 – 正常情况下每折 val_start == train_end + gap
-  T2.2 – 越界折不被添加（折叠不越界）
-  T2.3 – 数据量不足时 gap 自动缩减；T < n_folds×2 时退化为单折
-"""
-import sys
-sys.path.insert(0, r'd:\cl\MT5_AlphaGPT')
+from dataclasses import fields
 
 import pytest
-from model_core.engine import _build_walk_forward_folds
+
+import model_core.walk_forward as walk_forward_module
+from model_core.features import MAX_FEATURE_LOOKBACK
+from model_core.ops import MAX_OPERATOR_LOOKBACK
+from model_core.semantics import InsufficientWalkForwardDataError
+from model_core.walk_forward import (
+    WalkForwardFold,
+    build_walk_forward_folds,
+    formula_warmup_bars,
+    required_training_bars,
+)
 
 
-class TestNormalCase:
-    """T2.1 – 正常情况：val_start == train_end + gap（使用折内记录的实际 gap）"""
-
-    def test_val_start_equals_train_end_plus_gap(self):
-        """T=500, n_folds=5, gap=20：每折的 val_start 严格等于 train_end + gap。"""
-        folds = _build_walk_forward_folds(T=500, n_folds=5, gap=20)
-        assert len(folds) > 0, "应至少返回一折"
-        for i, fold in enumerate(folds):
-            actual_gap = fold["gap"]
-            assert fold["val_start"] == fold["train_end"] + actual_gap, (
-                f"折 {i}: val_start={fold['val_start']} != "
-                f"train_end={fold['train_end']} + gap={actual_gap}"
-            )
-
-    def test_gap_preserved_when_data_sufficient(self):
-        """当数据充足时（T mod n_folds >= gap*(n_folds-1)），gap 不被缩减。
-        T=53, n_folds=3, gap=1：53 mod 3 = 2 >= 1*(3-1)=2，gap 恰好被保留为 1。
-        """
-        folds = _build_walk_forward_folds(T=53, n_folds=3, gap=1)
-        assert len(folds) > 0, "应返回至少一折"
-        for fold in folds:
-            assert "gap" in fold, "折字典缺少 'gap' 键"
-            assert fold["gap"] == 1, f"gap 应保留为 1，实际 gap={fold['gap']}"
-
-    def test_expected_fold_count(self):
-        """T=500, n_folds=5, gap=20：应有 4 折（k=1~4）。"""
-        folds = _build_walk_forward_folds(T=500, n_folds=5, gap=20)
-        assert len(folds) == 4
-
-    def test_train_start_always_zero(self):
-        """所有折的 train_start 都为 0（扩展训练窗口）。"""
-        folds = _build_walk_forward_folds(T=500, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            assert fold["train_start"] == 0, (
-                f"折 {i}: train_start 应为 0，实际为 {fold['train_start']}"
-            )
-
-    def test_val_end_within_bounds(self):
-        """所有折的 val_end <= T。"""
-        T = 500
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            assert fold["val_end"] <= T, (
-                f"折 {i}: val_end={fold['val_end']} 超出 T={T}"
-            )
+class _IntSubclass(int):
+    pass
 
 
-class TestGapZero:
-    """gap=0 时 val_start 应等于 train_end。"""
+class _HostileProtocols:
+    calls = 0
 
-    def test_val_start_equals_train_end_when_gap_zero(self):
-        folds = _build_walk_forward_folds(T=500, n_folds=5, gap=0)
-        assert len(folds) > 0
-        for i, fold in enumerate(folds):
-            assert fold["val_start"] == fold["train_end"], (
-                f"折 {i}: gap=0 时 val_start 应等于 train_end，"
-                f"实际 val_start={fold['val_start']}, train_end={fold['train_end']}"
-            )
+    def _fail(self):
+        type(self).calls += 1
+        raise RuntimeError("hostile protocol executed")
 
-    def test_gap_stored_as_zero(self):
-        folds = _build_walk_forward_folds(T=500, n_folds=5, gap=0)
-        for fold in folds:
-            assert fold["gap"] == 0
+    __repr__ = lambda self: self._fail()
+    __str__ = lambda self: self._fail()
+    __int__ = lambda self: self._fail()
+    __index__ = lambda self: self._fail()
+    __hash__ = lambda self: self._fail()
+    __eq__ = lambda self, other: self._fail()
 
 
-class TestInsufficientData:
-    """T2.3 – 数据量不足时 gap 自动缩减，折叠不越界。"""
-
-    def test_no_fold_has_val_start_beyond_T(self):
-        """T=50, n_folds=5, gap=20：gap 应被自动缩减，所有折 val_start < T。"""
-        T = 50
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            assert fold["val_start"] < T, (
-                f"折 {i}: val_start={fold['val_start']} >= T={T}"
-            )
-
-    def test_no_fold_has_val_end_beyond_T(self):
-        """T=50, n_folds=5, gap=20：所有折 val_end <= T。"""
-        T = 50
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            assert fold["val_end"] <= T, (
-                f"折 {i}: val_end={fold['val_end']} > T={T}"
-            )
-
-    def test_gap_reduced_when_insufficient_data(self):
-        """T=50, n_folds=5, gap=20：实际 gap 应 < 20（已缩减）。"""
-        T = 50
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=20)
-        for fold in folds:
-            assert fold["gap"] < 20, (
-                f"数据不足时 gap 应缩减，但折 gap={fold['gap']}"
-            )
-
-    def test_val_start_still_equals_train_end_plus_actual_gap(self):
-        """数据不足时缩减后的 gap 仍满足 val_start == train_end + actual_gap。"""
-        folds = _build_walk_forward_folds(T=50, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            actual_gap = fold["gap"]
-            assert fold["val_start"] == fold["train_end"] + actual_gap, (
-                f"折 {i}: val_start={fold['val_start']} != "
-                f"train_end={fold['train_end']} + gap={actual_gap}"
-            )
+_HUGE_INTEGERS = [
+    pytest.param(10**1000, id="positive-1000-digits"),
+    pytest.param(-(10**1000), id="negative-1000-digits"),
+    pytest.param(10**5000, id="positive-5000-digits"),
+    pytest.param(-(10**5000), id="negative-5000-digits"),
+]
 
 
-class TestDegenerateCase:
-    """T2.3 – T < n_folds×2 时退化为单折（全量训练，无验证）。"""
+def test_minimum_scorable_fold_observations_is_explicitly_two() -> None:
+    assert walk_forward_module.MIN_SCORABLE_FOLD_OBSERVATIONS == 2
 
-    def test_returns_single_fold_when_T_too_small(self):
-        """T=8, n_folds=5：fold_size=8//5=1 < 2，应退化为单折。"""
-        folds = _build_walk_forward_folds(T=8, n_folds=5, gap=20)
-        assert len(folds) == 1, (
-            f"T=8, n_folds=5 时应退化为单折，实际返回 {len(folds)} 折"
+
+def test_walk_forward_fold_has_exact_fields() -> None:
+    assert [field.name for field in fields(WalkForwardFold)] == [
+        "fold_index",
+        "train_start",
+        "train_end",
+        "val_start",
+        "val_end",
+        "effective_gap",
+    ]
+
+
+def test_walk_forward_keeps_full_effective_gap_and_expands_training() -> None:
+    folds = build_walk_forward_folds(
+        total_bars=1600,
+        n_blocks=5,
+        configured_gap=20,
+        min_fold_bars=200,
+        warmup_bars=400,
+        label_lookahead=2,
+    )
+
+    assert len(folds) == 4
+    assert [fold.fold_index for fold in folds] == [0, 1, 2, 3]
+    assert all(fold.train_start == 400 for fold in folds)
+    assert all(fold.effective_gap == 20 for fold in folds)
+    assert all(fold.val_start - fold.train_end == 20 for fold in folds)
+    assert all(fold.val_end - fold.val_start >= 200 for fold in folds)
+    assert all(
+        current.train_end > previous.train_end
+        for previous, current in zip(folds, folds[1:])
+    )
+    assert folds[-1].val_end <= 1600 - 2
+
+
+def test_effective_gap_is_never_less_than_label_lookahead() -> None:
+    folds = build_walk_forward_folds(
+        total_bars=1200,
+        n_blocks=5,
+        configured_gap=0,
+        min_fold_bars=100,
+        warmup_bars=100,
+        label_lookahead=2,
+    )
+    assert all(fold.effective_gap == 2 for fold in folds)
+    assert all(fold.val_start - fold.train_end == 2 for fold in folds)
+
+
+def test_required_training_bars_uses_all_gaps_and_label_tail() -> None:
+    assert required_training_bars(
+        warmup_bars=400,
+        label_lookahead=2,
+        n_blocks=5,
+        min_fold_bars=200,
+        configured_gap=20,
+    ) == 1482
+
+
+@pytest.mark.parametrize("formula_length", _HUGE_INTEGERS)
+def test_formula_warmup_rejects_operationally_excessive_exact_integers(
+    formula_length: int,
+) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        formula_warmup_bars(formula_length)
+
+    message = str(exc_info.value)
+    assert "formula_length" in message
+    assert len(message) <= 160
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "warmup_bars",
+        "label_lookahead",
+        "n_blocks",
+        "min_fold_bars",
+        "configured_gap",
+    ],
+)
+@pytest.mark.parametrize("huge", _HUGE_INTEGERS)
+def test_required_training_bars_rejects_operationally_excessive_exact_integers(
+    parameter: str,
+    huge: int,
+) -> None:
+    arguments = {
+        "warmup_bars": 2137,
+        "label_lookahead": 2,
+        "n_blocks": 5,
+        "min_fold_bars": 200,
+        "configured_gap": 20,
+    }
+    arguments[parameter] = huge
+
+    with pytest.raises(ValueError) as exc_info:
+        required_training_bars(**arguments)
+
+    message = str(exc_info.value)
+    assert parameter in message
+    assert len(message) <= 160
+
+
+def test_public_sizing_apis_preserve_approved_operational_topology() -> None:
+    assert formula_warmup_bars(8) == 2137
+    assert required_training_bars(
+        warmup_bars=2137,
+        label_lookahead=2,
+        n_blocks=5,
+        min_fold_bars=200,
+        configured_gap=20,
+    ) == 3219
+
+
+def test_required_training_bars_rejects_one_bar_folds() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"min_fold_bars must be an integer >= 2",
+    ):
+        required_training_bars(
+            warmup_bars=0,
+            label_lookahead=2,
+            n_blocks=2,
+            min_fold_bars=1,
+            configured_gap=2,
         )
 
-    def test_degenerate_fold_covers_full_range(self):
-        """退化单折的 train 和 val 均覆盖全量 [0, T)。"""
-        T = 8
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=20)
-        fold = folds[0]
-        assert fold["train_start"] == 0
-        assert fold["train_end"] == T
-        assert fold["val_start"] == 0
-        assert fold["val_end"] == T
 
-    def test_degenerate_fold_gap_is_zero(self):
-        """退化单折的 gap 为 0（无意义的 gap）。"""
-        folds = _build_walk_forward_folds(T=8, n_folds=5, gap=20)
-        assert folds[0]["gap"] == 0
-
-    def test_T_equals_n_folds_times_2_minus_1(self):
-        """fold_size = (n_folds*2 - 1) // n_folds = 1 < 2，仍退化为单折。"""
-        T = 5 * 2 - 1   # = 9, fold_size = 9//5 = 1
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=0)
-        assert len(folds) == 1
-
-    def test_T_equals_n_folds_times_2_gives_multiple_folds(self):
-        """fold_size = (n_folds*2) // n_folds = 2 >= 2，应产生多折。"""
-        T = 5 * 2   # = 10, fold_size = 10//5 = 2
-        folds = _build_walk_forward_folds(T=T, n_folds=5, gap=0)
-        assert len(folds) > 1, (
-            f"fold_size=2 时应产生多折，实际返回 {len(folds)} 折"
+def test_builder_rejects_one_bar_folds_with_domain_details() -> None:
+    with pytest.raises(InsufficientWalkForwardDataError) as exc_info:
+        build_walk_forward_folds(
+            total_bars=6,
+            n_blocks=2,
+            configured_gap=2,
+            min_fold_bars=1,
+            warmup_bars=0,
+            label_lookahead=2,
         )
 
+    message = str(exc_info.value)
+    for fragment in (
+        "parameter=min_fold_bars",
+        "value=1",
+        "reason=min_fold_bars must be an integer >= 2",
+        "required=",
+        "actual=6",
+        "warmup=0",
+        "gap=2",
+        "blocks=2",
+        "min_fold_bars=1",
+    ):
+        assert fragment in message
 
-class TestReturnStructure:
-    """验证返回的折字典包含所有必要键。"""
 
-    REQUIRED_KEYS = {"train_start", "train_end", "val_start", "val_end", "gap"}
+def test_insufficient_data_never_reduces_gap_or_returns_a_fake_fold() -> None:
+    with pytest.raises(InsufficientWalkForwardDataError) as exc_info:
+        build_walk_forward_folds(
+            total_bars=500,
+            n_blocks=5,
+            configured_gap=20,
+            min_fold_bars=200,
+            warmup_bars=200,
+            label_lookahead=2,
+        )
 
-    def test_all_required_keys_present(self):
-        folds = _build_walk_forward_folds(T=500, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            missing = self.REQUIRED_KEYS - set(fold.keys())
-            assert not missing, f"折 {i} 缺少键：{missing}"
+    message = str(exc_info.value)
+    for fragment in (
+        "required=",
+        "actual=500",
+        "warmup=200",
+        "gap=20",
+        "blocks=5",
+        "min_fold_bars=200",
+    ):
+        assert fragment in message
 
-    def test_degenerate_fold_has_required_keys(self):
-        folds = _build_walk_forward_folds(T=8, n_folds=5, gap=20)
-        for i, fold in enumerate(folds):
-            missing = self.REQUIRED_KEYS - set(fold.keys())
-            assert not missing, f"退化折 {i} 缺少键：{missing}"
+
+@pytest.mark.parametrize("n_blocks", [-3, -1, 0, 1])
+def test_fewer_than_two_blocks_fails_closed_with_domain_details(
+    n_blocks: int,
+) -> None:
+    with pytest.raises(InsufficientWalkForwardDataError) as exc_info:
+        build_walk_forward_folds(
+            total_bars=500,
+            n_blocks=n_blocks,
+            configured_gap=20,
+            min_fold_bars=200,
+            warmup_bars=100,
+            label_lookahead=2,
+        )
+
+    message = str(exc_info.value)
+    for fragment in (
+        "required=522",
+        "actual=500",
+        "warmup=100",
+        "gap=20",
+        f"blocks={n_blocks}",
+        "min_fold_bars=200",
+        "parameter=n_blocks",
+        f"value={n_blocks!r}",
+        "reason=at least two blocks are required",
+    ):
+        assert fragment in message
+
+
+@pytest.mark.parametrize(
+    ("parameter", "invalid_value"),
+    [
+        ("total_bars", -1),
+        ("configured_gap", -1),
+        ("min_fold_bars", 0),
+        ("warmup_bars", -1),
+        ("label_lookahead", -1),
+        ("total_bars", True),
+        ("n_blocks", False),
+        ("configured_gap", 1.5),
+        ("min_fold_bars", "200"),
+        ("warmup_bars", None),
+        ("label_lookahead", 2.0),
+        ("n_blocks", "5"),
+    ],
+)
+def test_invalid_public_build_arguments_use_walk_forward_domain_error(
+    parameter: str, invalid_value,
+) -> None:
+    arguments = {
+        "total_bars": 1600,
+        "n_blocks": 5,
+        "configured_gap": 20,
+        "min_fold_bars": 200,
+        "warmup_bars": 400,
+        "label_lookahead": 2,
+    }
+    arguments[parameter] = invalid_value
+
+    with pytest.raises(InsufficientWalkForwardDataError) as exc_info:
+        build_walk_forward_folds(**arguments)
+
+    message = str(exc_info.value)
+    for fragment in (
+        "invalid walk-forward configuration",
+        f"parameter={parameter}",
+        f"value={invalid_value!r}",
+        "reason=",
+        "required=",
+        f"actual={arguments['total_bars']!r}",
+        f"warmup={arguments['warmup_bars']!r}",
+        f"gap={arguments['configured_gap']!r}",
+        f"blocks={arguments['n_blocks']!r}",
+        f"min_fold_bars={arguments['min_fold_bars']!r}",
+    ):
+        assert fragment in message
+
+
+def test_formula_warmup_bars_uses_declared_feature_and_operator_history() -> None:
+    assert formula_warmup_bars(1) == MAX_FEATURE_LOOKBACK + MAX_OPERATOR_LOOKBACK - 1
+    assert formula_warmup_bars(3) == MAX_FEATURE_LOOKBACK + 3 * (
+        MAX_OPERATOR_LOOKBACK - 1
+    )
+
+
+@pytest.mark.parametrize("formula_length", [0, -1])
+def test_formula_warmup_rejects_non_positive_length(formula_length: int) -> None:
+    with pytest.raises(ValueError, match="formula_length must be >= 1"):
+        formula_warmup_bars(formula_length)
+
+
+@pytest.mark.parametrize("value", [True, _IntSubclass(1)])
+def test_formula_warmup_requires_exact_builtin_int(value) -> None:
+    with pytest.raises(ValueError, match="formula_length must be >= 1"):
+        formula_warmup_bars(value)
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "warmup_bars",
+        "label_lookahead",
+        "n_blocks",
+        "min_fold_bars",
+        "configured_gap",
+    ],
+)
+@pytest.mark.parametrize("value", [True, _IntSubclass(5)])
+def test_required_training_bars_requires_exact_builtin_int(parameter, value) -> None:
+    arguments = {
+        "warmup_bars": 400,
+        "label_lookahead": 2,
+        "n_blocks": 5,
+        "min_fold_bars": 200,
+        "configured_gap": 20,
+    }
+    arguments[parameter] = value
+    with pytest.raises(ValueError):
+        required_training_bars(**arguments)
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "total_bars",
+        "warmup_bars",
+        "label_lookahead",
+        "n_blocks",
+        "min_fold_bars",
+        "configured_gap",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [True, _IntSubclass(5), _HostileProtocols()],
+    ids=["bool", "int-subclass", "hostile-protocols"],
+)
+def test_builder_rejects_non_exact_ints_without_caller_protocols(
+    parameter, value
+) -> None:
+    _HostileProtocols.calls = 0
+    arguments = {
+        "total_bars": 1600,
+        "n_blocks": 5,
+        "configured_gap": 20,
+        "min_fold_bars": 200,
+        "warmup_bars": 400,
+        "label_lookahead": 2,
+    }
+    arguments[parameter] = value
+
+    with pytest.raises(InsufficientWalkForwardDataError) as captured:
+        build_walk_forward_folds(**arguments)
+
+    assert len(str(captured.value)) <= 500
+    assert _HostileProtocols.calls == 0
+
+
+def test_builder_huge_exact_int_diagnostic_is_bounded_without_stringifying_value() -> None:
+    huge = 10**5000
+    with pytest.raises(InsufficientWalkForwardDataError) as captured:
+        build_walk_forward_folds(
+            total_bars=1600,
+            n_blocks=huge,
+            configured_gap=20,
+            min_fold_bars=200,
+            warmup_bars=400,
+            label_lookahead=2,
+        )
+
+    message = str(captured.value)
+    assert "bit_length=" in message
+    assert len(message) <= 500

@@ -1,137 +1,243 @@
-# Feature: mt5-alphagpt-refactor, Property 6: 回测 80/20 分割不变量
-# Feature: mt5-alphagpt-refactor, Property 7: 高换手率惩罚单调性
-"""
-Property-based tests for model_core.backtest (MT5Backtest).
+"""Properties of mask-aligned shared-execution backtest scoring."""
 
-Property 6 Validates: Requirements 5.4
-Property 7 Validates: Requirements 5.3
-"""
-
-import math
-import torch
 import pytest
-from hypothesis import given, settings, strategies as st, assume
+import torch
+from hypothesis import assume, given, settings, strategies as st
 
 from model_core.backtest import MT5Backtest
+from model_core.execution import performance_metrics
+from model_core.walk_forward import build_walk_forward_folds, required_training_bars
 
 
-# ── Property 6: 回测 80/20 分割不变量 ────────────────────────────────────────
-# Validates: Requirements 5.4
-
-
-@settings(max_examples=100)
-@given(
-    T=st.integers(min_value=10, max_value=500),
-)
-def test_property6_backtest_80_20_split(T: int):
-    """
-    For any T, MT5Backtest.evaluate() must use exactly floor(T*0.8) steps
-    as in-sample and the remaining steps as out-of-sample.
-
-    Note: _sortino is now called multiple times internally by _multi_objective,
-    so we validate the split via the returned mean_oos instead.
-
-    Validates: Requirements 5.4
-    """
-    backtest = MT5Backtest()
-
-    expected_is  = math.floor(T * 0.8)
-    expected_oos = T - expected_is
-
-    # Capture oos pnl length via wrapping mean
-    captured_oos_len = []
-    original_evaluate = backtest.evaluate
-
-    def capturing_evaluate(factors, raw_dict, target_ret):
-        t = factors.shape[1]
-        split = math.floor(t * 0.8)
-        captured_oos_len.append(t - split)
-        return original_evaluate(factors, raw_dict, target_ret)
-
-    factors    = torch.ones(1, T)
-    target_ret = torch.zeros(1, T)
-
-    capturing_evaluate(factors, {}, target_ret)
-
-    assert captured_oos_len[0] == expected_oos, (
-        f"T={T}: out-of-sample length expected {expected_oos}, "
-        f"got {captured_oos_len[0]}"
+def inputs(length: int, valid_bars: int):
+    factors = torch.linspace(-1.0, 1.0, length).unsqueeze(0)
+    target_ret = torch.cos(torch.arange(length, dtype=torch.float32)).unsqueeze(0) * 0.01
+    target_valid = torch.arange(length).unsqueeze(0) < valid_bars
+    bar_time_ns = (
+        torch.arange(length, dtype=torch.int64).unsqueeze(0)
+        * 3_600
+        * 1_000_000_000
     )
+    return factors, target_ret, target_valid, bar_time_ns
 
 
-# ── Property 7: 高换手率惩罚单调性 ───────────────────────────────────────────
-# Validates: Requirements 5.3
+@pytest.fixture(scope="module", autouse=True)
+def _warm_backtest_runtime() -> None:
+    values = inputs(8, 6)
+    factors, target_ret, target_valid, bar_time_ns = values
+    baseline = MT5Backtest().evaluate_segment(*values)
+    factors_changed = factors.clone()
+    target_changed = target_ret.clone()
+    factors_changed[~target_valid] = 1.0e10
+    target_changed[~target_valid] = -1.0e10
+    changed = MT5Backtest().evaluate_segment(
+        factors_changed, target_changed, target_valid, bar_time_ns
+    )
+    torch.testing.assert_close(changed, baseline)
 
 
-@settings(max_examples=100)
 @given(
-    T=st.integers(min_value=20, max_value=300),
-    ret_val=st.floats(
-        min_value=0.0002,   # strictly positive and above cost_rate=0.0001
-        max_value=0.01,
+    length=st.integers(min_value=8, max_value=80),
+    invalid_tail=st.integers(min_value=2, max_value=5),
+)
+@settings(max_examples=100)
+def test_masked_tail_is_irrelevant_to_segment_score(length, invalid_tail):
+    invalid_tail = min(invalid_tail, length - 3)
+    values = inputs(length, length - invalid_tail)
+    factors, target_ret, target_valid, bar_time_ns = values
+    baseline = MT5Backtest().evaluate_segment(*values)
+
+    factors_changed = factors.clone()
+    target_changed = target_ret.clone()
+    factors_changed[~target_valid] = 1.0e10
+    target_changed[~target_valid] = -1.0e10
+    changed = MT5Backtest().evaluate_segment(
+        factors_changed, target_changed, target_valid, bar_time_ns
+    )
+    torch.testing.assert_close(changed, baseline)
+
+
+@given(
+    length=st.integers(min_value=8, max_value=80),
+    base_cost=st.floats(
+        min_value=1.0e-6,
+        max_value=0.005,
         allow_nan=False,
         allow_infinity=False,
     ),
 )
-def test_property7_high_turnover_penalty_monotonicity(T: int, ret_val: float):
-    """
-    For any two signal sequences A and B with the same raw returns but
-    differing turnover:
-      - Signal B (low turnover): constant +1 position → turnover ≈ 0
-      - Signal A (high turnover): alternating ±1 positions → turnover ≈ 2
+@settings(max_examples=100)
+def test_cost_stress_rerun_cannot_improve_shared_net_pnl(length, base_cost):
+    values = inputs(length, length - 2)
+    bt = MT5Backtest(cost_rate=base_cost)
+    normal = bt._run_execution(*values, cost_rate=base_cost)
+    stressed = bt._run_execution(*values, cost_rate=base_cost * 2.0)
+    assert stressed.net_pnl.sum().item() <= normal.net_pnl.sum().item() + 1e-8
 
-    A's fitness score must be strictly lower than B's score.
 
-    The ret_val is chosen positive and above cost_rate so that:
-      - Signal B earns a genuine positive PnL (clear downside distribution)
-      - Signal A's heavy turnover costs create a meaningful penalty
+@given(
+    length=st.integers(min_value=8, max_value=80),
+    base_cost=st.floats(
+        min_value=1.0e-6,
+        max_value=0.001,
+        allow_nan=False,
+        allow_infinity=False,
+    ),
+)
+@settings(max_examples=30)
+def test_public_cost_stress_matches_shared_execution_at_double_cost(length, base_cost):
+    values = inputs(length, length - 2)
+    factors, target_ret, target_valid, bar_time_ns = values
+    bt = MT5Backtest(cost_rate=base_cost)
+    stressed = bt._run_execution(*values, cost_rate=base_cost * 2.0)
+    expected = max(-5.0, min(5.0, performance_metrics(stressed).sortino))
 
-    Validates: Requirements 5.3
-    """
-    backtest = MT5Backtest()
+    assert bt._cost_stress(
+        factors, target_ret, target_valid, bar_time_ns
+    ) == pytest.approx(expected)
 
-    # Shared target return: same for both sequences (positive, above cost_rate)
-    target_ret = torch.full((1, T), ret_val, dtype=torch.float32)
 
-    # ── Signal B: constant large positive factor → tanh → +1 → zero turnover
-    # position is always +1, turnover = 0 after first bar
-    factors_B = torch.ones(1, T, dtype=torch.float32) * 10.0
+@given(
+    length=st.integers(min_value=12, max_value=80),
+    bounds=st.tuples(*(st.integers(min_value=-2, max_value=82) for _ in range(4))),
+)
+@settings(max_examples=60)
+def test_evaluate_fold_rejects_every_invalid_integer_boundary_tuple(length, bounds):
+    train_start, train_end, val_start, val_end = bounds
+    is_valid = (
+        0 <= train_start < train_end < val_start < val_end
+        and train_end - train_start >= 2
+        and val_end - val_start >= 2
+        and train_end + 2 <= length
+        and val_end + 2 <= length
+    )
+    assume(not is_valid)
+    with pytest.raises(
+        ValueError,
+        match=r"field=(fold_bounds|train_bars|val_bars|train_end|val_end)",
+    ):
+        MT5Backtest().evaluate_fold(
+            *inputs(length, length - 2),
+            train_start=train_start,
+            train_end=train_end,
+            val_start=val_start,
+            val_end=val_end,
+        )
 
-    # ── Signal A: alternating large ±10 factor → tanh → alternating ±1
-    # position alternates each bar → very high turnover (~2.0 per bar)
-    alternating = torch.ones(T, dtype=torch.float32)
-    alternating[1::2] = -1.0          # odd indices → -1
-    factors_A = (alternating * 10.0).unsqueeze(0)  # shape [1, T]
 
-    # Evaluate both
-    score_B, _ = backtest.evaluate(factors_B, {}, target_ret)
-    score_A, _ = backtest.evaluate(factors_A, {}, target_ret)
+@given(
+    train_bars=st.integers(min_value=8, max_value=12),
+    gap=st.integers(min_value=1, max_value=8),
+    val_bars=st.integers(min_value=8, max_value=12),
+)
+@settings(max_examples=30)
+def test_evaluate_fold_accepts_valid_disjoint_ranges(train_bars, gap, val_bars):
+    val_start = train_bars + gap
+    val_end = val_start + val_bars
+    length = val_end + 2
+    train_score, val_score = MT5Backtest().evaluate_fold(
+        *inputs(length, length - 2),
+        train_start=0,
+        train_end=train_bars,
+        val_start=val_start,
+        val_end=val_end,
+    )
+    assert torch.isfinite(train_score)
+    assert torch.isfinite(val_score)
 
-    # Verify turnover invariants (sanity check)
-    signal_A = torch.tanh(factors_A)
-    pos_A = torch.sign(signal_A)
-    prev_A = torch.roll(pos_A, 1, dims=1)
-    prev_A[:, 0] = 0.0
-    turnover_A_mean = torch.abs(pos_A - prev_A).mean().item()
 
-    signal_B = torch.tanh(factors_B)
-    pos_B = torch.sign(signal_B)
-    prev_B = torch.roll(pos_B, 1, dims=1)
-    prev_B[:, 0] = 0.0
-    turnover_B_mean = torch.abs(pos_B - prev_B).mean().item()
+@given(
+    field=st.sampled_from(["train_start", "train_end", "val_start", "val_end"]),
+    exponent=st.integers(min_value=1000, max_value=5000),
+    sign=st.sampled_from([-1, 1]),
+)
+@settings(max_examples=30)
+def test_excessive_exact_fold_boundaries_have_bounded_field_diagnostics(
+    field, exponent, sign
+):
+    bounds = dict(train_start=0, train_end=8, val_start=10, val_end=18)
+    bounds[field] = sign * (10**exponent)
 
-    # Signal A must have high turnover (> 0.5) and B must have low (≤ 0.5)
-    assume(turnover_A_mean > 0.5)
-    assume(turnover_B_mean <= 0.5)
+    with pytest.raises(ValueError) as caught:
+        MT5Backtest().evaluate_fold(
+            *inputs(20, 18),
+            **bounds,
+        )
 
-    # Skip degenerate cases where scores are not finite (numerical edge cases)
-    assume(math.isfinite(score_A.item()))
-    assume(math.isfinite(score_B.item()))
+    message = str(caught.value)
+    assert len(message) <= 1024
+    assert f"field={field}" in message
+    assert "actual=out of operational bounds" in message
 
-    # Core property: high-turnover signal must score strictly lower
-    assert score_A.item() < score_B.item(), (
-        f"Property 7 violated: "
-        f"score_A={score_A.item():.6f} should be < score_B={score_B.item():.6f} "
-        f"(turnover_A={turnover_A_mean:.4f}, turnover_B={turnover_B_mean:.4f}, "
-        f"T={T}, ret_val={ret_val:.6f})"
+
+@given(
+    warmup_bars=st.integers(min_value=0, max_value=10),
+    configured_gap=st.integers(min_value=0, max_value=10),
+)
+@settings(max_examples=30)
+def test_smallest_builder_fold_is_always_scorable(warmup_bars, configured_gap):
+    total_bars = required_training_bars(
+        warmup_bars=warmup_bars,
+        label_lookahead=2,
+        n_blocks=2,
+        min_fold_bars=2,
+        configured_gap=configured_gap,
+    )
+    fold = build_walk_forward_folds(
+        total_bars=total_bars,
+        n_blocks=2,
+        configured_gap=configured_gap,
+        min_fold_bars=2,
+        warmup_bars=warmup_bars,
+        label_lookahead=2,
+    )[0]
+    factors = torch.zeros((1, total_bars), dtype=torch.float32)
+    target_ret = torch.zeros_like(factors)
+    for start, end in (
+        (fold.train_start, fold.train_end),
+        (fold.val_start, fold.val_end),
+    ):
+        factors[:, start:end] = torch.tensor([[1.0, -1.0]])
+        target_ret[:, start:end] = 0.01
+    target_valid = torch.arange(total_bars).unsqueeze(0) < total_bars - 2
+    bar_time_ns = (
+        torch.arange(total_bars, dtype=torch.int64).unsqueeze(0)
+        * 3_600
+        * 1_000_000_000
+    )
+
+    train_score, val_score = MT5Backtest().evaluate_fold(
+        factors=factors,
+        target_ret=target_ret,
+        target_valid=target_valid,
+        bar_time_ns=bar_time_ns,
+        train_start=fold.train_start,
+        train_end=fold.train_end,
+        val_start=fold.val_start,
+        val_end=fold.val_end,
+    )
+    assert torch.isfinite(train_score)
+    assert torch.isfinite(val_score)
+
+
+@given(
+    dtype=st.sampled_from([torch.float16, torch.float32, torch.float64]),
+    scale=st.sampled_from([0.5, 1.0, 2.0, 8.0]),
+)
+@settings(max_examples=30)
+def test_public_ic_is_finite_and_scale_equivalent(dtype, scale):
+    from model_core.backtest import compute_ic_metrics
+
+    base = torch.tensor([[1.0, 2.0, 4.0, 8.0]], dtype=dtype)
+    target = torch.tensor([[1.0, 3.0, 2.0, 5.0]], dtype=dtype)
+    valid = torch.ones_like(base, dtype=torch.bool)
+
+    baseline, baseline_stability = compute_ic_metrics(base, target, valid)
+    scaled, scaled_stability = compute_ic_metrics(base * scale, target, valid)
+
+    assert torch.isfinite(scaled)
+    assert torch.isfinite(scaled_stability)
+    torch.testing.assert_close(scaled, baseline, rtol=0, atol=2.0e-3)
+    torch.testing.assert_close(
+        scaled_stability, baseline_stability, rtol=0, atol=2.0e-3
     )

@@ -135,6 +135,8 @@ class ModelConfig:
 
     # ── Walk-Forward Gap ───────────────────────────────────────────────
     WF_GAP: int = 20
+    WF_N_BLOCKS: int = 5
+    WF_MIN_FOLD_BARS: int = 200
 
     # ── 公式结构约束（2026-07-05 新增）──────────────────────────────────
     # 背景：index 组因子因 TS_RANK 连续使用退化为 beta 因子（91.8% 做多），
