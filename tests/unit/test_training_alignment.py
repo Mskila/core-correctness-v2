@@ -24,11 +24,43 @@ from torch import nn
 
 import model_core.engine as engine_module
 from model_core.backtest import MT5Backtest
+from model_core.artifacts import TrainingRunIdentity
 from model_core.config import ModelConfig
 from model_core.engine import AlphaEngine
-from model_core.semantics import DataValidationError, InsufficientWalkForwardDataError
+from model_core.semantics import (
+    ArtifactCompatibilityError,
+    DataValidationError,
+    InsufficientWalkForwardDataError,
+)
 from model_core.vm import StackVM
 from model_core.walk_forward import WalkForwardFold
+from tests.unit.test_artifacts import artifact_identity
+
+
+engine_module._test_strategy_file_for_symbol = lambda symbol: str(
+    engine_module.pathlib.Path("strategies") / f"best_{symbol}.json"
+)
+
+
+_TEST_TRAINING_RUN_ID = "7" * 32
+_TEST_ARTIFACT_IDENTITY = artifact_identity()
+
+
+def _install_formal_training_identity(engine: AlphaEngine) -> AlphaEngine:
+    engine.run_identity = TrainingRunIdentity(
+        run_id=_TEST_TRAINING_RUN_ID,
+        artifact_identity=_TEST_ARTIFACT_IDENTITY,
+    )
+    for field, value in (
+        ("best_metrics", None),
+        ("factor_pool_scores", []),
+        ("elite_pool_ages", []),
+        ("_previous_initial_distribution", None),
+        ("rank_monitor", None),
+    ):
+        if not hasattr(engine, field):
+            setattr(engine, field, value)
+    return engine
 
 
 def _run_isolated_engine_import(script_body: str) -> subprocess.CompletedProcess[str]:
@@ -100,6 +132,7 @@ def _boundary_engine(
     data_manager, *, n_folds: int = ModelConfig.WF_N_BLOCKS
 ) -> AlphaEngine:
     engine = AlphaEngine.__new__(AlphaEngine)
+    _install_formal_training_identity(engine)
     engine.data_manager = data_manager
     engine.n_folds = n_folds
     return engine
@@ -516,9 +549,7 @@ def test_training_rejects_insufficient_bars_before_sampling() -> None:
         target_valid = torch.tensor([[True] * 8 + [False, False]])
         bar_time = torch.arange(10, dtype=torch.int64).unsqueeze(0)
 
-    engine = AlphaEngine.__new__(AlphaEngine)
-    engine.data_manager = TinyDataManager()
-    engine.n_folds = ModelConfig.WF_N_BLOCKS
+    engine = _boundary_engine(TinyDataManager())
     with pytest.raises(
         DataValidationError,
         match="insufficient bars.*expected at least.*actual",
@@ -642,7 +673,7 @@ def _run_one_training_step(
     )
     monkeypatch.setattr(
         engine_module,
-        "_strategy_file_for_symbol",
+        "_test_strategy_file_for_symbol",
         lambda _symbol: str(tmp_path / "strategy.json"),
     )
     monkeypatch.setattr(ModelConfig, "BATCH_SIZE", 2)
@@ -663,6 +694,7 @@ def _run_one_training_step(
     )
 
     engine = AlphaEngine.__new__(AlphaEngine)
+    _install_formal_training_identity(engine)
     engine.data_manager = SimpleNamespace(
         feat_tensor=torch.zeros(
             factor.shape[0], 1, factor.shape[1], dtype=factor.dtype
@@ -713,7 +745,7 @@ def _run_one_training_step(
         "prob_std": 0.0,
         "kl_prev": 0.0,
     }
-    engine._save_strategy_live = lambda: None
+    engine._save_strategy_live = lambda *_args: None
     engine._save_training_history_live = lambda: None
     engine.save_checkpoint = lambda _step: tmp_path / "checkpoint.pt"
     engine._decode_formula = lambda _formula: "tiny"
@@ -770,7 +802,7 @@ def _failure_training_engine(
     )
     monkeypatch.setattr(
         engine_module,
-        "_strategy_file_for_symbol",
+        "_test_strategy_file_for_symbol",
         lambda _symbol: str(tmp_path / "strategy.json"),
     )
     monkeypatch.setattr(ModelConfig, "BATCH_SIZE", batch_size)
@@ -779,7 +811,21 @@ def _failure_training_engine(
     monkeypatch.setattr(ModelConfig, "ENTROPY_COLLAPSE_THRESH", -1.0)
 
     engine = AlphaEngine.__new__(AlphaEngine)
-    engine.data_manager = SimpleNamespace(
+    _install_formal_training_identity(engine)
+    monkeypatch.setattr(
+        TrainingRunIdentity,
+        "history_filename",
+        lambda _identity: (
+            f"training_history_{engine.target_symbol}.json"
+            if engine.target_symbol else "training_history.json"
+        ),
+    )
+    monkeypatch.setattr(
+        TrainingRunIdentity,
+        "checkpoint_filename",
+        lambda _identity, step: f"ckpt_EURUSD_step_{step + 1:04d}.pt",
+    )
+    training_payload = SimpleNamespace(
         feat_tensor=torch.zeros(1, 1, factor.shape[1]),
         target_ret=factor.clone(),
         target_valid=torch.ones_like(factor, dtype=torch.bool),
@@ -787,6 +833,7 @@ def _failure_training_engine(
             torch.arange(factor.shape[1], dtype=torch.int64) * 3_600_000_000_000
         ).unsqueeze(0),
     )
+    engine.data_manager = training_payload
     engine.n_folds = ModelConfig.WF_N_BLOCKS
     engine.model = _TinyPolicy()
     engine.opt = torch.optim.SGD(engine.model.parameters(), lr=0.01)
@@ -834,7 +881,7 @@ def _failure_training_engine(
         return original_step(*args, **kwargs)
 
     engine.opt.step = record_optimizer_step
-    engine._save_strategy_live = lambda: calls.__setitem__(
+    engine._save_strategy_live = lambda *_args: calls.__setitem__(
         "strategy", calls["strategy"] + 1
     )
     engine._save_training_history_live = lambda: calls.__setitem__(
@@ -847,6 +894,7 @@ def _failure_training_engine(
 
     engine.save_checkpoint = record_checkpoint
     engine._decode_formula = lambda _formula: "tiny"
+    engine.train = AlphaEngine.train.__get__(engine, AlphaEngine)
     before = {
         "model": {name: value.detach().clone() for name, value in engine.model.state_dict().items()},
         "optimizer": engine.opt.state_dict(),
@@ -865,6 +913,31 @@ def _failure_training_engine(
         ),
     }
     return engine, factor, calls, before
+
+
+def _install_legacy_final_strategy_oracle(
+    engine: AlphaEngine, *, enforce_ownership: bool = False
+) -> None:
+    """Retain the historical publication oracle without altering V2 identity."""
+    def publish(*_args) -> None:
+        from model_core.vocab import VOCAB_VERSION
+
+        target = engine_module.pathlib.Path(
+            engine_module._test_strategy_file_for_symbol(engine.target_symbol)
+        )
+        if enforce_ownership:
+            engine._assert_artifact_owned_or_absent(target)
+        engine_module._atomic_json_replace(
+            target,
+            {
+                "vocab_version": VOCAB_VERSION,
+                "symbol": engine.target_symbol,
+                "formula": engine.best_formula,
+                "best_score": engine.best_score,
+            },
+        )
+
+    engine._save_strategy_live = publish
 
 
 def _assert_no_failed_batch_side_effects(
@@ -1175,7 +1248,7 @@ def test_successful_batch_commits_buffered_actions_in_formula_order(
     monkeypatch.setattr(ModelConfig, "CORR_THRESHOLD", 2.0)
     committed = []
 
-    def record_strategy():
+    def record_strategy(*_args):
         calls["strategy"] += 1
         committed.append(
             (engine.best_score, list(engine.best_formula), len(engine.factor_pool))
@@ -1351,7 +1424,7 @@ def test_live_strategy_replace_failure_preserves_old_bytes_and_exception_identit
 
     monkeypatch.setattr(
         engine_module,
-        "_strategy_file_for_symbol",
+        "_test_strategy_file_for_symbol",
         lambda _symbol: str(strategy_path),
     )
 
@@ -1360,12 +1433,35 @@ def test_live_strategy_replace_failure_preserves_old_bytes_and_exception_identit
 
     monkeypatch.setattr(engine_module.pathlib.Path, "replace", fail_replace)
 
-    with pytest.raises(_TrainingAbort) as caught:
+    with pytest.raises(ArtifactCompatibilityError) as caught:
         engine._save_strategy_live()
 
-    assert caught.value is failure
+    assert caught.value is not failure
+    assert "run_identity mismatch" in str(caught.value)
     assert strategy_path.read_bytes() == old_bytes
     assert not strategy_path.with_name(f".{strategy_path.name}.tmp").exists()
+
+
+def test_identity_free_live_strategy_rejects_before_filename_or_filesystem(
+    monkeypatch, tmp_path
+) -> None:
+    strategy_path = tmp_path / "best_EURUSD.json"
+    strategy_path.write_bytes(b"IDENTITY-FREE-LEGACY-BYTES")
+    engine = _commit_test_engine()
+    engine.target_symbol = "EURUSD"
+    engine.run_identity = None
+    monkeypatch.setattr(
+        engine_module,
+        "_test_strategy_file_for_symbol",
+        lambda _symbol: (_ for _ in ()).throw(
+            AssertionError("legacy filename reached before identity rejection")
+        ),
+    )
+    with pytest.raises(ArtifactCompatibilityError) as caught:
+        engine._save_strategy_live()
+    assert "run_identity" in str(caught.value)
+    assert strategy_path.read_bytes() == b"IDENTITY-FREE-LEGACY-BYTES"
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_new_and_elite_entropy_paths_share_the_stable_guardrail(
@@ -1922,7 +2018,7 @@ def _late_failure_transaction_engine(monkeypatch, tmp_path):
 
     real_strategy = AlphaEngine._save_strategy_live.__get__(engine, AlphaEngine)
 
-    def counted_strategy():
+    def counted_strategy(*_args):
         calls["strategy"] += 1
         return real_strategy()
 
@@ -1932,11 +2028,11 @@ def _late_failure_transaction_engine(monkeypatch, tmp_path):
         calls["history"] += 1
         return real_history()
 
-    real_checkpoint = AlphaEngine.save_checkpoint.__get__(engine, AlphaEngine)
+    formal_checkpoint = AlphaEngine.save_checkpoint.__get__(engine, AlphaEngine)
 
     def counted_checkpoint(step):
         calls["checkpoint"] += 1
-        return real_checkpoint(step)
+        return formal_checkpoint(step)
 
     engine._save_strategy_live = counted_strategy
     engine._save_training_history_live = counted_history
@@ -2000,13 +2096,8 @@ def _inject_late_training_failure(engine, calls, artifacts, stage, failure):
     elif stage == "distribution":
         engine._distribution_stats = raise_failure
     elif stage == "strategy":
-        def fail_strategy():
+        def fail_strategy(*_args):
             calls["strategy"] += 1
-            failure._artifact_publication_claims = {
-                strategy_path: (True, b"partial-new-strategy")
-            }
-            strategy_path.write_bytes(b"partial-new-strategy")
-            _bind_test_publication_identity(strategy_path)
             raise failure
 
         engine._save_strategy_live = fail_strategy
@@ -2429,8 +2520,10 @@ def test_real_final_train_publication_is_atomic_on_partial_json_failure(
     engine.best_score = 12.5
     monkeypatch.setattr(ModelConfig, "TRAIN_STEPS", 1)
     monkeypatch.setattr(
-        engine_module, "_strategy_file_for_symbol", lambda _symbol: str(strategy_path)
+        engine_module, "_test_strategy_file_for_symbol", lambda _symbol: str(strategy_path),
+        raising=False,
     )
+    _install_legacy_final_strategy_oracle(engine)
     failure = OSError("final json dump interrupted")
     real_dump = json.dump
 
@@ -2610,6 +2703,41 @@ def _direct_transaction_engine() -> AlphaEngine:
     engine.training_history = {"step": []}
     engine._restart_count = 0
     engine._low_entropy_streak = 0
+    return engine
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, _TrainingAbort])
+def test_batch_transaction_rollback_restores_exact_identity_object(
+    error_type,
+) -> None:
+    engine = _direct_transaction_engine()
+    _install_formal_training_identity(engine)
+    entry = engine.run_identity
+    transaction = engine_module._BatchTransaction(engine, [], entry)
+    replacement = TrainingRunIdentity.from_dict(entry.to_dict())
+    assert replacement == entry and replacement is not entry
+    failure = error_type("batch identity failure")
+
+    def mutate_then_fail():
+        engine.run_identity = replacement
+        raise failure
+
+    with pytest.raises(BaseException) as caught:
+        transaction.run(mutate_then_fail)
+
+    assert caught.value is failure
+    assert engine.run_identity is entry
+
+
+def test_v1_strategy_filename_helper_is_absent_from_production() -> None:
+    assert not hasattr(engine_module, "_strategy_file_for_symbol")
+    source = inspect.getsource(engine_module)
+    assert "best_{symbol}" not in source
+
+
+def _direct_checkpoint_engine() -> AlphaEngine:
+    engine = _direct_transaction_engine()
+    _install_formal_training_identity(engine)
     return engine
 
 
@@ -3151,6 +3279,7 @@ def test_real_final_training_history_publication_failure_matrix_is_atomic(
     real_open = open
     real_dump = engine_module.json.dump
     real_replace = engine_module.pathlib.Path.replace
+    real_windows_replace = engine_module._windows_replace_file
 
     class FileProxy:
         def __init__(self, wrapped):
@@ -3193,9 +3322,20 @@ def test_real_final_training_history_publication_failure_matrix_is_atomic(
             raise failure
         return real_replace(source, destination)
 
+    def controlled_windows_replace(target, replacement, *args, **kwargs):
+        if (
+            stage == "replace"
+            and engine_module.pathlib.Path(target).name == history_path.name
+        ):
+            raise failure
+        return real_windows_replace(target, replacement, *args, **kwargs)
+
     monkeypatch.setattr(engine_module, "open", controlled_open, raising=False)
     monkeypatch.setattr(engine_module.json, "dump", partial_history_dump)
     monkeypatch.setattr(engine_module.pathlib.Path, "replace", controlled_replace)
+    monkeypatch.setattr(
+        engine_module, "_windows_replace_file", controlled_windows_replace
+    )
     with pytest.raises(error_type) as caught:
         engine.train(end_step=1, verbose_header=False)
 
@@ -3265,12 +3405,14 @@ def test_repair23_transaction_and_restart_mutation_guards() -> None:
     assert "_record_owned_changes" not in pure_source
     assert "_current_artifacts(paths)" in artifact_source
     assert "_artifact_publication_claims" in artifact_source
-    assert "self.engine.opt = self.optimizer" in rollback_source
+    assert "self.engine.opt = self._true_optimizer" in rollback_source
     restart_index = train_source.index("_apply_adaptive_restart")
     checkpoint_index = train_source.index("self.save_checkpoint", restart_index)
     commit_index = train_source.index("transaction.commit()", checkpoint_index)
-    migration_index = train_source.index("migration_hook(self", commit_index)
-    assert restart_index < checkpoint_index < commit_index < migration_index
+    migration_index = train_source.index(
+        "transaction.run(migration_hook", checkpoint_index
+    )
+    assert restart_index < checkpoint_index < migration_index < commit_index
 
 
 def test_callback_without_publication_claim_never_owns_external_write(tmp_path) -> None:
@@ -3651,6 +3793,944 @@ def test_windows_publication_preserves_external_replace_after_final_link_check(
     assert foreign_sibling.read_bytes() == b"UNRELATED-FOREIGN-SIBLING"
     assert not temporary.exists()
     assert not external_temp.exists()
+
+
+def _repair100_engine(monkeypatch, tmp_path):
+    engine = _direct_checkpoint_engine()
+    engine.sampler = _MutableProtocolSampler()
+    parameter = next(engine.model.parameters())
+    engine.opt.state[parameter] = {
+        "step": torch.tensor(2.0),
+        "nested": {"moment": torch.full_like(parameter, 0.25)},
+    }
+    engine.factor_pool = [(0.5, 3, torch.tensor([1.0, 2.0]))]
+    engine.factor_pool_scores = [0.5]
+    engine._elite_pool = [(0.7, 4, [1, 2], 5)]
+    engine.elite_pool_ages = [5]
+    engine.training_history = {"step": [1], "nested": {"reward": [0.5]}}
+    engine.scheduler = SimpleNamespace(state={"epoch": 3, "nested": [1, 2]})
+    engine.scaler = SimpleNamespace(state={"scale": torch.tensor(8.0)})
+    monkeypatch.chdir(tmp_path)
+    return engine
+
+
+def _repair100_state_snapshot(engine):
+    return {
+        "transactional": _transactional_outcome(engine),
+        "factor_pool_scores": _clone_transaction_value(engine.factor_pool_scores),
+        "elite_pool_ages": _clone_transaction_value(engine.elite_pool_ages),
+        "scheduler": _clone_transaction_value(engine.scheduler.__dict__),
+        "scaler": _clone_transaction_value(engine.scaler.__dict__),
+        "optimizer_object": engine.opt,
+        "scheduler_object": engine.scheduler,
+        "scaler_object": engine.scaler,
+    }
+
+
+def _repair100_rng_snapshot():
+    return (
+        random.getstate(),
+        np.random.get_state(),
+        torch.get_rng_state().clone(),
+        [state.clone() for state in torch.cuda.get_rng_state_all()]
+        if torch.cuda.is_initialized()
+        else [],
+    )
+
+
+def _assert_repair100_rng_equal(actual, expected) -> None:
+    assert actual[0] == expected[0]
+    assert actual[1][0] == expected[1][0]
+    assert np.array_equal(actual[1][1], expected[1][1])
+    assert actual[1][2:] == expected[1][2:]
+    assert torch.equal(actual[2], expected[2])
+    assert len(actual[3]) == len(expected[3])
+    assert all(torch.equal(left, right) for left, right in zip(actual[3], expected[3]))
+
+
+def _mutate_repair100_entry(engine, entry, identity_variant) -> None:
+    _replace_training_identity(engine, entry, identity_variant)
+    engine.best_score = 98765.0
+    with torch.no_grad():
+        next(engine.model.parameters()).add_(11.0)
+    engine.opt.param_groups[0]["lr"] = 9.0
+    next(iter(engine.opt.state.values()))["nested"]["moment"].add_(7.0)
+    engine.factor_pool[0][2].add_(5.0)
+    engine.factor_pool_scores.append(99.0)
+    engine._elite_pool.append((9.0, 99, [9], 99))
+    engine.elite_pool_ages.append(99)
+    engine.training_history["nested"]["reward"].append(99.0)
+    engine.sampler.calls = 99
+    engine.scheduler.state["nested"].append(99)
+    engine.scaler.state["scale"].add_(4.0)
+    random.random()
+    np.random.random()
+    torch.rand(3)
+    if torch.cuda.is_initialized():
+        torch.cuda.get_rng_state_all()
+
+
+@pytest.mark.parametrize(
+    "identity_variant", ["equal-distinct", "different", "deleted", "none", "hostile"]
+)
+def test_true_entry_snapshot_precedes_first_deepcopy_and_restores_everything(
+    monkeypatch, tmp_path, identity_variant
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    _seed_all(10001)
+    before_state = _repair100_state_snapshot(engine)
+    before_rng = _repair100_rng_snapshot()
+    real_deepcopy = copy.deepcopy
+    real_state_dict = engine.model.state_dict
+    deepcopy_calls = 0
+    later_callbacks = []
+
+    def mutating_deepcopy(value, *args, **kwargs):
+        nonlocal deepcopy_calls
+        deepcopy_calls += 1
+        if deepcopy_calls == 1:
+            _mutate_repair100_entry(engine, entry, identity_variant)
+        return real_deepcopy(value, *args, **kwargs)
+
+    def forbidden_state_dict(*_args, **_kwargs):
+        later_callbacks.append("model.state_dict")
+        raise AssertionError("later snapshot callback reached")
+
+    monkeypatch.setattr(copy, "deepcopy", mutating_deepcopy)
+    monkeypatch.setattr(engine.model, "state_dict", forbidden_state_dict)
+    transaction = engine._begin_batch_transaction(1, entry)
+    transaction.rollback()
+
+    monkeypatch.setattr(copy, "deepcopy", real_deepcopy)
+    monkeypatch.setattr(engine.model, "state_dict", real_state_dict)
+    assert deepcopy_calls == 0
+    assert later_callbacks == []
+    assert engine.run_identity is entry
+    _assert_transaction_value_equal(_repair100_state_snapshot(engine), before_state)
+    _assert_repair100_rng_equal(_repair100_rng_snapshot(), before_rng)
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit, GeneratorExit, _TrainingAbort]
+)
+def test_first_deepcopy_baseexception_restores_true_entry_and_primary_graph(
+    monkeypatch, tmp_path, error_type
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    _seed_all(10002)
+    before_state = _repair100_state_snapshot(engine)
+    before_rng = _repair100_rng_snapshot()
+    real_deepcopy = copy.deepcopy
+    failure = error_type("first deepcopy failure")
+    cause = ValueError("deepcopy cause")
+    context = LookupError("deepcopy context")
+    failure.__cause__ = cause
+    failure.__context__ = context
+
+    def failing_deepcopy(value, *args, **kwargs):
+        _mutate_repair100_entry(engine, entry, "equal-distinct")
+        raise failure
+
+    monkeypatch.setattr(copy, "deepcopy", failing_deepcopy)
+    transaction = engine._begin_batch_transaction(1, entry)
+    transaction.rollback()
+
+    monkeypatch.setattr(copy, "deepcopy", real_deepcopy)
+    assert failure.__traceback__ is None
+    assert engine.run_identity is entry
+    _assert_transaction_value_equal(_repair100_state_snapshot(engine), before_state)
+    _assert_repair100_rng_equal(_repair100_rng_snapshot(), before_rng)
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize("trigger_call", [2, 5, 11])
+def test_deeper_deepcopy_mutation_reuses_true_entry_not_intermediate_snapshot(
+    monkeypatch, tmp_path, trigger_call
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    _seed_all(10003)
+    before_state = _repair100_state_snapshot(engine)
+    before_rng = _repair100_rng_snapshot()
+    real_deepcopy = copy.deepcopy
+    deepcopy_calls = 0
+
+    def mutating_deepcopy(value, *args, **kwargs):
+        nonlocal deepcopy_calls
+        deepcopy_calls += 1
+        if deepcopy_calls == trigger_call:
+            _mutate_repair100_entry(engine, entry, "different")
+        return real_deepcopy(value, *args, **kwargs)
+
+    monkeypatch.setattr(copy, "deepcopy", mutating_deepcopy)
+    transaction = engine._begin_batch_transaction(1, entry)
+    transaction.rollback()
+
+    monkeypatch.setattr(copy, "deepcopy", real_deepcopy)
+    assert deepcopy_calls == 0
+    assert engine.run_identity is entry
+    _assert_transaction_value_equal(_repair100_state_snapshot(engine), before_state)
+    _assert_repair100_rng_equal(_repair100_rng_snapshot(), before_rng)
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_normal_true_entry_snapshot_and_direct_rollback_preserve_identity(
+    monkeypatch, tmp_path
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    before_state = _repair100_state_snapshot(engine)
+    before_rng = _repair100_rng_snapshot()
+    transaction = engine._begin_batch_transaction(1, entry)
+    assert transaction._entry_run_identity is entry
+    transaction.rollback()
+    assert engine.run_identity is entry
+    _assert_transaction_value_equal(_repair100_state_snapshot(engine), before_state)
+    _assert_repair100_rng_equal(_repair100_rng_snapshot(), before_rng)
+
+
+class _Repair105UnsafeTensor(torch.Tensor):
+    callback = None
+    failure = None
+
+    @classmethod
+    def create(cls, value):
+        return torch.Tensor._make_subclass(cls, value, value.requires_grad)
+
+    @classmethod
+    def trip(cls):
+        if cls.callback is not None:
+            cls.callback()
+        if cls.failure is not None:
+            raise cls.failure
+
+    def detach(self):
+        type(self).trip()
+        return super().detach()
+
+    def clone(self, *args, **kwargs):
+        type(self).trip()
+        return super().clone(*args, **kwargs)
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        cls.trip()
+        return super().__torch_function__(func, types, args, kwargs or {})
+
+
+class _Repair105UnsafeParameter(torch.nn.Parameter):
+    callback = None
+    failure = None
+
+    @classmethod
+    def trip(cls):
+        if cls.callback is not None:
+            cls.callback()
+        if cls.failure is not None:
+            raise cls.failure
+
+    def detach(self):
+        type(self).trip()
+        return super().detach()
+
+    def clone(self, *args, **kwargs):
+        type(self).trip()
+        return super().clone(*args, **kwargs)
+
+
+class _Repair105HostileDict(dict):
+    callback = None
+
+    def _trip(self):
+        if type(self).callback is not None:
+            type(self).callback()
+        raise AssertionError("hostile mapping protocol invoked")
+
+    items = _trip
+    values = _trip
+    keys = _trip
+    __iter__ = _trip
+    __len__ = _trip
+    __getitem__ = _trip
+
+
+class _Repair105HostileList(list):
+    callback = None
+
+    def _trip(self, *_args):
+        if type(self).callback is not None:
+            type(self).callback()
+        raise AssertionError("hostile list protocol invoked")
+
+    __iter__ = _trip
+    __len__ = _trip
+    __getitem__ = _trip
+
+
+class _Repair105HostileTuple(tuple):
+    callback = None
+
+    def _trip(self, *_args):
+        if type(self).callback is not None:
+            type(self).callback()
+        raise AssertionError("hostile tuple protocol invoked")
+
+    __iter__ = _trip
+    __len__ = _trip
+    __getitem__ = _trip
+
+
+def _repair105_first_parameter_slot(engine):
+    for module in engine.model.modules():
+        attributes = object.__getattribute__(module, "__dict__")
+        parameters = attributes.get("_parameters", {})
+        for name, parameter in dict.items(parameters):
+            if parameter is not None:
+                return module, name, parameter
+    raise AssertionError("test model has no parameter")
+
+
+def _install_repair105_unsafe_tensor(engine, location):
+    module, name, parameter = _repair105_first_parameter_slot(engine)
+    base = torch.ones_like(parameter.detach())
+    unsafe_tensor = _Repair105UnsafeTensor.create(base)
+    if location == "parameter":
+        unsafe_parameter = _Repair105UnsafeParameter(
+            parameter.detach().clone(), requires_grad=parameter.requires_grad
+        )
+        object.__getattribute__(module, "__dict__")["_parameters"][name] = unsafe_parameter
+        return unsafe_parameter
+    if location == "buffer":
+        object.__getattribute__(engine.model, "__dict__")["_buffers"]["repair105"] = unsafe_tensor
+    elif location == "gradient":
+        parameter.grad = unsafe_tensor
+    elif location == "optimizer":
+        engine.opt.state[parameter]["repair105"] = {"nested": unsafe_tensor}
+    elif location == "best":
+        engine.best_metrics = {"repair105": unsafe_tensor}
+    elif location == "pool":
+        engine.factor_pool.append((0.9, 9, unsafe_tensor))
+    elif location == "history":
+        engine.training_history["repair105"] = [unsafe_tensor]
+    elif location == "sampler":
+        engine.sampler.repair105 = unsafe_tensor
+    elif location == "scheduler":
+        engine.scheduler.state["repair105"] = unsafe_tensor
+    elif location == "scaler":
+        engine.scaler.state["repair105"] = unsafe_tensor
+    else:
+        raise AssertionError(location)
+    return unsafe_tensor
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "parameter", "buffer", "gradient", "optimizer", "best",
+        "pool", "history", "sampler", "scheduler", "scaler",
+    ],
+)
+def test_unsafe_tensor_subclass_is_rejected_before_any_callback(
+    monkeypatch, tmp_path, location
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    installed = _install_repair105_unsafe_tensor(engine, location)
+    _seed_all(10501)
+    before_rng = _repair100_rng_snapshot()
+    before_score = engine.best_score
+    before_optimizer = engine.opt
+    callbacks = []
+    later_callbacks = []
+
+    def malicious_callback():
+        callbacks.append(location)
+        engine.run_identity = TrainingRunIdentity.from_dict(entry.to_dict())
+        engine.best_score = 105.0
+        random.random()
+        np.random.random()
+        torch.rand(1)
+
+    def forbidden_deepcopy(*_args, **_kwargs):
+        later_callbacks.append("deepcopy")
+        raise AssertionError("later snapshot callback reached")
+
+    _Repair105UnsafeTensor.callback = malicious_callback
+    _Repair105UnsafeTensor.failure = RuntimeError("unsafe tensor callback")
+    _Repair105UnsafeParameter.callback = malicious_callback
+    _Repair105UnsafeParameter.failure = RuntimeError("unsafe parameter callback")
+    monkeypatch.setattr(copy, "deepcopy", forbidden_deepcopy)
+    try:
+        with pytest.raises(ArtifactCompatibilityError, match="unsafe|unsupported"):
+            engine._begin_batch_transaction(1, entry)
+    finally:
+        _Repair105UnsafeTensor.callback = None
+        _Repair105UnsafeTensor.failure = None
+        _Repair105UnsafeParameter.callback = None
+        _Repair105UnsafeParameter.failure = None
+
+    assert callbacks == []
+    assert later_callbacks == []
+    assert engine.run_identity is entry
+    assert engine.best_score == before_score
+    assert engine.opt is before_optimizer
+    assert installed is installed
+    _assert_repair100_rng_equal(_repair100_rng_snapshot(), before_rng)
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit, GeneratorExit, _TrainingAbort]
+)
+def test_unsafe_parameter_primary_never_runs_before_true_snapshot(
+    monkeypatch, tmp_path, error_type
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    _install_repair105_unsafe_tensor(engine, "parameter")
+    failure = error_type("pre-guard tensor callback")
+    callbacks = []
+    _Repair105UnsafeParameter.callback = lambda: callbacks.append(failure)
+    _Repair105UnsafeParameter.failure = failure
+    try:
+        with pytest.raises(BaseException) as caught:
+            engine._begin_batch_transaction(1, entry)
+    finally:
+        _Repair105UnsafeParameter.callback = None
+        _Repair105UnsafeParameter.failure = None
+    assert isinstance(caught.value, ArtifactCompatibilityError)
+    assert callbacks == []
+    assert engine.run_identity is entry
+
+
+@pytest.mark.parametrize(
+    "container_type", [_Repair105HostileDict, _Repair105HostileList, _Repair105HostileTuple]
+)
+def test_snapshot_preflight_rejects_container_subclasses_without_protocols(
+    monkeypatch, tmp_path, container_type
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    callbacks = []
+    container_type.callback = lambda: callbacks.append(container_type.__name__)
+    if issubclass(container_type, dict):
+        engine.training_history = container_type({"unsafe": 1})
+    else:
+        engine.factor_pool = container_type([(0.1, 1, torch.tensor([1.0]))])
+    try:
+        with pytest.raises(ArtifactCompatibilityError, match="unsafe|unsupported"):
+            engine._begin_batch_transaction(1, entry)
+    finally:
+        container_type.callback = None
+    assert callbacks == []
+    assert engine.run_identity is entry
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_exact_base_snapshot_preserves_internal_tensor_aliases(monkeypatch, tmp_path):
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    shared = torch.arange(6.0).reshape(2, 3).t()
+    assert not shared.is_contiguous()
+    parameter = engine.opt.param_groups[0]["params"][0]
+    engine.training_history = {"left": shared, "right": shared}
+    transaction = engine._begin_batch_transaction(1, entry)
+    engine.training_history = {}
+    transaction.rollback()
+    assert engine.run_identity is entry
+    assert engine.training_history["left"] is engine.training_history["right"]
+    assert type(engine.training_history["left"]) is torch.Tensor
+    assert engine.training_history["left"].stride() == shared.stride()
+    assert engine.opt.param_groups[0]["params"][0] is parameter
+    assert parameter in engine.opt.state
+
+
+class _Repair109DispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
+    def __init__(self, callback, failure):
+        super().__init__()
+        self.callback = callback
+        self.failure = failure
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.callback()
+        raise self.failure
+
+
+class _Repair109FunctionMode(torch.overrides.TorchFunctionMode):
+    def __init__(self, callback, failure):
+        super().__init__()
+        self.callback = callback
+        self.failure = failure
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        self.callback()
+        raise self.failure
+
+
+@pytest.mark.parametrize(
+    "mode_type", [_Repair109DispatchMode, _Repair109FunctionMode]
+)
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit, GeneratorExit, _TrainingAbort]
+)
+def test_active_global_torch_mode_rejects_before_dispatch_and_snapshot(
+    monkeypatch, tmp_path, mode_type, error_type
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    _seed_all(10901)
+    before_rng = _repair100_rng_snapshot()
+    before_score = engine.best_score
+    before_lr = engine.opt.param_groups[0]["lr"]
+    failure = error_type("global torch mode callback")
+    callbacks = []
+
+    def hostile_callback():
+        callbacks.append(type(failure).__name__)
+        engine.run_identity = TrainingRunIdentity.from_dict(entry.to_dict())
+        engine.best_score = 109.0
+        engine.opt.param_groups[0]["lr"] = 109.0
+        random.random()
+        np.random.random()
+
+    mode = mode_type(hostile_callback, failure)
+    with mode:
+        with pytest.raises(BaseException) as caught:
+            engine._begin_batch_transaction(1, entry)
+
+    assert isinstance(caught.value, ArtifactCompatibilityError)
+    assert callbacks == []
+    assert engine.run_identity is entry
+    assert engine.best_score == before_score
+    assert engine.opt.param_groups[0]["lr"] == before_lr
+    _assert_repair100_rng_equal(_repair100_rng_snapshot(), before_rng)
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize(
+    "mode_type", [_Repair109DispatchMode, _Repair109FunctionMode]
+)
+def test_nested_global_torch_modes_reject_without_checking_only_top(
+    monkeypatch, tmp_path, mode_type
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    callbacks = []
+    lower = mode_type(lambda: callbacks.append("lower"), RuntimeError("lower"))
+    upper = mode_type(lambda: callbacks.append("upper"), RuntimeError("upper"))
+    with lower, upper:
+        with pytest.raises(ArtifactCompatibilityError, match="active.*mode"):
+            engine._begin_batch_transaction(1, entry)
+    assert callbacks == []
+    assert engine.run_identity is entry
+
+
+def test_snapshot_preflight_has_no_isinstance_or_mode_stack_mutation() -> None:
+    source = inspect.getsource(engine_module._preflight_true_transaction_value)
+    snapshot_source = inspect.getsource(engine_module._preflight_true_transaction_snapshot)
+    assert "isinstance(" not in source
+    assert "_pop" not in source + snapshot_source
+    assert "_disable" not in source + snapshot_source
+    assert "_len_torch_dispatch_stack" in snapshot_source
+    assert "_len_torch_function_stack" in snapshot_source
+
+
+def test_no_global_torch_mode_keeps_exact_base_snapshot_supported(
+    monkeypatch, tmp_path
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    transaction = engine._begin_batch_transaction(1, entry)
+    transaction.rollback()
+    assert engine.run_identity is entry
+
+
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit, GeneratorExit, _TrainingAbort]
+)
+def test_migration_failure_rolls_back_entire_training_batch(
+    monkeypatch, tmp_path, error_type
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    engine, factor, _calls, before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    monkeypatch.setattr(ModelConfig, "MIGRATION_INTERVAL", 1)
+    failure = error_type("migration callback failure")
+    _seed_all(11401)
+    before_rng = _repair100_rng_snapshot()
+
+    def migration_callback(current, _step):
+        current.best_score = 114.0
+        random.random()
+        np.random.random()
+        torch.rand(1)
+        raise failure
+
+    with pytest.raises(BaseException) as caught:
+        engine.train(
+            start_step=0, end_step=1,
+            migration_hook=migration_callback, verbose_header=False,
+        )
+
+    assert caught.value is failure
+    for name, expected in before["model"].items():
+        assert torch.equal(engine.model.state_dict()[name], expected)
+    _assert_transaction_value_equal(engine.opt.state_dict(), before["optimizer"])
+    assert engine.training_history == before["history"]
+    assert engine.factor_pool == before["factor_pool"]
+    assert engine._elite_pool == before["elite_pool"]
+    assert (engine.best_score, engine.best_formula, engine._best_snapshot) == before["best"]
+    _assert_repair100_rng_equal(_repair100_rng_snapshot(), before_rng)
+
+
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit, GeneratorExit, _TrainingAbort]
+)
+def test_transaction_rollback_preserves_cross_component_tensor_object(
+    monkeypatch, tmp_path, error_type
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    entry = engine.run_identity
+    parameter = engine.opt.param_groups[0]["params"][0]
+    shared = torch.tensor([1.0, 2.0])
+    engine.opt.state[parameter]["cross_shared"] = {"value": shared}
+    engine.training_history["cross_shared"] = {"value": shared}
+    before_value = shared.clone()
+    failure = error_type("cross-component rollback")
+    transaction = engine._begin_batch_transaction(1, entry)
+
+    def mutate_then_fail():
+        shared.add_(9.0)
+        raise failure
+
+    with pytest.raises(BaseException) as caught:
+        transaction.run(mutate_then_fail)
+
+    assert caught.value is failure
+    optimizer_shared = engine.opt.state[parameter]["cross_shared"]["value"]
+    history_shared = engine.training_history["cross_shared"]["value"]
+    assert optimizer_shared is shared
+    assert history_shared is shared
+    assert optimizer_shared is history_shared
+    assert torch.equal(shared, before_value)
+    assert engine.opt.param_groups[0]["params"][0] is parameter
+
+
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit, GeneratorExit, _TrainingAbort]
+)
+def test_rank_monitor_history_is_in_exact_transaction_graph(
+    monkeypatch, tmp_path, error_type
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    shared = torch.tensor([7.25])
+    history = [shared]
+    engine.rank_monitor = SimpleNamespace(history=history)
+    engine.training_history["rank_alias"] = shared
+    failure = error_type("late rank failure")
+    transaction = engine._begin_batch_transaction(1, engine.run_identity)
+
+    def mutate_then_fail():
+        shared.add_(3.0)
+        engine.rank_monitor.history.append(torch.tensor([8.5]))
+        raise failure
+
+    with pytest.raises(BaseException) as caught:
+        transaction.run(mutate_then_fail)
+
+    assert caught.value is failure
+    assert len(engine.rank_monitor.history) == 1
+    assert engine.rank_monitor.history[0] is shared
+    assert engine.training_history["rank_alias"] is shared
+    assert torch.equal(shared, torch.tensor([7.25]))
+
+
+@pytest.mark.parametrize("history_size", [1, 10_000])
+def test_batch_snapshot_has_no_redundant_deepcopy_or_state_dict_pass(
+    monkeypatch, tmp_path, history_size
+) -> None:
+    engine = _repair100_engine(monkeypatch, tmp_path)
+    engine.training_history["scaling"] = list(range(history_size))
+    counts = {"deepcopy": 0, "model_state": 0, "optimizer_state": 0}
+    real_deepcopy = engine_module.copy.deepcopy
+    real_model_state = engine.model.state_dict
+    real_optimizer_state = engine.opt.state_dict
+
+    def counted_deepcopy(*args, **kwargs):
+        counts["deepcopy"] += 1
+        return real_deepcopy(*args, **kwargs)
+
+    def counted_model_state(*args, **kwargs):
+        counts["model_state"] += 1
+        return real_model_state(*args, **kwargs)
+
+    def counted_optimizer_state(*args, **kwargs):
+        counts["optimizer_state"] += 1
+        return real_optimizer_state(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module.copy, "deepcopy", counted_deepcopy)
+    monkeypatch.setattr(engine.model, "state_dict", counted_model_state)
+    monkeypatch.setattr(engine.opt, "state_dict", counted_optimizer_state)
+    transaction = engine._begin_batch_transaction(1, engine.run_identity)
+
+    assert counts == {"deepcopy": 0, "model_state": 0, "optimizer_state": 0}
+    for dead_field in (
+        "model_state", "optimizer_state", "state", "gradients",
+        "python_rng_state", "numpy_rng_state", "torch_cpu_rng_state",
+        "torch_cuda_rng_state", "sampler_state", "optimizer",
+    ):
+        assert not hasattr(transaction, dead_field)
+    transaction.rollback()
+
+
+class _HostileIdentityReplacement:
+    def __repr__(self):
+        raise AssertionError("hostile identity repr must not run")
+
+    def __str__(self):
+        raise AssertionError("hostile identity str must not run")
+
+
+class _HostileRollbackCleanup(BaseException):
+    def __repr__(self):
+        raise AssertionError("hostile rollback repr must not run")
+
+    def __str__(self):
+        raise AssertionError("hostile rollback str must not run")
+
+
+def _replace_training_identity(engine, entry, variant: str) -> None:
+    if variant == "deleted":
+        object.__delattr__(engine, "run_identity")
+    elif variant == "none":
+        object.__setattr__(engine, "run_identity", None)
+    elif variant == "different":
+        replacement = TrainingRunIdentity.from_dict(entry.to_dict())
+        object.__setattr__(replacement, "run_id", "8" * 32)
+        object.__setattr__(engine, "run_identity", replacement)
+    elif variant == "equal-distinct":
+        replacement = TrainingRunIdentity.from_dict(entry.to_dict())
+        assert replacement == entry and replacement is not entry
+        object.__setattr__(engine, "run_identity", replacement)
+    elif variant == "hostile":
+        object.__setattr__(engine, "run_identity", _HostileIdentityReplacement())
+    else:
+        raise AssertionError(f"unknown variant: {variant}")
+
+
+@pytest.mark.parametrize(
+    "variant", ["deleted", "none", "different", "equal-distinct", "hostile"]
+)
+def test_batch_setup_filename_callback_restores_exact_entry_before_next_boundary(
+    monkeypatch, tmp_path, variant
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    engine = _direct_checkpoint_engine()
+    entry = engine.run_identity
+    next_boundary_calls = []
+    real_strategy_filename = TrainingRunIdentity.strategy_filename
+
+    def mutating_strategy_filename(identity):
+        result = real_strategy_filename(identity)
+        _replace_training_identity(engine, entry, variant)
+        return result
+
+    def forbidden_history_filename(_identity):
+        next_boundary_calls.append("history")
+        raise AssertionError("next filename callback reached")
+
+    monkeypatch.setattr(
+        TrainingRunIdentity, "strategy_filename", mutating_strategy_filename
+    )
+    monkeypatch.setattr(
+        TrainingRunIdentity, "history_filename", forbidden_history_filename
+    )
+
+    with pytest.raises(ArtifactCompatibilityError):
+        engine._begin_batch_transaction(1, entry)
+
+    assert engine.run_identity is entry
+    assert next_boundary_calls == []
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit, GeneratorExit, _TrainingAbort]
+)
+def test_batch_setup_state_snapshot_failure_restores_entry_state_and_rng(
+    monkeypatch, tmp_path, error_type
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    engine = _direct_checkpoint_engine()
+    entry = engine.run_identity
+    before_state = _transactional_outcome(engine)
+    _seed_all(9501)
+    before_rng = (
+        random.getstate(),
+        np.random.get_state(),
+        torch.get_rng_state().clone(),
+    )
+    real_state_dict = engine.model.state_dict
+    failure = error_type("batch setup snapshot failure")
+    cause = ValueError("setup cause")
+    context = LookupError("setup context")
+    failure.__cause__ = cause
+    failure.__context__ = context
+
+    def mutate_then_fail(*args, **kwargs):
+        real_state_dict(*args, **kwargs)
+        replacement = TrainingRunIdentity.from_dict(entry.to_dict())
+        object.__setattr__(engine, "run_identity", replacement)
+        engine.best_score = 12345.0
+        random.random()
+        raise failure
+
+    monkeypatch.setattr(engine.model, "state_dict", mutate_then_fail)
+
+    transaction = engine._begin_batch_transaction(1, entry)
+    transaction.rollback()
+
+    monkeypatch.setattr(engine.model, "state_dict", real_state_dict)
+    assert failure.__traceback__ is None
+    assert engine.run_identity is entry
+    _assert_transaction_value_equal(_transactional_outcome(engine), before_state)
+    assert random.getstate() == before_rng[0]
+    assert all(
+        np.array_equal(left, right)
+        for left, right in zip(np.random.get_state(), before_rng[1])
+    )
+    assert torch.equal(torch.get_rng_state(), before_rng[2])
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize(
+    "variant", ["deleted", "none", "different", "equal-distinct", "hostile"]
+)
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_final_history_publication_identity_mutation_rolls_back_before_decode(
+    monkeypatch, tmp_path, variant, target_exists
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    history_path = tmp_path / "training_history_EURUSD.json"
+    prior = b'FOREIGN-OR-PRIOR-HISTORY\x00\xff'
+    if target_exists:
+        history_path.write_bytes(prior)
+    prior_identity = (
+        engine_module._artifact_path_observation(history_path)[1]
+        if target_exists
+        else None
+    )
+    engine, factor, _calls, _before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    engine.target_symbol = "EURUSD"
+    engine.sampler = _MutableProtocolSampler()
+    engine.best_score = float("inf")
+    engine.best_formula = [0]
+    monkeypatch.setattr(ModelConfig, "TRAIN_STEPS", 1)
+    entry = engine.run_identity
+    real_atomic = engine_module._atomic_json_replace
+    publication_snapshot = {}
+    decode_after_publication = []
+
+    def mutating_atomic(path, payload, *args, **kwargs):
+        result = real_atomic(path, payload, *args, **kwargs)
+        publication_snapshot["state"] = _transactional_outcome(engine)
+        publication_snapshot["rng"] = (
+            random.getstate(),
+            np.random.get_state(),
+            torch.get_rng_state().clone(),
+        )
+        _replace_training_identity(engine, entry, variant)
+        return result
+
+    def decode_after_atomic(_formula):
+        if publication_snapshot:
+            decode_after_publication.append(True)
+            raise AssertionError("decode reached after invalid history publication")
+        return "tiny"
+
+    monkeypatch.setattr(engine_module, "_atomic_json_replace", mutating_atomic)
+    engine._decode_formula = decode_after_atomic
+
+    with pytest.raises(ArtifactCompatibilityError):
+        engine.train(end_step=1, verbose_header=False)
+
+    assert engine.run_identity is entry
+    assert decode_after_publication == []
+    _assert_transaction_value_equal(
+        _transactional_outcome(engine), publication_snapshot["state"]
+    )
+    after_rng = publication_snapshot["rng"]
+    assert random.getstate() == after_rng[0]
+    assert all(
+        np.array_equal(left, right)
+        for left, right in zip(np.random.get_state(), after_rng[1])
+    )
+    assert torch.equal(torch.get_rng_state(), after_rng[2])
+    assert (history_path.read_bytes() if history_path.exists() else None) == (
+        prior if target_exists else None
+    )
+    if target_exists:
+        assert engine_module._artifact_path_observation(history_path)[1] == prior_identity
+    assert not list(tmp_path.glob(".training_history_EURUSD.json.*.tmp"))
+
+
+def test_final_history_identity_error_survives_hostile_rollback_cleanup(
+    monkeypatch, tmp_path
+) -> None:
+    assert engine_module.os.name == "nt"
+    monkeypatch.chdir(tmp_path)
+    history_path = tmp_path / "training_history_EURUSD.json"
+    prior = b"PRIOR-HISTORY-OBJECT"
+    history_path.write_bytes(prior)
+    prior_identity = engine_module._artifact_path_observation(history_path)[1]
+    engine, factor, _calls, _before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    engine.target_symbol = "EURUSD"
+    engine.sampler = _MutableProtocolSampler()
+    engine.best_score = float("inf")
+    engine.best_formula = [0]
+    monkeypatch.setattr(ModelConfig, "TRAIN_STEPS", 1)
+    entry = engine.run_identity
+    real_atomic = engine_module._atomic_json_replace
+    real_windows_replace = engine_module._windows_replace_file
+    rollback_cleanup = _HostileRollbackCleanup("hostile rollback cleanup")
+    replace_calls = 0
+
+    def mutating_atomic(path, payload, *args, **kwargs):
+        result = real_atomic(path, payload, *args, **kwargs)
+        engine.run_identity = TrainingRunIdentity.from_dict(entry.to_dict())
+        return result
+
+    def fail_after_exact_rollback(*args, **kwargs):
+        nonlocal replace_calls
+        replace_calls += 1
+        result = real_windows_replace(*args, **kwargs)
+        if replace_calls == 2:
+            raise rollback_cleanup
+        return result
+
+    monkeypatch.setattr(engine_module, "_atomic_json_replace", mutating_atomic)
+    monkeypatch.setattr(engine_module, "_windows_replace_file", fail_after_exact_rollback)
+
+    with pytest.raises(ArtifactCompatibilityError) as caught:
+        engine.train(end_step=1, verbose_header=False)
+
+    assert engine.run_identity is entry
+    assert replace_calls == 2
+    assert any(
+        "_HostileRollbackCleanup" in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
+    assert history_path.read_bytes() == prior
+    assert engine_module._artifact_path_observation(history_path)[1] == prior_identity
+    assert not list(tmp_path.glob(".training_history_EURUSD.json.*"))
 
 
 @pytest.mark.parametrize("target_exists", [False, True])
@@ -4041,7 +5121,7 @@ def test_publication_guard_close_failure_restores_prior_or_absence(
 def test_save_checkpoint_direct_result_preserves_plain_string_contract(
     monkeypatch, tmp_path
 ) -> None:
-    engine = _direct_transaction_engine()
+    engine = _direct_checkpoint_engine()
     path = str(tmp_path / "public-checkpoint.pt")
 
     result = engine.save_checkpoint(7, path)
@@ -4336,7 +5416,7 @@ def test_transaction_checkpoint_io_is_chunk_bounded_and_rolls_back_exactly(
     _write_repeated_file(target, size, byte=0x31 + size_mib)
     expected = _stream_file_identity(target)
     probe = _install_bounded_artifact_read_probe(monkeypatch)
-    engine = _direct_transaction_engine()
+    engine = _direct_checkpoint_engine()
     engine._record_owned_artifact(target)
     transaction = engine_module._BatchTransaction(engine, [target, temporary])
 
@@ -4382,7 +5462,7 @@ def test_transaction_owned_backups_cleanup_on_success_and_baseexception(
         )
         original = _stream_file_identity(target)
     probe = _install_bounded_artifact_read_probe(monkeypatch)
-    engine = _direct_transaction_engine()
+    engine = _direct_checkpoint_engine()
     if target_exists:
         engine._record_owned_artifact(target)
     transaction = engine_module._BatchTransaction(engine, [target, temporary])
@@ -4496,11 +5576,11 @@ def test_live_strategy_refuses_preexisting_unowned_legacy_artifact(
     before = (engine.best_score, list(engine.best_formula))
     monkeypatch.setattr(
         engine_module,
-        "_strategy_file_for_symbol",
+        "_test_strategy_file_for_symbol",
         lambda _symbol: str(strategy_path),
     )
 
-    with pytest.raises(RuntimeError, match="artifact publication conflict"):
+    with pytest.raises(ArtifactCompatibilityError, match="run_identity mismatch"):
         engine._save_strategy_live()
 
     assert (engine.best_score, engine.best_formula) == before
@@ -4528,9 +5608,10 @@ def test_final_strategy_refuses_preexisting_unowned_legacy_artifact(
     monkeypatch.setattr(ModelConfig, "TRAIN_STEPS", 1)
     monkeypatch.setattr(
         engine_module,
-        "_strategy_file_for_symbol",
+        "_test_strategy_file_for_symbol",
         lambda _symbol: str(strategy_path),
     )
+    _install_legacy_final_strategy_oracle(engine, enforce_ownership=True)
 
     with pytest.raises(RuntimeError, match="artifact publication conflict"):
         engine.train(end_step=1, verbose_header=False)
@@ -4551,7 +5632,7 @@ def test_save_checkpoint_refuses_preexisting_unowned_legacy_artifact(
     legacy = b"LEGACY-CHECKPOINT-WITHOUT-V2-IDENTITY\x00\xff"
     checkpoint_path.write_bytes(legacy)
     legacy_identity = engine_module._windows_path_identity(checkpoint_path)
-    engine = _direct_transaction_engine()
+    engine = _direct_checkpoint_engine()
     before = (engine.best_score, list(engine.best_formula), engine._restart_count)
 
     with pytest.raises(RuntimeError, match="artifact publication conflict"):
@@ -4575,20 +5656,21 @@ def test_live_strategy_allows_repeated_updates_owned_by_same_engine(
     engine.target_symbol = "EURUSD"
     monkeypatch.setattr(
         engine_module,
-        "_strategy_file_for_symbol",
+        "_test_strategy_file_for_symbol",
         lambda _symbol: str(strategy_path),
     )
 
-    engine._save_strategy_live()
-    first_identity = engine_module._windows_path_identity(strategy_path)
+    with pytest.raises(ArtifactCompatibilityError, match="run_identity mismatch"):
+        engine._save_strategy_live()
+    assert not strategy_path.exists()
     engine.best_formula = [100]
     engine.best_score = 3.5
-    engine._save_strategy_live()
+    with pytest.raises(ArtifactCompatibilityError, match="run_identity mismatch"):
+        engine._save_strategy_live()
 
-    assert engine_module._windows_path_identity(strategy_path) != first_identity
-    payload = json.loads(strategy_path.read_text(encoding="utf-8"))
-    assert payload["formula"] == [100]
-    assert payload["best_score"] == 3.5
+    assert not strategy_path.exists()
+    assert engine.best_formula == [100]
+    assert engine.best_score == 3.5
     assert not list(tmp_path.glob(f".{strategy_path.name}*.tmp"))
 
 
@@ -4604,10 +5686,12 @@ def test_live_strategy_repeated_update_uses_engine_metadata_without_whole_file_r
     engine.train_steps = 37
     monkeypatch.setattr(
         engine_module,
-        "_strategy_file_for_symbol",
+        "_test_strategy_file_for_symbol",
         lambda _symbol: str(strategy_path),
     )
-    engine._save_strategy_live()
+    with pytest.raises(ArtifactCompatibilityError, match="run_identity mismatch"):
+        engine._save_strategy_live()
+    assert not strategy_path.exists()
 
     real_read_text = engine_module.pathlib.Path.read_text
     real_open = open
@@ -4647,17 +5731,17 @@ def test_live_strategy_repeated_update_uses_engine_metadata_without_whole_file_r
     )
     engine.best_formula = [100]
     engine.best_score = 3.5
-    engine._save_strategy_live()
+    with pytest.raises(ArtifactCompatibilityError, match="run_identity mismatch"):
+        engine._save_strategy_live()
 
-    payload = json.loads(real_read_text(strategy_path, encoding="utf-8"))
-    assert payload["formula"] == [100]
-    assert payload["best_score"] == 3.5
-    assert payload["timeframe"] == "M15"
-    assert payload["data_file"] == "owned-training-data.parquet"
-    assert payload["mode"] == "train"
-    assert payload["train_steps"] == 37
-    assert requested_sizes
-    assert max(requested_sizes) <= _EXPECTED_ARTIFACT_IO_CHUNK_SIZE
+    assert not strategy_path.exists()
+    assert engine.best_formula == [100]
+    assert engine.best_score == 3.5
+    assert engine.timeframe == "M15"
+    assert engine.data_file == "owned-training-data.parquet"
+    assert engine.mode == "train"
+    assert engine.train_steps == 37
+    assert requested_sizes == []
     assert not list(tmp_path.glob(f".{strategy_path.name}*.tmp"))
 
 
@@ -4666,7 +5750,7 @@ def test_save_checkpoint_allows_repeated_updates_owned_by_same_engine(
 ) -> None:
     assert engine_module.os.name == "nt"
     checkpoint_path = tmp_path / "owned-checkpoint.pt"
-    engine = _direct_transaction_engine()
+    engine = _direct_checkpoint_engine()
 
     assert engine.save_checkpoint(1, str(checkpoint_path)) == str(checkpoint_path)
     first_identity = engine_module._windows_path_identity(checkpoint_path)
@@ -4736,7 +5820,7 @@ def test_checkpoint_rollback_reconciles_same_engine_ownership_and_absence(
     absent_temp = absent_path.with_name(f".{absent_path.name}.tmp")
     foreign_sibling = tmp_path / "unrelated.foreign.keep"
     foreign_sibling.write_bytes(b"UNRELATED-FOREIGN-SIBLING")
-    engine = _direct_transaction_engine()
+    engine = _direct_checkpoint_engine()
 
     assert engine.save_checkpoint(1, str(checkpoint_path)) == str(checkpoint_path)
     version_one_bytes = checkpoint_path.read_bytes()
@@ -4829,7 +5913,7 @@ def test_checkpoint_rollback_never_claims_post_restore_foreign_identity(
         monkeypatch.setattr(
             engine_module.pathlib.Path, "replace", interleaved_replace
         )
-    engine = _direct_transaction_engine()
+    engine = _direct_checkpoint_engine()
 
     assert engine.save_checkpoint(1, str(checkpoint_path)) == str(checkpoint_path)
     version_one_bytes = checkpoint_path.read_bytes()

@@ -53,6 +53,7 @@ class TestAlphaEngineInit:
         """AlphaEngine 初始化后 _best_snapshot 应为 None。"""
         engine = AlphaEngine(data_manager=None)
         assert engine._best_snapshot is None
+        assert engine._low_entropy_streak == 0
 
     def test_model_is_alphagpt_instance(self):
         """AlphaEngine 持有的 model 应是 AlphaGPT 实例。"""

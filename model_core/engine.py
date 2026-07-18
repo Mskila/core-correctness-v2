@@ -1,4 +1,5 @@
 import copy
+import collections
 import contextvars
 import ctypes
 import hashlib
@@ -27,10 +28,12 @@ from .vm import StackVM
 from .backtest import MT5Backtest, compute_ic_metrics
 from .semantics import (
     LABEL_LOOKAHEAD_BARS,
+    ArtifactCompatibilityError,
     DataValidationError,
     InsufficientWalkForwardDataError,
 )
-from .vocab import FORMULA_VOCAB, VOCAB_VERSION, VocabVersionMismatchError  # task 12.2
+from .artifacts import TrainingRunIdentity, verify_artifact_identity
+from .vocab import FORMULA_VOCAB, VOCAB_VERSION  # task 12.2
 from .walk_forward import (
     WalkForwardFold,
     _safe_diagnostic_value,
@@ -49,6 +52,113 @@ _ACTIVE_ARTIFACT_PUBLICATION = contextvars.ContextVar(
 # The bound is independent of checkpoint/history/strategy size.
 _ARTIFACT_IO_CHUNK_SIZE = 1024 * 1024
 _ABSENT_ARTIFACT_VERSION = (False, 0, None)
+_MISSING_RUN_IDENTITY = object()
+
+
+def _safe_value_category(value: object) -> str:
+    value_type = type(value)
+    if value is _MISSING_RUN_IDENTITY:
+        return "missing"
+    if value is None:
+        return "NoneType"
+    if value_type in (bool, int, float, str, dict, list, tuple):
+        return value_type.__name__
+    if value_type is torch.Tensor:
+        return "Tensor"
+    return "non-TrainingRunIdentity"
+
+
+def _safe_exception_category(exc: Exception) -> str:
+    exc_type = type(exc)
+    for known in (
+        ArtifactCompatibilityError, KeyError, RuntimeError, TypeError, ValueError,
+    ):
+        if exc_type is known:
+            return known.__name__
+    return "ordinary-exception"
+
+
+def _safe_failure_summary(exc: BaseException) -> str:
+    """Bound diagnostics without invoking protocols on hostile subclasses."""
+    category = type(exc).__name__[:80]
+    if type(exc) in (RuntimeError, OSError, ValueError, TypeError):
+        return f"{category}: {str(exc)[:240]}"
+    return category
+
+
+def _checkpoint_compatibility_error(
+    field: str, expected: str, actual: str, *, cause: Exception | None = None,
+) -> ArtifactCompatibilityError:
+    error = ArtifactCompatibilityError(
+        f"{field} mismatch: expected={expected} actual={actual}"
+    )
+    if cause is not None:
+        error.__cause__ = cause
+    return error
+
+
+def _validated_run_identity(owner: object, operation: str) -> TrainingRunIdentity:
+    """Return the exact validated identity object without hostile protocols."""
+    attributes = object.__getattribute__(owner, "__dict__")
+    value = attributes.get("run_identity", _MISSING_RUN_IDENTITY)
+    if type(value) is not TrainingRunIdentity:
+        raise _checkpoint_compatibility_error(
+            "run_identity",
+            f"exact TrainingRunIdentity at {operation} entry",
+            _safe_value_category(value),
+        )
+    def require_same_entry(stage: str) -> None:
+        current = object.__getattribute__(owner, "__dict__").get(
+            "run_identity", _MISSING_RUN_IDENTITY
+        )
+        if current is not value:
+            object.__setattr__(owner, "run_identity", value)
+            raise _checkpoint_compatibility_error(
+                "run_identity",
+                f"exact unchanged TrainingRunIdentity after {stage}",
+                _safe_value_category(current),
+            )
+
+    try:
+        # Round-trip validates every field, but the installed object itself is the
+        # lifetime token.  Returning the clone would let an equal replacement
+        # cross a later callback boundary undetected.
+        payload = TrainingRunIdentity.to_dict(value)
+        require_same_entry(f"{operation} identity serialization callback")
+        TrainingRunIdentity.from_dict(payload)
+        require_same_entry(f"{operation} identity deserialization callback")
+        return value
+    except ArtifactCompatibilityError:
+        object.__setattr__(owner, "run_identity", value)
+        raise
+    except Exception as exc:
+        object.__setattr__(owner, "run_identity", value)
+        raise _checkpoint_compatibility_error(
+            "run_identity",
+            f"valid TrainingRunIdentity at {operation} entry",
+            _safe_exception_category(exc),
+            cause=exc,
+        )
+    except BaseException:
+        object.__setattr__(owner, "run_identity", value)
+        raise
+
+
+def _revalidate_run_identity(
+    owner: object, expected: TrainingRunIdentity, operation: str
+) -> TrainingRunIdentity:
+    try:
+        current = _validated_run_identity(owner, operation)
+    except ArtifactCompatibilityError:
+        object.__setattr__(owner, "run_identity", expected)
+        raise
+    if current is not expected:
+        object.__setattr__(owner, "run_identity", expected)
+        raise _checkpoint_compatibility_error(
+            "run_identity", "exact unchanged TrainingRunIdentity throughout operation",
+            "different-valid-identity",
+        )
+    return current
 
 
 def _artifact_stream_version(fp) -> tuple[bool, int, str | None]:
@@ -133,6 +243,22 @@ def _snapshot_artifact_to_owned_backup(
         raise
 
 
+def _cleanup_owned_transaction_backup(backup: pathlib.Path) -> None:
+    try:
+        backup.unlink(missing_ok=True)
+    except BaseException as path_failure:
+        try:
+            os.unlink(backup)
+        except FileNotFoundError:
+            return
+        except BaseException as fallback_failure:
+            path_failure.add_note(
+                "owned transaction backup fallback cleanup failed: "
+                + _safe_failure_summary(fallback_failure)
+            )
+            raise path_failure
+
+
 def _copy_artifact_path(source: pathlib.Path, destination: pathlib.Path) -> None:
     with open(source, "rb") as source_fp, open(destination, "wb") as destination_fp:
         while True:
@@ -170,17 +296,6 @@ except ImportError:
     _CHECKPOINT_DIR = pathlib.Path("checkpoints")
 
 
-def _strategy_file_for_symbol(symbol: str | None) -> str:
-    """返回该品种对应的策略文件路径。
-
-    单品种训练时使用 strategies/best_{symbol}.json，
-    多品种/未指定品种时回退到默认路径。
-    """
-    if symbol:
-        return str(pathlib.Path("strategies") / f"best_{symbol}.json")
-    return _STRATEGY_FILE
-
-
 def _atomic_json_replace(
     target: pathlib.Path,
     payload: object,
@@ -188,7 +303,7 @@ def _atomic_json_replace(
     indent: int | None = None,
     ensure_ascii: bool = True,
     publisher=None,
-) -> None:
+) -> "_ArtifactPublicationReceipt | None":
     """Publish JSON without exposing a truncated or partially written target."""
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -219,10 +334,24 @@ def _atomic_json_replace(
             raise
         fp.close()
         fp = None
-        if publisher is None:
+        active_publication = _ACTIVE_ARTIFACT_PUBLICATION.get()
+        if active_publication is not None:
+            with temporary.open("rb") as published_fp:
+                published = _artifact_stream_version(published_fp)
+        else:
+            published = None
+        if publisher is None and active_publication is None:
             temporary.replace(target)
         else:
-            publisher(temporary, target)
+            (publisher or _replace_artifact_publication_temp)(temporary, target)
+        if published is not None:
+            return _artifact_publication_result(
+                None,
+                {
+                    target: published,
+                    temporary: _ABSENT_ARTIFACT_VERSION,
+                },
+            )
     except BaseException as failure:
         if fp is not None:
             try:
@@ -628,24 +757,523 @@ class _ArtifactPublicationReceipt:
         self._artifact_publication_claims = dict(claims)
 
 
+_SAFE_PATH_TYPES = (
+    pathlib.PurePath,
+    pathlib.PurePosixPath,
+    pathlib.PureWindowsPath,
+    pathlib.PosixPath,
+    pathlib.WindowsPath,
+)
+
+
+def _safe_exact_items(value):
+    if type(value) is dict or type(value) is collections.defaultdict:
+        return dict.items(value)
+    if type(value) is collections.OrderedDict:
+        return collections.OrderedDict.items(value)
+    raise TypeError("unsafe mapping container")
+
+
+def _preflight_true_transaction_value(value, path: str, seen: set[int]) -> None:
+    value_type = type(value)
+    if value_type is torch.nn.Parameter:
+        return
+    if value_type is torch.Tensor:
+        return
+    if value_type is np.ndarray:
+        return
+    if value is None or value_type in (
+        bool, int, float, complex, str, bytes, torch.dtype, torch.device,
+    ) or value_type in _SAFE_PATH_TYPES:
+        return
+    if value_type not in (
+        dict, collections.OrderedDict, collections.defaultdict,
+        list, tuple, set,
+    ):
+        raise ArtifactCompatibilityError(
+            f"unsupported transaction snapshot type: field={path[:120]} "
+            f"actual={value_type.__name__[:80]}"
+        )
+    identity = id(value)
+    if identity in seen:
+        return
+    seen.add(identity)
+    if value_type in (dict, collections.OrderedDict, collections.defaultdict):
+        if value_type is collections.defaultdict:
+            factory = value.default_factory
+            if factory not in (None, dict):
+                raise ArtifactCompatibilityError(
+                    f"unsafe transaction snapshot factory: field={path[:120]}"
+                )
+        for key, item in _safe_exact_items(value):
+            _preflight_true_transaction_value(key, f"{path}.key", seen)
+            _preflight_true_transaction_value(item, f"{path}.value", seen)
+        return
+    iterator = (
+        list.__iter__(value) if value_type is list
+        else tuple.__iter__(value) if value_type is tuple
+        else set.__iter__(value)
+    )
+    for index, item in enumerate(iterator):
+        _preflight_true_transaction_value(item, f"{path}[{index}]", seen)
+
+
+def _preflight_true_transaction_snapshot(engine: "AlphaEngine") -> None:
+    dispatch_depth = torch._C._len_torch_dispatch_stack()
+    function_depth = torch.overrides._len_torch_function_stack()
+    if (
+        type(dispatch_depth) is not int
+        or type(function_depth) is not int
+        or dispatch_depth != 0
+        or function_depth != 0
+    ):
+        raise ArtifactCompatibilityError(
+            "active global torch mode is unsafe for transaction snapshot: "
+            "expected=empty-dispatch-and-function-stacks actual=active-mode"
+        )
+    attributes = object.__getattribute__(engine, "__dict__")
+    model = dict.__getitem__(attributes, "model")
+    optimizer = dict.__getitem__(attributes, "opt")
+    pending = [model]
+    seen_modules: set[int] = set()
+    while pending:
+        module = list.pop(pending)
+        if id(module) in seen_modules:
+            continue
+        seen_modules.add(id(module))
+        module_attributes = object.__getattribute__(module, "__dict__")
+        for field in ("_parameters", "_buffers", "_modules"):
+            mapping = dict.get(module_attributes, field, {})
+            if type(mapping) is not dict:
+                raise ArtifactCompatibilityError(
+                    f"unsafe module registry type: field={field} "
+                    f"actual={type(mapping).__name__[:80]}"
+                )
+        for parameter in dict.values(dict.__getitem__(module_attributes, "_parameters")):
+            if parameter is None:
+                continue
+            if type(parameter) is not torch.nn.Parameter:
+                raise ArtifactCompatibilityError(
+                    "unsafe transaction snapshot type: field=model.parameter "
+                    f"expected=exact-parameter actual={type(parameter).__name__[:80]}"
+                )
+            gradient = parameter.grad
+            if gradient is not None and type(gradient) is not torch.Tensor:
+                raise ArtifactCompatibilityError(
+                    "unsafe transaction snapshot type: field=model.gradient "
+                    f"expected=exact-tensor actual={type(gradient).__name__[:80]}"
+                )
+        for buffer in dict.values(dict.__getitem__(module_attributes, "_buffers")):
+            if buffer is not None and type(buffer) is not torch.Tensor:
+                raise ArtifactCompatibilityError(
+                    "unsafe transaction snapshot type: field=model.buffer "
+                    f"expected=exact-tensor actual={type(buffer).__name__[:80]}"
+                )
+        for child in dict.values(dict.__getitem__(module_attributes, "_modules")):
+            if child is not None:
+                list.append(pending, child)
+
+    seen: set[int] = set()
+    _preflight_true_transaction_value(optimizer.state, "optimizer.state", seen)
+    _preflight_true_transaction_value(
+        optimizer.param_groups, "optimizer.param_groups", seen
+    )
+    for name in _BatchTransaction._STATE_FIELDS:
+        if name in attributes:
+            _preflight_true_transaction_value(attributes[name], name, seen)
+    history = dict.get(attributes, "training_history")
+    if history is not None:
+        if type(history) is not dict:
+            raise ArtifactCompatibilityError(
+                "unsafe transaction snapshot type: field=training_history "
+                f"expected=exact-dict actual={type(history).__name__[:80]}"
+            )
+        for key, value in dict.items(history):
+            _preflight_true_transaction_value(key, "training_history.key", seen)
+            if type(value) is list:
+                if list.__len__(value):
+                    _preflight_true_transaction_value(
+                        list.__getitem__(value, -1),
+                        "training_history.tail", seen,
+                    )
+            else:
+                _preflight_true_transaction_value(
+                    value, "training_history.value", seen
+                )
+    for name in ("sampler", "scheduler", "scaler"):
+        value = dict.get(attributes, name)
+        if value is None:
+            continue
+        try:
+            value_attributes = object.__getattribute__(value, "__dict__")
+        except AttributeError:
+            continue
+        if type(value_attributes) is not dict:
+            raise ArtifactCompatibilityError(
+                f"unsafe transaction object state: field={name}"
+            )
+        _preflight_true_transaction_value(value_attributes, name, seen)
+    rank_monitor = dict.get(attributes, "rank_monitor")
+    if rank_monitor is not None:
+        rank_attributes = object.__getattribute__(rank_monitor, "__dict__")
+        if type(rank_attributes) is not dict:
+            raise ArtifactCompatibilityError(
+                "unsafe transaction object state: field=rank_monitor"
+            )
+        if "history" in rank_attributes:
+            _preflight_true_transaction_value(
+                dict.__getitem__(rank_attributes, "history"),
+                "rank_monitor.history", seen,
+            )
+
+
+def _capture_true_transaction_graph(value, memo, tensor_values, array_values):
+    """Copy containers while retaining entry tensor/array objects and aliases."""
+    value_type = type(value)
+    if value_type is torch.nn.Parameter:
+        return value
+    if value is None or value_type in (
+        bool, int, float, complex, str, bytes, torch.dtype, torch.device,
+    ) or value_type in _SAFE_PATH_TYPES:
+        return value
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if value_type is torch.Tensor:
+        memo[identity] = value
+        tensor_values.append((value, value.detach().clone()))
+        return value
+    if value_type is np.ndarray:
+        memo[identity] = value
+        array_values.append((value, value.copy()))
+        return value
+    if value_type in (dict, collections.OrderedDict, collections.defaultdict):
+        result = (
+            collections.OrderedDict() if value_type is collections.OrderedDict
+            else collections.defaultdict(value.default_factory)
+            if value_type is collections.defaultdict else {}
+        )
+        memo[identity] = result
+        for key, item in _safe_exact_items(value):
+            result[_capture_true_transaction_graph(
+                key, memo, tensor_values, array_values
+            )] = _capture_true_transaction_graph(
+                item, memo, tensor_values, array_values
+            )
+        return result
+    if value_type is list:
+        result = []
+        memo[identity] = result
+        for item in list.__iter__(value):
+            list.append(result, _capture_true_transaction_graph(
+                item, memo, tensor_values, array_values
+            ))
+        return result
+    if value_type is tuple:
+        result = tuple(
+            _capture_true_transaction_graph(item, memo, tensor_values, array_values)
+            for item in tuple.__iter__(value)
+        )
+        memo[identity] = result
+        return result
+    if value_type is set:
+        result = set()
+        memo[identity] = result
+        for item in set.__iter__(value):
+            set.add(result, _capture_true_transaction_graph(
+                item, memo, tensor_values, array_values
+            ))
+        return result
+    raise TypeError(
+        "unsupported true-entry transaction value: "
+        f"{value_type.__name__[:80]}"
+    )
+
+
+def _capture_exact_object_graph(
+    value, seen, containers, tensor_values, array_values
+) -> None:
+    """Snapshot values while retaining every exact entry graph object."""
+    value_type = type(value)
+    if value_type is torch.nn.Parameter or value is None or value_type in (
+        bool, int, float, complex, str, bytes, torch.dtype, torch.device,
+    ) or value_type in _SAFE_PATH_TYPES:
+        return
+    identity = id(value)
+    if identity in seen:
+        return
+    seen.add(identity)
+    if value_type is torch.Tensor:
+        tensor_values.append((value, value.detach().clone()))
+        return
+    if value_type is np.ndarray:
+        array_values.append((value, value.copy()))
+        return
+    if value_type in (dict, collections.OrderedDict, collections.defaultdict):
+        items = list(_safe_exact_items(value))
+        containers.append((value, "mapping", items))
+        for key, item in items:
+            _capture_exact_object_graph(
+                key, seen, containers, tensor_values, array_values
+            )
+            _capture_exact_object_graph(
+                item, seen, containers, tensor_values, array_values
+            )
+        return
+    if value_type is list:
+        items = list(list.__iter__(value))
+        containers.append((value, "list", items))
+        for item in items:
+            _capture_exact_object_graph(
+                item, seen, containers, tensor_values, array_values
+            )
+        return
+    if value_type is tuple:
+        for item in tuple.__iter__(value):
+            _capture_exact_object_graph(
+                item, seen, containers, tensor_values, array_values
+            )
+        return
+    if value_type is set:
+        items = list(set.__iter__(value))
+        containers.append((value, "set", items))
+        for item in items:
+            _capture_exact_object_graph(
+                item, seen, containers, tensor_values, array_values
+            )
+        return
+    raise ArtifactCompatibilityError(
+        "unsupported exact checkpoint snapshot type: "
+        f"actual={value_type.__name__[:80]}"
+    )
+
+
+def _restore_exact_object_graph(containers) -> None:
+    for target, kind, _items in containers:
+        if kind == "mapping":
+            if type(target) is collections.OrderedDict:
+                collections.OrderedDict.clear(target)
+            else:
+                dict.clear(target)
+        elif kind == "list":
+            list.clear(target)
+        else:
+            set.clear(target)
+    for target, kind, items in containers:
+        if kind == "mapping":
+            for key, value in items:
+                if type(target) is collections.OrderedDict:
+                    collections.OrderedDict.__setitem__(target, key, value)
+                else:
+                    dict.__setitem__(target, key, value)
+        elif kind == "list":
+            list.extend(target, items)
+        else:
+            for value in items:
+                set.add(target, value)
+
+
+def _move_checkpoint_tensor_graph(value, device: torch.device, memo: dict):
+    """Move exact persisted tensor containers without invoking other protocols."""
+    value_type = type(value)
+    if value_type is torch.Tensor:
+        key = (id(value), device.type, device.index)
+        if key not in memo:
+            memo[key] = value.to(device)
+        return memo[key]
+    identity = id(value)
+    if value_type is list:
+        if identity in memo:
+            return memo[identity]
+        result = []
+        memo[identity] = result
+        for item in list.__iter__(value):
+            list.append(result, _move_checkpoint_tensor_graph(item, device, memo))
+        return result
+    if value_type is tuple:
+        if identity in memo:
+            return memo[identity]
+        result = tuple(
+            _move_checkpoint_tensor_graph(item, device, memo)
+            for item in tuple.__iter__(value)
+        )
+        memo[identity] = result
+        return result
+    if value_type is dict:
+        if identity in memo:
+            return memo[identity]
+        result = {}
+        memo[identity] = result
+        for key, item in dict.items(value):
+            dict.__setitem__(
+                result, key,
+                _move_checkpoint_tensor_graph(item, device, memo),
+            )
+        return result
+    return value
+
+
+class _CommittedHistorySnapshot:
+    """Persistent exact history graph advanced only by newly committed data."""
+
+    def __init__(self, root: dict) -> None:
+        self.root = root
+        self.seen: set[int] = set()
+        self.containers = []
+        self.tensor_values = []
+        self.array_values = []
+        _capture_exact_object_graph(
+            root, self.seen, self.containers,
+            self.tensor_values, self.array_values,
+        )
+        self._container_items = {
+            id(target): items for target, _kind, items in self.containers
+        }
+
+    def matches(self, root) -> bool:
+        if root is not self.root or type(root) is not dict:
+            return False
+        committed = self._container_items.get(id(root))
+        if committed is None:
+            return False
+        current = list(dict.items(root))
+        if len(current) != len(committed):
+            return False
+        for (current_key, current_value), (key, value) in zip(
+            current, committed
+        ):
+            if current_key != key or current_value is not value:
+                return False
+            if type(value) is list:
+                items = self._container_items.get(id(value))
+                if items is None or list.__len__(value) != len(items):
+                    return False
+        return True
+
+    def restore(self, engine: "AlphaEngine") -> None:
+        _restore_exact_object_graph(self.containers)
+        with torch.no_grad():
+            for target, value in self.tensor_values:
+                target.copy_(value)
+        for target, value in self.array_values:
+            np.copyto(target, value)
+        engine.training_history = self.root
+
+    def advance(self, root) -> None:
+        if root is not self.root or type(root) is not dict:
+            raise ArtifactCompatibilityError(
+                "training history root changed during batch commit"
+            )
+        committed_root = self._container_items[id(root)]
+        previous = dict(committed_root)
+        current = list(dict.items(root))
+        appended = []
+        new_values = []
+        scheduled_lists: set[int] = set()
+        for key, value in current:
+            old_value = previous.get(key, _MISSING_RUN_IDENTITY)
+            if old_value is value and type(value) is list:
+                if id(value) in scheduled_lists:
+                    continue
+                scheduled_lists.add(id(value))
+                committed_items = self._container_items[id(value)]
+                old_length = len(committed_items)
+                new_length = list.__len__(value)
+                if new_length < old_length:
+                    raise ArtifactCompatibilityError(
+                        "training history shortened during batch commit"
+                    )
+                for index in range(old_length, new_length):
+                    appended.append((
+                        committed_items, list.__getitem__(value, index)
+                    ))
+                continue
+            if old_value is not value:
+                new_values.extend((key, value))
+
+        staged_seen = set(self.seen)
+        staged_containers = []
+        staged_tensor_values = []
+        staged_array_values = []
+        for value in new_values + [item for _items, item in appended]:
+            _capture_exact_object_graph(
+                value, staged_seen, staged_containers,
+                staged_tensor_values, staged_array_values,
+            )
+        for committed_items, item in appended:
+            list.append(committed_items, item)
+        self.seen = staged_seen
+        self.containers.extend(staged_containers)
+        self.tensor_values.extend(staged_tensor_values)
+        self.array_values.extend(staged_array_values)
+        for target, _kind, items in staged_containers:
+            self._container_items[id(target)] = items
+        committed_root[:] = current
+
+
+def _committed_history_snapshot(engine: "AlphaEngine", history: dict):
+    attributes = object.__getattribute__(engine, "__dict__")
+    snapshot = dict.get(attributes, "_committed_training_history")
+    if (
+        type(snapshot) is not _CommittedHistorySnapshot
+        or not snapshot.matches(history)
+    ):
+        snapshot = _CommittedHistorySnapshot(history)
+        dict.__setitem__(attributes, "_committed_training_history", snapshot)
+    return snapshot
+
+
+def _raw_module_state_targets(module: torch.nn.Module):
+    """Read registered state directly, without replaceable module iterators."""
+    parameters = []
+    buffers = []
+    seen_modules: set[int] = set()
+    seen_parameters: set[int] = set()
+    seen_buffers: set[int] = set()
+    pending = [module]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen_modules:
+            continue
+        seen_modules.add(id(current))
+        attributes = object.__getattribute__(current, "__dict__")
+        for parameter in dict.values(attributes.get("_parameters", {})):
+            if parameter is not None and id(parameter) not in seen_parameters:
+                seen_parameters.add(id(parameter))
+                parameters.append(parameter)
+        for buffer in dict.values(attributes.get("_buffers", {})):
+            if buffer is not None and id(buffer) not in seen_buffers:
+                seen_buffers.add(id(buffer))
+                buffers.append(buffer)
+        pending.extend(
+            child
+            for child in dict.values(attributes.get("_modules", {}))
+            if child is not None
+        )
+    return parameters, buffers
+
+
 class _BatchTransaction:
     """Rollback one training batch across memory and its public artifacts."""
 
     _STATE_FIELDS = (
         "best_score",
         "best_formula",
+        "best_metrics",
         "_best_snapshot",
         "_best_update_step",
         "_stagnation_steps",
         "factor_pool",
+        "factor_pool_scores",
         "_factor_pool_counter",
         "_elite_pool",
+        "elite_pool_ages",
         "_elite_counter",
         "_reward_ema",
         "_reward_ema_step",
-        "training_history",
         "_restart_count",
         "_low_entropy_streak",
+        "_previous_initial_distribution",
     )
 
     @staticmethod
@@ -656,43 +1284,35 @@ class _BatchTransaction:
     def _artifact_observation(path: pathlib.Path):
         return _artifact_path_observation(path)
 
-    def __init__(self, engine: "AlphaEngine", artifact_paths: list[pathlib.Path]):
+    def __init__(
+        self, engine: "AlphaEngine", artifact_paths: list[pathlib.Path],
+        run_identity: TrainingRunIdentity | None = None,
+        *, preserve_publication_object: bool = False,
+        refresh_training_history: bool = False,
+    ):
         self.engine = engine
-        self.model_state = copy.deepcopy(engine.model.state_dict())
-        self.optimizer = engine.opt
-        self.optimizer_state = copy.deepcopy(engine.opt.state_dict())
-        self.gradients = [
-            None if parameter.grad is None else parameter.grad.detach().clone()
-            for parameter in engine.model.parameters()
-        ]
-        self.state = {
-            name: copy.deepcopy(getattr(engine, name)) for name in self._STATE_FIELDS
-        }
+        self.run_identity = run_identity
+        _preflight_true_transaction_snapshot(engine)
+        self.preserve_publication_object = preserve_publication_object
+        self.refresh_training_history = refresh_training_history
+        installed_identity = object.__getattribute__(engine, "__dict__").get(
+            "run_identity", _MISSING_RUN_IDENTITY
+        )
+        self._entry_run_identity = (
+            run_identity
+            if type(run_identity) is TrainingRunIdentity
+            else (
+                installed_identity
+                if type(installed_identity) is TrainingRunIdentity
+                else _MISSING_RUN_IDENTITY
+            )
+        )
         self.artifacts: dict[pathlib.Path, tuple[bool, int, str | None]] = {}
         self.artifact_identities: dict[
             pathlib.Path, tuple[int, int, int] | None
         ] = {}
         self._initial_engine_owned_artifacts: set[pathlib.Path] = set()
         self._artifact_backups: dict[pathlib.Path, pathlib.Path | None] = {}
-        ownership_records = engine._artifact_ownership_records()
-        try:
-            for path in dict.fromkeys(artifact_paths):
-                version, backup, identity = _snapshot_artifact_to_owned_backup(path)
-                self.artifacts[path] = version
-                self.artifact_identities[path] = identity
-                self._artifact_backups[path] = backup
-                ownership_key = engine._artifact_ownership_key(path)
-                if (
-                    version[0]
-                    and identity is not None
-                    and ownership_records.get(ownership_key) == (version, identity)
-                ):
-                    self._initial_engine_owned_artifacts.add(path)
-        except BaseException:
-            for backup in self._artifact_backups.values():
-                if backup is not None:
-                    backup.unlink(missing_ok=True)
-            raise
         self.owned_artifacts: dict[
             pathlib.Path,
             tuple[tuple[bool, int, str | None], tuple[int, int, int] | None],
@@ -703,30 +1323,258 @@ class _BatchTransaction:
         self._publication_expected_identities: dict[
             pathlib.Path, tuple[int, int, int] | None
         ] = {}
+        self._publication_receipts: dict[pathlib.Path, pathlib.Path] = {}
         self._last_observed_identities: dict[
             pathlib.Path, tuple[int, int, int] | None
         ] = {}
         self.publication_conflicts: list[str] = []
-        self.python_rng_state = random.getstate()
-        self.numpy_rng_state = np.random.get_state()
-        self.torch_cpu_rng_state = torch.get_rng_state().clone()
-        self.torch_cuda_rng_state = (
-            [state.clone() for state in torch.cuda.get_rng_state_all()]
+        self.active = True
+        self._capture_true_entry_snapshot()
+
+        try:
+            self.observe_artifacts(artifact_paths)
+        except BaseException as failure:
+            self._rollback_setup_failure(failure)
+            raise
+
+    def _capture_true_entry_snapshot(self) -> None:
+        attributes = object.__getattribute__(self.engine, "__dict__")
+        parameters, buffers = _raw_module_state_targets(self.engine.model)
+        capture_memo = {}
+        self._true_model_values = [
+            (parameter, parameter.detach().clone())
+            for parameter in parameters
+        ]
+        self._true_buffer_values = [
+            (buffer, buffer.detach().clone())
+            for buffer in buffers
+        ]
+        self._true_gradient_objects = [parameter.grad for parameter in parameters]
+        self._true_gradients = [
+            None if gradient is None else gradient.detach().clone()
+            for gradient in self._true_gradient_objects
+        ]
+        self._true_optimizer = self.engine.opt
+        self._true_python_rng_state = random._inst.getstate()
+        numpy_state = np.random.mtrand._rand.get_state()
+        self._true_numpy_rng_state = (
+            numpy_state[0], numpy_state[1].copy(), *numpy_state[2:]
+        )
+        self._true_torch_cpu_rng_state = torch.default_generator.get_state().clone()
+        self._true_torch_cuda_rng_state = (
+            [generator.get_state().clone() for generator in torch.cuda.default_generators]
             if torch.cuda.is_initialized()
             else None
         )
-        sampler = getattr(engine, "sampler", None)
-        state_dict = getattr(sampler, "state_dict", None)
-        load_state_dict = getattr(sampler, "load_state_dict", None)
-        getstate = getattr(sampler, "getstate", None)
-        setstate = getattr(sampler, "setstate", None)
-        if callable(state_dict) and callable(load_state_dict):
-            self.sampler_state = ("state_dict", copy.deepcopy(state_dict()))
-        elif callable(getstate) and callable(setstate):
-            self.sampler_state = ("getstate", copy.deepcopy(getstate()))
+        sampler = attributes.get("sampler")
+        self._true_sampler = sampler
+        try:
+            sampler_attributes = object.__getattribute__(sampler, "__dict__")
+        except AttributeError:
+            sampler_attributes = None
+        auxiliary_sources = {}
+        self._true_auxiliary_objects = {}
+        for name in ("scheduler", "scaler"):
+            value = attributes.get(name, _MISSING_RUN_IDENTITY)
+            if value is _MISSING_RUN_IDENTITY:
+                continue
+            value_attributes = object.__getattribute__(value, "__dict__")
+            self._true_auxiliary_objects[name] = value
+            auxiliary_sources[name] = value_attributes
+        self._true_rank_monitor = attributes.get("rank_monitor")
+        rank_attributes = (
+            object.__getattribute__(self._true_rank_monitor, "__dict__")
+            if self._true_rank_monitor is not None else None
+        )
+        history = attributes.get("training_history")
+        self._true_training_history = history
+        if self.refresh_training_history:
+            # Checkpoint save is an explicit synchronization boundary. External
+            # callers may have replaced an already-committed history element,
+            # so refresh here without adding a full-history walk to each batch.
+            self._true_history_snapshot = _CommittedHistorySnapshot(history)
+            dict.__setitem__(
+                attributes,
+                "_committed_training_history",
+                self._true_history_snapshot,
+            )
         else:
-            self.sampler_state = None
-        self.active = True
+            self._true_history_snapshot = _committed_history_snapshot(
+                self.engine, history
+            )
+        graph_source = {
+            "optimizer_state": self.engine.opt.state,
+            "optimizer_param_groups": self.engine.opt.param_groups,
+            "state": {
+                name: attributes[name]
+                for name in self._STATE_FIELDS if name in attributes
+            },
+            "sampler": sampler_attributes,
+            "auxiliary": auxiliary_sources,
+            "rank_monitor_history": (
+                dict.get(rank_attributes, "history")
+                if rank_attributes is not None else None
+            ),
+        }
+        self._true_graph_tensor_values = []
+        self._true_graph_array_values = []
+        self._true_graph = _capture_true_transaction_graph(
+            graph_source, capture_memo,
+            self._true_graph_tensor_values, self._true_graph_array_values,
+        )
+        self._true_optimizer_state = self._true_graph["optimizer_state"]
+        self._true_optimizer_param_groups = self._true_graph[
+            "optimizer_param_groups"
+        ]
+        self._true_state = self._true_graph["state"]
+        self._true_sampler_attributes = self._true_graph["sampler"]
+
+    def _restore_training_history(self) -> None:
+        self._true_history_snapshot.restore(self.engine)
+
+    def _commit_training_history(self) -> None:
+        self._true_history_snapshot.advance(self.engine.training_history)
+
+    def _revalidate_setup(self, operation: str) -> None:
+        if self.run_identity is not None:
+            _revalidate_run_identity(self.engine, self.run_identity, operation)
+
+    def _rollback_setup_failure(self, primary: BaseException) -> None:
+        failures: list[BaseException] = []
+
+        def attempt(operation) -> None:
+            try:
+                operation()
+            except BaseException as failure:
+                failures.append(failure)
+
+        attempt(
+            lambda: object.__setattr__(
+                self.engine, "run_identity", self._entry_run_identity
+            )
+        )
+        attempt(lambda: random._inst.setstate(self._true_python_rng_state))
+        attempt(lambda: np.random.mtrand._rand.set_state(self._true_numpy_rng_state))
+        attempt(
+            lambda: torch.default_generator.set_state(
+                self._true_torch_cpu_rng_state
+            )
+        )
+        if self._true_torch_cuda_rng_state is not None:
+            for generator, state in zip(
+                torch.cuda.default_generators, self._true_torch_cuda_rng_state
+            ):
+                attempt(lambda generator=generator, state=state: generator.set_state(state))
+
+        def restore_model_values() -> None:
+            with torch.no_grad():
+                for target, value in self._true_model_values:
+                    target.copy_(value)
+                for target, value in self._true_buffer_values:
+                    target.copy_(value)
+
+        attempt(restore_model_values)
+
+        def restore_graph_values() -> None:
+            with torch.no_grad():
+                for target, value in self._true_graph_tensor_values:
+                    target.copy_(value)
+            for target, value in self._true_graph_array_values:
+                np.copyto(target, value)
+
+        attempt(restore_graph_values)
+
+        def restore_gradients() -> None:
+            for parameter, gradient_object, gradient in zip(
+                (target for target, _ in self._true_model_values),
+                self._true_gradient_objects,
+                self._true_gradients,
+            ):
+                if gradient is None:
+                    parameter.grad = None
+                else:
+                    gradient_object.copy_(gradient)
+                    parameter.grad = gradient_object
+
+        attempt(restore_gradients)
+
+        def restore_optimizer() -> None:
+            self.engine.opt = self._true_optimizer
+            self.engine.opt.state = self._true_optimizer_state
+            self.engine.opt.param_groups = self._true_optimizer_param_groups
+
+        attempt(restore_optimizer)
+        for name, value in self._true_state.items():
+            attempt(
+                lambda name=name, value=value: setattr(
+                    self.engine, name, value
+                )
+            )
+        attempt(self._restore_training_history)
+
+        def restore_sampler() -> None:
+            self.engine.sampler = self._true_sampler
+            if self._true_sampler_attributes is not None:
+                attributes = object.__getattribute__(
+                    self._true_sampler, "__dict__"
+                )
+                attributes.clear()
+                attributes.update(self._true_sampler_attributes)
+
+        attempt(restore_sampler)
+        for name, value in self._true_auxiliary_objects.items():
+            true_attributes = self._true_graph["auxiliary"][name]
+            def restore_auxiliary(
+                name=name, value=value, true_attributes=true_attributes
+            ) -> None:
+                setattr(self.engine, name, value)
+                attributes = object.__getattribute__(value, "__dict__")
+                attributes.clear()
+                attributes.update(true_attributes)
+
+            attempt(restore_auxiliary)
+        if self._true_rank_monitor is not None:
+            def restore_rank_monitor() -> None:
+                self.engine.rank_monitor = self._true_rank_monitor
+                self._true_rank_monitor.history = self._true_graph[
+                    "rank_monitor_history"
+                ]
+
+            attempt(restore_rank_monitor)
+        for backup in self._artifact_backups.values():
+            if backup is not None:
+                attempt(
+                    lambda backup=backup:
+                    _cleanup_owned_transaction_backup(backup)
+                )
+        object.__setattr__(self.engine, "run_identity", self._entry_run_identity)
+        self.active = False
+        self._release()
+        for failure in failures[:8]:
+            primary.add_note(
+                "batch setup rollback also failed: "
+                + _safe_failure_summary(failure)
+            )
+
+    def observe_artifacts(self, artifact_paths: list[pathlib.Path]) -> None:
+        ownership_records = self.engine._artifact_ownership_records()
+        for path in dict.fromkeys(artifact_paths):
+            version, backup, identity = _snapshot_artifact_to_owned_backup(path)
+            # The helper has returned ownership of this exact backup. Register
+            # it before any subsequent identity/revalidation boundary so setup
+            # rollback can always remove it.
+            self._artifact_backups[path] = backup
+            self._revalidate_setup("artifact backup snapshot")
+            self.artifacts[path] = version
+            self.artifact_identities[path] = identity
+            ownership_key = self.engine._artifact_ownership_key(path)
+            self._revalidate_setup("artifact ownership key")
+            if (
+                version[0]
+                and identity is not None
+                and ownership_records.get(ownership_key) == (version, identity)
+            ):
+                self._initial_engine_owned_artifacts.add(path)
 
     def _current_artifacts(
         self,
@@ -800,7 +1648,9 @@ class _BatchTransaction:
         hook = getattr(self, "_publication_cas_interleave_hook", None)
         if callable(hook):
             hook(target)
-        published, candidate_identity = self._artifact_observation(temporary)
+        with temporary.open("rb") as candidate_fp:
+            published = _artifact_stream_version(candidate_fp)
+            candidate_identity = _artifact_open_file_identity(candidate_fp)
         if os.name != "nt":
             current, current_identity = self._artifact_observation(target)
             expected_identity = self._publication_expected_identities.get(target)
@@ -924,7 +1774,10 @@ class _BatchTransaction:
                 else:
                     _windows_delete_handle(receipt_kernel32, receipt_handle)
                 raise conflict
-            _windows_delete_handle(receipt_kernel32, receipt_handle)
+            if self.preserve_publication_object:
+                self._publication_receipts[target] = receipt
+            else:
+                _windows_delete_handle(receipt_kernel32, receipt_handle)
         except BaseException as failure:
             if getattr(failure, "_artifact_kernel_replace_succeeded", False):
                 recovery_kernel32 = None
@@ -1035,10 +1888,11 @@ class _BatchTransaction:
                         raise ctypes.WinError(ctypes.get_last_error())
                 except BaseException as close_failure:
                     close_failures.append(close_failure)
-            try:
-                receipt.rmdir()
-            except BaseException as cleanup_failure:
-                close_failures.append(cleanup_failure)
+            if target not in self._publication_receipts:
+                try:
+                    receipt.rmdir()
+                except BaseException as cleanup_failure:
+                    close_failures.append(cleanup_failure)
             if close_failures:
                 primary = close_failures[0]
                 primary._artifact_publication_claims = {
@@ -1055,14 +1909,22 @@ class _BatchTransaction:
         if not self.active:
             raise RuntimeError("batch transaction is no longer active")
         try:
+            if self.run_identity is not None:
+                _revalidate_run_identity(
+                    self.engine, self.run_identity, "training callback before call"
+                )
             result = operation(*args, **kwargs)
+            if self.run_identity is not None:
+                _revalidate_run_identity(
+                    self.engine, self.run_identity, "training callback after call"
+                )
         except BaseException as failure:
             try:
                 self.rollback()
             except BaseException as rollback_failure:
                 failure.add_note(
                     "batch rollback also failed: "
-                    f"{type(rollback_failure).__name__}: {rollback_failure}"
+                    + _safe_failure_summary(rollback_failure)
                 )
             traceback.clear_frames(failure.__traceback__)
             raise
@@ -1079,6 +1941,10 @@ class _BatchTransaction:
         """Run one publication and own only exact declared receipt versions."""
         if not self.active:
             raise RuntimeError("batch transaction is no longer active")
+        if self.run_identity is not None:
+            _revalidate_run_identity(
+                self.engine, self.run_identity, "training artifact before observation"
+            )
         paths = tuple(dict.fromkeys(pathlib.Path(path) for path in affected_paths))
         undeclared = [path for path in paths if path not in self.artifacts]
         if undeclared:
@@ -1107,18 +1973,31 @@ class _BatchTransaction:
                 self.owned_artifacts.pop(path, None)
         self._publication_expected_identities = before_identities
         publication_token = _ACTIVE_ARTIFACT_PUBLICATION.set((self, before))
+        result = _MISSING_RUN_IDENTITY
         try:
             result = operation(*args, **kwargs)
+            if self.run_identity is not None:
+                _revalidate_run_identity(
+                    self.engine, self.run_identity,
+                    "training artifact after publication",
+                )
         except BaseException as failure:
             _ACTIVE_ARTIFACT_PUBLICATION.reset(publication_token)
             try:
-                claims = getattr(failure, "_artifact_publication_claims", {})
+                claims_source = (
+                    result
+                    if result is not _MISSING_RUN_IDENTITY
+                    else failure
+                )
+                claims = getattr(
+                    claims_source, "_artifact_publication_claims", {}
+                )
                 self._record_claimed_publications(before, dict(claims))
                 self.rollback()
             except BaseException as rollback_failure:
                 failure.add_note(
                     "batch rollback also failed: "
-                    f"{type(rollback_failure).__name__}: {rollback_failure}"
+                    + _safe_failure_summary(rollback_failure)
                 )
             traceback.clear_frames(failure.__traceback__)
             raise
@@ -1128,7 +2007,27 @@ class _BatchTransaction:
         return getattr(result, "_artifact_publication_result", result)
 
     def _release(self) -> None:
-        self.state.clear()
+        self._true_model_values.clear()
+        self._true_buffer_values.clear()
+        self._true_gradient_objects.clear()
+        self._true_gradients.clear()
+        self._true_optimizer = None
+        self._true_optimizer_state = None
+        self._true_optimizer_param_groups = None
+        self._true_state = None
+        self._true_training_history = None
+        self._true_history_snapshot = None
+        self._true_python_rng_state = None
+        self._true_numpy_rng_state = None
+        self._true_torch_cpu_rng_state = None
+        self._true_torch_cuda_rng_state = None
+        self._true_sampler = None
+        self._true_sampler_attributes = None
+        self._true_auxiliary_objects.clear()
+        self._true_rank_monitor = None
+        self._true_graph = None
+        self._true_graph_tensor_values.clear()
+        self._true_graph_array_values.clear()
         self.artifacts.clear()
         self.artifact_identities.clear()
         self._initial_engine_owned_artifacts.clear()
@@ -1136,37 +2035,54 @@ class _BatchTransaction:
         self.owned_artifacts.clear()
         self._publication_identities.clear()
         self._publication_expected_identities.clear()
+        self._publication_receipts.clear()
         self._last_observed_identities.clear()
         self.publication_conflicts.clear()
-        self.model_state.clear()
-        self.optimizer = None
-        self.optimizer_state.clear()
-        self.gradients.clear()
-        self.python_rng_state = None
-        self.numpy_rng_state = None
-        self.torch_cpu_rng_state = None
-        self.torch_cuda_rng_state = None
-        self.sampler_state = None
 
     def commit(self) -> None:
-        failures: list[BaseException] = []
-        for backup in self._artifact_backups.values():
+        try:
+            self._commit_training_history()
+        except BaseException as failure:
+            try:
+                self.rollback()
+            except BaseException as rollback_failure:
+                failure.add_note(
+                    "history commit rollback also failed: "
+                    + _safe_failure_summary(rollback_failure)
+                )
+            raise
+        def rollback_cleanup_failure(primary: BaseException) -> None:
+            try:
+                self.rollback()
+            except BaseException as rollback_failure:
+                primary.add_note(
+                    "transaction cleanup rollback also failed: "
+                    + _safe_failure_summary(rollback_failure)
+                )
+            raise primary
+
+        # Keep the transaction active, and retain at least one restoration
+        # source, until each owned cleanup operation succeeds.  A cleanup
+        # exception is therefore still a fully rollback-capable failure.
+        for path, receipt in tuple(self._publication_receipts.items()):
+            try:
+                (receipt / "displaced").unlink(missing_ok=True)
+                receipt.rmdir()
+            except BaseException as failure:
+                rollback_cleanup_failure(failure)
+            else:
+                self._publication_receipts.pop(path, None)
+        for path, backup in tuple(self._artifact_backups.items()):
             if backup is None:
                 continue
             try:
                 backup.unlink(missing_ok=True)
             except BaseException as failure:
-                failures.append(failure)
+                rollback_cleanup_failure(failure)
+            else:
+                self._artifact_backups[path] = None
         self.active = False
         self._release()
-        if failures:
-            primary = failures[0]
-            for additional in failures[1:8]:
-                primary.add_note(
-                    "additional transaction backup cleanup failure: "
-                    f"{type(additional).__name__}: {additional}"
-                )
-            raise primary
 
     def rollback(self) -> None:
         if not self.active:
@@ -1242,6 +2158,18 @@ class _BatchTransaction:
                     f"transaction backup missing for artifact: {str(path)[:160]}"
                 )
             if os.name == "nt":
+                receipt = self._publication_receipts.get(path)
+                if receipt is not None and existed:
+                    _windows_replace_file(path, receipt / "displaced")
+                    receipt.rmdir()
+                    self._publication_receipts.pop(path, None)
+                    restored_version, restored_identity = self._artifact_observation(
+                        path
+                    )
+                    reconcile_restored_ownership(
+                        restored_version, restored_identity
+                    )
+                    return
                 try:
                     kernel32, handle = _windows_open_exclusive(path)
                 except OSError as failure:
@@ -1331,48 +2259,90 @@ class _BatchTransaction:
                 rollback_temp.unlink(missing_ok=True)
 
         try:
-            attempt(lambda: random.setstate(self.python_rng_state))
-            attempt(lambda: np.random.set_state(self.numpy_rng_state))
-            attempt(lambda: torch.set_rng_state(self.torch_cpu_rng_state))
-            if self.torch_cuda_rng_state is not None:
-                attempt(
-                    lambda: torch.cuda.set_rng_state_all(self.torch_cuda_rng_state)
-                )
-            if self.sampler_state is not None:
-                protocol, sampler_state = self.sampler_state
-                if protocol == "state_dict":
-                    attempt(
-                        lambda: self.engine.sampler.load_state_dict(
-                            copy.deepcopy(sampler_state)
-                        )
-                    )
-                else:
-                    attempt(
-                        lambda: self.engine.sampler.setstate(
-                            copy.deepcopy(sampler_state)
-                        )
-                    )
-            attempt(lambda: self.engine.model.load_state_dict(self.model_state))
+            attempt(lambda: object.__setattr__(
+                self.engine, "run_identity", self._entry_run_identity
+            ))
+            attempt(lambda: random._inst.setstate(self._true_python_rng_state))
+            attempt(lambda: np.random.mtrand._rand.set_state(
+                self._true_numpy_rng_state
+            ))
+            attempt(lambda: torch.default_generator.set_state(
+                self._true_torch_cpu_rng_state
+            ))
+            if self._true_torch_cuda_rng_state is not None:
+                for generator, state in zip(
+                    torch.cuda.default_generators,
+                    self._true_torch_cuda_rng_state,
+                ):
+                    attempt(lambda generator=generator, state=state: (
+                        generator.set_state(state)
+                    ))
 
-            def restore_optimizer() -> None:
-                self.engine.opt = self.optimizer
-                self.engine.opt.load_state_dict(self.optimizer_state)
+            def restore_true_values() -> None:
+                with torch.no_grad():
+                    for target, value in self._true_model_values:
+                        target.copy_(value)
+                    for target, value in self._true_buffer_values:
+                        target.copy_(value)
+                    for target, value in self._true_graph_tensor_values:
+                        target.copy_(value)
+                for target, value in self._true_graph_array_values:
+                    np.copyto(target, value)
 
-            attempt(restore_optimizer)
+            attempt(restore_true_values)
 
             def restore_gradients() -> None:
-                for parameter, gradient in zip(
-                    self.engine.model.parameters(), self.gradients
+                for (parameter, _), gradient_object, gradient in zip(
+                    self._true_model_values,
+                    self._true_gradient_objects,
+                    self._true_gradients,
                 ):
-                    parameter.grad = None if gradient is None else gradient.clone()
+                    if gradient is None:
+                        parameter.grad = None
+                    else:
+                        gradient_object.copy_(gradient)
+                        parameter.grad = gradient_object
 
             attempt(restore_gradients)
-            for name, value in self.state.items():
-                attempt(
-                    lambda name=name, value=value: setattr(
-                        self.engine, name, copy.deepcopy(value)
+
+            def restore_optimizer() -> None:
+                self.engine.opt = self._true_optimizer
+                self.engine.opt.state = self._true_optimizer_state
+                self.engine.opt.param_groups = self._true_optimizer_param_groups
+
+            attempt(restore_optimizer)
+            for name, value in self._true_state.items():
+                attempt(lambda name=name, value=value: setattr(
+                    self.engine, name, value
+                ))
+            attempt(self._restore_training_history)
+
+            def restore_sampler() -> None:
+                self.engine.sampler = self._true_sampler
+                if self._true_sampler_attributes is not None:
+                    attributes = object.__getattribute__(
+                        self._true_sampler, "__dict__"
                     )
-                )
+                    attributes.clear()
+                    attributes.update(self._true_sampler_attributes)
+
+            attempt(restore_sampler)
+            for name, value in self._true_auxiliary_objects.items():
+                def restore_auxiliary(name=name, value=value) -> None:
+                    setattr(self.engine, name, value)
+                    attributes = object.__getattribute__(value, "__dict__")
+                    attributes.clear()
+                    attributes.update(self._true_graph["auxiliary"][name])
+
+                attempt(restore_auxiliary)
+            if self._true_rank_monitor is not None:
+                def restore_rank_monitor() -> None:
+                    self.engine.rank_monitor = self._true_rank_monitor
+                    self._true_rank_monitor.history = self._true_graph[
+                        "rank_monitor_history"
+                    ]
+
+                attempt(restore_rank_monitor)
             for path, original in self.artifacts.items():
                 attempt(
                     lambda path=path, original=original: restore_artifact(
@@ -1381,7 +2351,13 @@ class _BatchTransaction:
                 )
             for backup in self._artifact_backups.values():
                 if backup is not None:
-                    attempt(lambda backup=backup: backup.unlink(missing_ok=True))
+                    attempt(
+                        lambda backup=backup:
+                        _cleanup_owned_transaction_backup(backup)
+                    )
+            for receipt in tuple(self._publication_receipts.values()):
+                attempt(lambda receipt=receipt: (receipt / "displaced").unlink(missing_ok=True))
+                attempt(lambda receipt=receipt: receipt.rmdir())
             if conflicts:
                 failures.append(
                     RuntimeError(
@@ -1390,6 +2366,10 @@ class _BatchTransaction:
                     )
                 )
         finally:
+            if self._entry_run_identity is not _MISSING_RUN_IDENTITY:
+                object.__setattr__(
+                    self.engine, "run_identity", self._entry_run_identity
+                )
             self.active = False
             self._release()
         if failures:
@@ -1688,8 +2668,10 @@ class AlphaEngine:
     def __init__(self, data_manager=None, use_lord_regularization=True,
                  lord_decay_rate=1e-3, lord_num_iterations=5,
                  n_folds: object = _CONFIGURED_N_FOLDS,
-                 target_symbol: str | None = None):
+                 target_symbol: str | None = None,
+                 run_identity: TrainingRunIdentity | None = None):
         self.data_manager  = data_manager
+        self.run_identity = run_identity
         configured_n_folds = (
             ModelConfig.WF_N_BLOCKS
             if n_folds is _CONFIGURED_N_FOLDS
@@ -1727,6 +2709,7 @@ class AlphaEngine:
 
         self.best_score   = -float('inf')
         self.best_formula = None
+        self.best_metrics: dict[str, object] | None = None
         self._best_snapshot: dict | None = None
 
         self.training_history = {
@@ -1734,10 +2717,12 @@ class AlphaEngine:
         }
         self._restart_count      = 0
         self.factor_pool: list[tuple[float, int, torch.Tensor]] = []
+        self.factor_pool_scores: list[float] = []
         self._factor_pool_counter = 0
 
         # Elite Replay pool: (val_score, counter, formula_tokens, birth_step)
         self._elite_pool: list[tuple[float, int, list[int], int]] = []
+        self.elite_pool_ages: list[int] = []
         self._elite_counter = 0
 
         # 自适应噪声：记录 best 刷新步数
@@ -1748,6 +2733,7 @@ class AlphaEngine:
         self._reward_ema: float | None = None
         self._reward_ema_step: int = 0
         self._low_entropy_streak: int = 0
+        self._previous_initial_distribution: torch.Tensor | None = None
         self._owned_public_artifacts: dict[
             str,
             tuple[
@@ -1915,19 +2901,35 @@ class AlphaEngine:
             factor,
         )
 
-    def _begin_batch_transaction(self, next_step: int) -> _BatchTransaction:
-        strategy_path = pathlib.Path(_strategy_file_for_symbol(self.target_symbol))
-        history_path = pathlib.Path(
-            f"training_history_{self.target_symbol}.json"
-            if self.target_symbol else "training_history.json"
+    def _begin_batch_transaction(
+        self, next_step: int, run_identity: TrainingRunIdentity
+    ) -> _BatchTransaction:
+        run_identity = _revalidate_run_identity(
+            self, run_identity, "training batch before artifact observation"
         )
-        sym_tag = f"_{self.target_symbol}" if self.target_symbol else ""
-        checkpoint_path = _CHECKPOINT_DIR / f"ckpt{sym_tag}_step_{next_step:04d}.pt"
+        transaction = _BatchTransaction(self, [], run_identity)
+        strategy_name = transaction.run(run_identity.strategy_filename)
+        strategy_path = transaction.run(
+            lambda: pathlib.Path("strategies") / strategy_name
+        )
+        history_name = transaction.run(run_identity.history_filename)
+        history_path = transaction.run(pathlib.Path, history_name)
+        checkpoint_name = transaction.run(
+            run_identity.checkpoint_filename, max(0, next_step - 1)
+        )
+        checkpoint_path = transaction.run(
+            lambda: _CHECKPOINT_DIR / checkpoint_name
+        )
         published_paths = [strategy_path, history_path, checkpoint_path]
-        temporary_paths = [
-            path.with_name(f".{path.name}.tmp") for path in published_paths
-        ]
-        return _BatchTransaction(self, published_paths + temporary_paths)
+        temporary_paths = transaction.run(
+            lambda: [
+                path.with_name(f".{path.name}.tmp") for path in published_paths
+            ]
+        )
+        transaction.run(
+            transaction.observe_artifacts, published_paths + temporary_paths
+        )
+        return transaction
 
     def _commit_pending_actions(
         self,
@@ -1954,12 +2956,24 @@ class AlphaEngine:
                     _, final_val, fml, action_step = action
                     self._update_elite_pool(final_val, fml, action_step)
                     continue
-                (
-                    _, final_val, fml, snapshot, action_step, buffered_factor,
-                    old_best, ic_i, exposure,
-                ) = action
+                if len(action) == 10:
+                    (
+                        _, final_val, fml, snapshot, action_step, buffered_factor,
+                        old_best, ic_i, exposure, fold_evidence,
+                    ) = action
+                else:
+                    (
+                        _, final_val, fml, snapshot, action_step, buffered_factor,
+                        old_best, ic_i, exposure,
+                    ) = action
+                    fold_evidence = None
                 self.best_score = final_val
                 self.best_formula = fml
+                if fold_evidence is not None:
+                    self.best_metrics = {
+                        "validation_score": final_val,
+                        "fold_evidence": fold_evidence,
+                    }
                 self._best_snapshot = snapshot
                 self._best_update_step = action_step
                 self._stagnation_steps = 0
@@ -2209,11 +3223,15 @@ class AlphaEngine:
 
     def train(self, start_step: int = 0, end_step: int | None = None,
               migration_hook=None, verbose_header: bool = True):
+        run_identity = _validated_run_identity(self, "train")
         if self.data_manager is None:
             raise RuntimeError("AlphaEngine requires a data_manager.")
 
         feat, t_ret, t_valid, bar_time_ns = self._validate_training_tensors(
             self.data_manager
+        )
+        _revalidate_run_identity(
+            self, run_identity, "training data callback return"
         )
         n_folds = self._validate_n_folds(self.n_folds)
 
@@ -2292,12 +3310,19 @@ class AlphaEngine:
                                   disable=not sys.stderr.isatty(),
                                   leave=False,
                                   mininterval=5.0)
-        prev_init_dist     = None  # 用于计算相邻步分布差异 KL
+        for field, default in (
+            ("best_metrics", None),
+            ("factor_pool_scores", []),
+            ("elite_pool_ages", []),
+            ("_previous_initial_distribution", None),
+        ):
+            if not hasattr(self, field):
+                setattr(self, field, default)
 
         for step in pbar:
             # The transaction starts before every stochastic draw belonging to
             # this batch, so a failed attempt can be retried deterministically.
-            transaction = self._begin_batch_transaction(step + 1)
+            transaction = self._begin_batch_transaction(step + 1, run_identity)
             # ── Part A: Sample n_new new formulas ────────────────────
             inp_new = torch.zeros((n_new, 1), dtype=torch.long,
                                   device=ModelConfig.DEVICE)
@@ -2550,10 +3575,34 @@ class AlphaEngine:
                                     old_best = shadow_best_score
                                     snapshot = copy.deepcopy(self.model.state_dict())
                                     buffered_factor = selection_factor.detach()
+                                    fold_evidence = [
+                                        {
+                                            "fold_index": fold.fold_index,
+                                            "train_start_time_ns": int(
+                                                bar_time_ns[0, fold.train_start].item()
+                                            ),
+                                            "train_end_time_ns": int(
+                                                bar_time_ns[0, fold.train_end - 1].item()
+                                            ),
+                                            "val_start_time_ns": int(
+                                                bar_time_ns[0, fold.val_start].item()
+                                            ),
+                                            "val_end_time_ns": int(
+                                                bar_time_ns[0, fold.val_end - 1].item()
+                                            ),
+                                            "effective_gap": fold.effective_gap,
+                                            "validation_metrics": {
+                                                "score": float(fold_vl[index].item()),
+                                                "ic": float(fold_ic[index]),
+                                            },
+                                        }
+                                        for index, fold in enumerate(folds)
+                                    ]
                                     pending_actions.append(
                                         (
                                             "best", final_val, list(fml), snapshot,
                                             step, buffered_factor, old_best, ic_i, exposure,
+                                            fold_evidence,
                                         )
                                     )
                                     shadow_best_score = final_val
@@ -2580,7 +3629,7 @@ class AlphaEngine:
                     except BaseException as rollback_failure:
                         failure.add_note(
                             "batch rollback also failed: "
-                            f"{type(rollback_failure).__name__}: {rollback_failure}"
+                            + _safe_failure_summary(rollback_failure)
                         )
                 pending_actions.clear()
                 shadow_factor_pool.clear()
@@ -2665,8 +3714,10 @@ class AlphaEngine:
                 transaction.run(self.lord_opt.step)
 
             # ── Part D2: 分布细化指标 ────────────────────────────────
-            dst = transaction.run(self._distribution_stats, prev_init_dist)
-            prev_init_dist = dst['dist']
+            dst = transaction.run(
+                self._distribution_stats, self._previous_initial_distribution
+            )
+            self._previous_initial_distribution = dst['dist']
             with torch.no_grad():
                 uniq_tokens = seqs_new.unique().numel()
                 uniq_fmls   = torch.unique(seqs_new, dim=0).shape[0]
@@ -2679,20 +3730,16 @@ class AlphaEngine:
                 pending_actions,
                 publish_strategy=False,
             )
-            if commit_messages:
-                strategy_path = pathlib.Path(
-                    _strategy_file_for_symbol(self.target_symbol)
-                )
-                transaction.run_artifact(
-                    self._save_strategy_live,
-                    [
-                        strategy_path,
-                        strategy_path.with_name(f".{strategy_path.name}.tmp"),
-                    ],
-                )
+            has_winner = bool(commit_messages)
             for message in commit_messages:
                 tqdm.write(message)
             commit_messages.clear()
+            # Keep the historical publication hook inside the transaction for
+            # embedders that instrument it.  Formal V2 engines make the
+            # built-in hook a no-op; immutable artifacts are owned by the
+            # training service.
+            if has_winner:
+                transaction.run(self._save_strategy_live, run_identity)
 
             # ── Part E: Logging & history ────────────────────────────
             avg_rew = rewards.mean().item()
@@ -2750,10 +3797,11 @@ class AlphaEngine:
             self.training_history.setdefault('batch_uniq_fmls', []).append(uniq_fmls)
             self.training_history.setdefault('batch_fml_div', []).append(fml_div)
 
-            history_path = pathlib.Path(
-                f"training_history_{self.target_symbol}.json"
-                if self.target_symbol else "training_history.json"
+            current_identity = transaction.run(
+                _revalidate_run_identity,
+                self, run_identity, "training history boundary",
             )
+            history_path = pathlib.Path(current_identity.history_filename())
             transaction.run_artifact(
                 self._save_training_history_live,
                 [
@@ -2768,9 +3816,12 @@ class AlphaEngine:
             # A successful-step checkpoint represents the complete supported
             # post-restart state and is still inside the rollback boundary.
             if (step + 1) % 20 == 0 or (step + 1) == end_step:
-                sym_tag = f"_{self.target_symbol}" if self.target_symbol else ""
+                current_identity = transaction.run(
+                    _revalidate_run_identity,
+                    self, run_identity, "training checkpoint boundary",
+                )
                 checkpoint_path = (
-                    _CHECKPOINT_DIR / f"ckpt{sym_tag}_step_{step + 1:04d}.pt"
+                    _CHECKPOINT_DIR / current_identity.checkpoint_filename(step)
                 )
                 ckpt = transaction.run_artifact(
                     self.save_checkpoint,
@@ -2780,47 +3831,49 @@ class AlphaEngine:
                             f".{checkpoint_path.name}.tmp"
                         ),
                     ],
-                    step + 1,
+                    step,
                 )
                 tqdm.write(f"[检查点] → {ckpt} (最优={self.best_score:.3f})")
 
-            transaction.commit()
-
             # ── Part G: Migration hook（多岛训练时交换精英）────────────
-            # The hook remains outside the rollback contract because its
-            # external side effects cannot be reversed by this engine.
             if migration_hook is not None and (step + 1) % ModelConfig.MIGRATION_INTERVAL == 0:
                 tqdm.write(f"[迁移钩子 @ 第{step+1}步] 调用已注册钩子")
-                migration_hook(self, step + 1)
+                transaction.run(migration_hook, self, step + 1)
+
+            transaction.commit()
 
         # ── End of training ──────────────────────────────────────────
         # 仅当跑满最终步时才保存最终 strategy 和历史
         if end_step == ModelConfig.TRAIN_STEPS:
-            if self.best_formula is not None:
-                from .vocab import VOCAB_VERSION
-                strategy_data = {
-                    "vocab_version": VOCAB_VERSION,
-                    "symbol": self.target_symbol,
-                    "formula": self.best_formula,
-                    "best_score": self.best_score,
-                }
-                save_path = _strategy_file_for_symbol(self.target_symbol)
-                _atomic_json_replace(
-                    pathlib.Path(save_path),
-                    strategy_data,
-                    indent=2,
-                    publisher=self._publish_owned_artifact_temp,
-                )
+            current_identity = _revalidate_run_identity(
+                self, run_identity, "training final publication boundary"
+            )
+            self._save_strategy_live(run_identity)
+            current_identity = _revalidate_run_identity(
+                self, run_identity, "training final history boundary"
+            )
+            save_path = "managed by training_service.py"
 
             sym_tag = f"[{self.target_symbol}] " if self.target_symbol else ""
+            history_transaction = _BatchTransaction(
+                self, [], run_identity, preserve_publication_object=True
+            )
+            hist_name = history_transaction.run(current_identity.history_filename)
+            hist_path = history_transaction.run(pathlib.Path, hist_name)
+            hist_temp = history_transaction.run(
+                lambda: hist_path.with_name(f".{hist_path.name}.tmp")
+            )
+            history_transaction.run(
+                history_transaction.observe_artifacts, [hist_path, hist_temp]
+            )
             self.training_history.pop('_low_entropy_streak', None)
-            hist_path = (
-                f"training_history_{self.target_symbol}.json"
-                if self.target_symbol else "training_history.json"
+            history_transaction.run_artifact(
+                _atomic_json_replace,
+                [hist_path, hist_temp],
+                hist_path,
+                self.training_history,
             )
-            _atomic_json_replace(
-                pathlib.Path(hist_path), self.training_history
-            )
+            history_transaction.commit()
 
             print(f"\n[完成] {sym_tag}训练结束！")
             print(f"  最优验证分数 : {self.best_score:.4f}")
@@ -2884,7 +3937,11 @@ class AlphaEngine:
         """周期性写入训练曲线 JSON，供 Web UI 实时展示。"""
         if not self.target_symbol:
             return _artifact_publication_result(None, {})
-        hist_path = pathlib.Path(f"training_history_{self.target_symbol}.json")
+        hist_path = pathlib.Path(
+            self.run_identity.history_filename()
+            if getattr(self, "run_identity", None) is not None
+            else f"training_history_{self.target_symbol}.json"
+        )
         temporary = hist_path.with_name(f".{hist_path.name}.tmp")
         try:
             payload = {
@@ -2907,86 +3964,214 @@ class AlphaEngine:
             temporary.unlink(missing_ok=True)
             raise
 
-    def _save_strategy_live(self) -> _ArtifactPublicationReceipt | None:
+    def _save_strategy_live(
+        self, formal_identity: TrainingRunIdentity | None = None
+    ) -> _ArtifactPublicationReceipt | None:
         """每次 best_formula 更新时立即保存 strategy json。
         即使训练中途进程被杀（OOM/终端回收/Ctrl+C），也能保留最新最优公式。
         """
-        if self.best_formula is None:
-            return _artifact_publication_result(None, {})
-        from .vocab import VOCAB_VERSION
-        save_path = _strategy_file_for_symbol(self.target_symbol)
-        p = pathlib.Path(save_path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        self._assert_artifact_owned_or_absent(p)
-
-        strategy_data = {
-            "vocab_version": VOCAB_VERSION,
-            "symbol": self.target_symbol,
-            "formula": self.best_formula,
-            "best_score": self.best_score,
-            "formula_decoded": self._decode_formula(self.best_formula),
-        }
-        # 保留训练数据路径等元数据，避免 live 保存把 data_file 冲掉
-        for key in ("timeframe", "data_file", "mode", "train_steps"):
-            val = getattr(self, key, None)
-            if val is not None:
-                strategy_data[key] = val
-
-        temporary = p.with_name(f".{p.name}.tmp")
-        try:
-            with open(temporary, "w", encoding="utf-8") as fp:
-                json.dump(strategy_data, fp, indent=2, ensure_ascii=False)
-                fp.flush()
-            published = _artifact_path_version(temporary)
-            self._publish_owned_artifact_temp(temporary, p)
-            return _artifact_publication_result(
-                None,
-                {
-                    p: published,
-                    temporary: _ABSENT_ARTIFACT_VERSION,
-                },
+        if formal_identity is None:
+            _validated_run_identity(self, "strategy publication")
+        else:
+            _revalidate_run_identity(
+                self, formal_identity, "formal strategy publication hook"
             )
-        except BaseException:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-
+        return _artifact_publication_result(None, {})
     # ── Checkpoint save / load ────────────────────────────────────────────────
 
     def save_checkpoint(self, step: int, path: str | None = None) -> str:
-        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        if path is None:
-            sym_tag = f"_{self.target_symbol}" if self.target_symbol else ""
-            path = str(_CHECKPOINT_DIR / f"ckpt{sym_tag}_step_{step:04d}.pt")
+        attributes = object.__getattribute__(self, "__dict__")
+        entry_identity = dict.get(
+            attributes, "run_identity", _MISSING_RUN_IDENTITY
+        )
+        if type(entry_identity) is not TrainingRunIdentity:
+            actual = (
+                "missing" if entry_identity is _MISSING_RUN_IDENTITY
+                else type(entry_identity).__name__
+            )
+            raise ArtifactCompatibilityError(
+                "save_checkpoint run_identity: "
+                f"expected=TrainingRunIdentity, actual={actual[:80]}"
+            )
+        enclosing_publication = _ACTIVE_ARTIFACT_PUBLICATION.get()
+        transaction = _BatchTransaction(
+            self, [], entry_identity, preserve_publication_object=True,
+            refresh_training_history=True,
+        )
+
+        def resolve_paths():
+            validated = _validated_run_identity(self, "save_checkpoint")
+            resolved = path
+            if resolved is None:
+                filename = validated.checkpoint_filename(step)
+                _revalidate_run_identity(
+                    self, validated, "save_checkpoint filename callback"
+                )
+                resolved = str(_CHECKPOINT_DIR / filename)
+                _revalidate_run_identity(
+                    self, validated,
+                    "save_checkpoint default path construction",
+                )
+            target = pathlib.Path(resolved)
+            _revalidate_run_identity(
+                self, validated, "save_checkpoint target path construction"
+            )
+            temporary = target.with_name(f".{target.name}.tmp")
+            _revalidate_run_identity(
+                self, validated,
+                "save_checkpoint temporary path construction",
+            )
+            return resolved, target, temporary
+
+        resolved, target, temporary = transaction.run(resolve_paths)
+        if enclosing_publication is not None:
+            result = transaction.run(
+                self._save_checkpoint_transaction_body, step, resolved
+            )
+            transaction.commit()
+            return result
+        transaction.run(
+            transaction.observe_artifacts, [target, temporary]
+        )
+        result = transaction.run_artifact(
+            self._save_checkpoint_transaction_body,
+            [target, temporary],
+            step,
+            resolved,
+        )
+        published = transaction.run(_artifact_path_version, target)
+        transaction.commit()
+        return _artifact_publication_result(
+            result,
+            {
+                target: published,
+                temporary: _ABSENT_ARTIFACT_VERSION,
+            },
+        )
+
+    def _save_checkpoint_transaction_body(
+        self, step: int, path: str | None = None
+    ) -> str:
+        run_identity = _validated_run_identity(self, "save_checkpoint")
+        model_state = self.model.state_dict()
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint model state callback"
+        )
+        optimizer_state = self.opt.state_dict()
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint optimizer state callback"
+        )
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        torch_cpu_rng = torch.get_rng_state()
+        torch_cuda_rng = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        )
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint RNG state callbacks"
+        )
+        serialized_run_identity = run_identity.to_dict()
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint identity serialization callback"
+        )
         ckpt = {
+            "checkpoint_schema_version": "checkpoint-v2",
+            "run_identity":          serialized_run_identity,
             "step":                 step,
-            "vocab_version":        VOCAB_VERSION,   # task 12.2: 版本校验所需
-            "model_state_dict":     self.model.state_dict(),
-            "optimizer_state_dict": self.opt.state_dict(),
+            "model_state_dict":     model_state,
+            "optimizer_state_dict": optimizer_state,
             "best_score":           self.best_score,
             "best_formula":         self.best_formula,
+            "best_metrics":         self.best_metrics,
             "best_snapshot":        self._best_snapshot,
             "factor_pool":          self.factor_pool,
+            "factor_pool_scores":   self.factor_pool_scores,
             "factor_pool_counter":  self._factor_pool_counter,
             "elite_pool":           self._elite_pool,
+            "elite_pool_ages":      self.elite_pool_ages,
             "elite_counter":        self._elite_counter,
             "restart_count":        self._restart_count,
+            "best_update_step":     self._best_update_step,
+            "stagnation_steps":     self._stagnation_steps,
+            "reward_ema":           self._reward_ema,
+            "reward_ema_step":      self._reward_ema_step,
+            "low_entropy_streak":   self._low_entropy_streak,
+            "previous_initial_distribution": self._previous_initial_distribution,
             "training_history":     {
                 k: v for k, v in self.training_history.items()
                 if k != '_low_entropy_streak'
             },
+            "rank_monitor_history": (
+                list(self.rank_monitor.history) if self.rank_monitor is not None else []
+            ),
+            "python_random_state": python_rng,
+            "numpy_random_state": numpy_rng,
+            "torch_cpu_rng_state": torch_cpu_rng,
+            "torch_cuda_rng_state_all": torch_cuda_rng,
         }
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint payload construction"
+        )
+        if path is None:
+            filename = run_identity.checkpoint_filename(step)
+            _revalidate_run_identity(
+                self, run_identity, "save_checkpoint filename callback"
+            )
+            path = str(_CHECKPOINT_DIR / filename)
+            _revalidate_run_identity(
+                self, run_identity, "save_checkpoint default path construction"
+            )
         target = pathlib.Path(path)
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint target path construction"
+        )
         temporary = target.with_name(f".{target.name}.tmp")
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint temporary path construction"
+        )
+        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint directory creation callback"
+        )
         self._assert_artifact_owned_or_absent(target)
+        _revalidate_run_identity(
+            self, run_identity, "save_checkpoint ownership callback"
+        )
         try:
             torch.save(ckpt, temporary)
+            _revalidate_run_identity(
+                self, run_identity, "save_checkpoint serialization callback"
+            )
             published = _artifact_path_version(temporary)
+            _revalidate_run_identity(
+                self, run_identity, "save_checkpoint publication boundary"
+            )
             self._publish_owned_artifact_temp(temporary, target)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
+            _revalidate_run_identity(
+                self, run_identity, "save_checkpoint publication callback"
+            )
+        except BaseException as failure:
+            claims = {}
+            try:
+                if (
+                    "published" in locals()
+                    and _artifact_path_version(target) == published
+                ):
+                    claims[target] = published
+            except BaseException as observation_failure:
+                failure.add_note(
+                    "checkpoint publication observation also failed: "
+                    + _safe_failure_summary(observation_failure)
+                )
+            try:
+                temporary.unlink(missing_ok=True)
+            except BaseException as cleanup_failure:
+                failure.add_note(
+                    "checkpoint temporary cleanup also failed: "
+                    + _safe_failure_summary(cleanup_failure)
+                )
+            if claims:
+                failure._artifact_publication_claims = claims
             raise
         return _artifact_publication_result(
             path,
@@ -2996,43 +4181,436 @@ class AlphaEngine:
             },
         )
 
-    def load_checkpoint(self, path: str) -> int:
-        ckpt = torch.load(path, map_location=ModelConfig.DEVICE)
-
-        # ── Task 12.2：版本校验（R3.7）──────────────────────────────────────
-        # 从 checkpoint 读取 vocab_version；若字段缺失（旧版 checkpoint），视为
-        # 版本不匹配并抛错——拒绝加载、不消费任何 token。
-        artifact_version = ckpt.get("vocab_version")
-        if artifact_version is None:
-            raise VocabVersionMismatchError(
-                f"checkpoint '{path}' 不含 vocab_version 字段（旧版产物），"
-                f"当前词表版本 {FORMULA_VOCAB.version!r}；需重新训练后加载"
+    def _install_checkpoint_v2_atomically(
+        self, ckpt: dict, path: str, run_identity: TrainingRunIdentity
+    ) -> int:
+        _revalidate_run_identity(
+            self, run_identity, "load_checkpoint state validation boundary"
+        )
+        for field in (
+            "step", "factor_pool_counter", "elite_counter", "restart_count",
+            "best_update_step", "stagnation_steps", "reward_ema_step",
+            "low_entropy_streak",
+        ):
+            value = ckpt[field]
+            if type(value) is not int or value < 0:
+                raise _checkpoint_compatibility_error(
+                    field, "exact non-negative int", _safe_value_category(value)
+                )
+        for field in (
+            "factor_pool", "factor_pool_scores", "elite_pool", "elite_pool_ages",
+            "rank_monitor_history", "torch_cuda_rng_state_all",
+        ):
+            if type(ckpt[field]) is not list:
+                raise _checkpoint_compatibility_error(
+                    field, "exact list", _safe_value_category(ckpt[field])
+                )
+        for field in ("best_metrics", "best_snapshot"):
+            if ckpt[field] is not None and not isinstance(ckpt[field], dict):
+                raise _checkpoint_compatibility_error(
+                    field, "None or exact dict", _safe_value_category(ckpt[field])
+                )
+        if ckpt["best_formula"] is not None and type(ckpt["best_formula"]) is not list:
+            raise _checkpoint_compatibility_error(
+                "best_formula", "None or exact list",
+                _safe_value_category(ckpt["best_formula"]),
             )
-        # verify() 版本不匹配时抛 VocabVersionMismatchError，拒绝加载
-        FORMULA_VOCAB.verify(artifact_version)
-        # ── 版本校验通过，继续加载 ────────────────────────────────────────
+        score = ckpt["best_score"]
+        if type(score) not in (int, float) or math.isnan(float(score)):
+            raise _checkpoint_compatibility_error(
+                "best_score", "real score", _safe_value_category(score)
+            )
+        reward_ema = ckpt["reward_ema"]
+        if reward_ema is not None and (
+            type(reward_ema) not in (int, float)
+            or not math.isfinite(float(reward_ema))
+        ):
+            raise _checkpoint_compatibility_error(
+                "reward_ema", "None or finite real", _safe_value_category(reward_ema)
+            )
+        distribution = ckpt["previous_initial_distribution"]
+        if distribution is not None and type(distribution) is not torch.Tensor:
+            raise _checkpoint_compatibility_error(
+                "previous_initial_distribution", "None or exact Tensor",
+                _safe_value_category(distribution),
+            )
+        history = ckpt["training_history"]
+        if type(history) is not dict or any(
+            type(key) is not str or type(value) is not list
+            for key, value in history.items()
+        ):
+            raise _checkpoint_compatibility_error(
+                "training_history", "exact dict[str, list]",
+                _safe_value_category(history),
+            )
+        cpu_rng = ckpt["torch_cpu_rng_state"]
+        if (
+            type(cpu_rng) is not torch.Tensor or cpu_rng.dtype != torch.uint8
+            or cpu_rng.device.type != "cpu" or cpu_rng.ndim != 1
+        ):
+            raise _checkpoint_compatibility_error(
+                "torch_cpu_rng_state", "one-dimensional CPU uint8 Tensor",
+                _safe_value_category(cpu_rng),
+            )
+        cuda_rng = ckpt["torch_cuda_rng_state_all"]
+        if not torch.cuda.is_available() and cuda_rng:
+            raise _checkpoint_compatibility_error(
+                "torch_cuda_rng_state_all", "empty list without CUDA", "non-empty-list"
+            )
+        if torch.cuda.is_available() and (
+            len(cuda_rng) != torch.cuda.device_count()
+            or any(type(value) is not torch.Tensor or value.dtype != torch.uint8
+                   or value.ndim != 1 for value in cuda_rng)
+        ):
+            raise _checkpoint_compatibility_error(
+                "torch_cuda_rng_state_all", "one uint8 RNG Tensor per CUDA device",
+                "invalid-list",
+            )
 
-        self.model.load_state_dict(ckpt["model_state_dict"])
-        self.opt.load_state_dict(ckpt["optimizer_state_dict"])
-        self.best_score          = ckpt.get("best_score",  -float('inf'))
-        self.best_formula        = ckpt.get("best_formula", None)
-        self._best_snapshot      = ckpt.get("best_snapshot", None)
-        self.factor_pool         = ckpt.get("factor_pool", [])
-        self._factor_pool_counter = ckpt.get("factor_pool_counter", 0)
-        self._elite_pool         = ckpt.get("elite_pool", [])
-        self._elite_counter      = ckpt.get("elite_counter", 0)
-        self._restart_count      = ckpt.get("restart_count", 0)
-        for k, v in ckpt.get("training_history", {}).items():
-            self.training_history[k] = v
+        validation_field = "python_random_state"
+        try:
+            random.Random().setstate(ckpt["python_random_state"])
+            validation_field = "numpy_random_state"
+            np.random.RandomState().set_state(ckpt["numpy_random_state"])
+            validation_field = "torch_cpu_rng_state"
+            torch.Generator(device="cpu").set_state(cpu_rng)
+            decoded = ckpt
+        except Exception as exc:
+            raise _checkpoint_compatibility_error(
+                validation_field, "valid restorable state",
+                _safe_exception_category(exc), cause=exc,
+            )
 
-        # 清理 elite pool 中的重复条目（保留各公式的最高分版本）
-        self._elite_pool = self._dedup_elite_pool(self._elite_pool)
+        field_names = (
+            "best_score", "best_formula", "best_metrics", "_best_snapshot",
+            "factor_pool", "factor_pool_scores", "_factor_pool_counter",
+            "_elite_pool", "elite_pool_ages", "_elite_counter", "_restart_count",
+            "_best_update_step", "_stagnation_steps", "_reward_ema",
+            "_reward_ema_step", "_low_entropy_streak",
+            "_previous_initial_distribution", "training_history",
+        )
+        _preflight_true_transaction_snapshot(self)
+        _revalidate_run_identity(
+            self, run_identity, "load_checkpoint exact graph preflight"
+        )
+        attributes = object.__getattribute__(self, "__dict__")
+        parameters, buffers = _raw_module_state_targets(self.model)
+        before = {
+            "optimizer_object": self.opt,
+            "optimizer_state": self.opt.state,
+            "optimizer_param_groups": self.opt.param_groups,
+            "fields": {name: attributes[name] for name in field_names},
+            "rank_monitor": attributes.get("rank_monitor"),
+            "rank": (
+                attributes["rank_monitor"].history
+                if attributes.get("rank_monitor") is not None else None
+            ),
+            "python": random.getstate(), "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state().clone(),
+            "cuda": ([state.clone() for state in torch.cuda.get_rng_state_all()]
+                     if torch.cuda.is_available() else []),
+            "model_values": [
+                (parameter, parameter.detach().clone()) for parameter in parameters
+            ],
+            "buffer_values": [
+                (buffer, buffer.detach().clone()) for buffer in buffers
+            ],
+            "gradients": [(parameter, parameter.grad) for parameter in parameters],
+            "containers": [], "tensor_values": [], "array_values": [],
+        }
+        graph_seen: set[int] = set()
+        for value in (
+            before["optimizer_state"], before["optimizer_param_groups"],
+            *before["fields"].values(), before["rank"],
+            *(gradient for _parameter, gradient in before["gradients"]),
+        ):
+            _capture_exact_object_graph(
+                value, graph_seen, before["containers"],
+                before["tensor_values"], before["array_values"],
+            )
+        _revalidate_run_identity(
+            self, run_identity, "load_checkpoint exact graph snapshot callback"
+        )
+        restore_field = "model_state_dict"
+        try:
+            self.model.load_state_dict(decoded["model_state_dict"])
+            _revalidate_run_identity(
+                self, run_identity, "load_checkpoint model restore callback"
+            )
+            if decoded["best_snapshot"] is not None:
+                restore_field = "best_snapshot"
+                self.model.load_state_dict(decoded["best_snapshot"])
+                _revalidate_run_identity(
+                    self, run_identity,
+                    "load_checkpoint best snapshot validation callback",
+                )
+                restore_field = "model_state_dict"
+                self.model.load_state_dict(decoded["model_state_dict"])
+                _revalidate_run_identity(
+                    self, run_identity,
+                    "load_checkpoint model reinstallation callback",
+                )
+            restore_field = "optimizer_state_dict"
+            self.opt.load_state_dict(decoded["optimizer_state_dict"])
+            _revalidate_run_identity(
+                self, run_identity, "load_checkpoint optimizer restore callback"
+            )
+            restore_field = "checkpoint_tensor_devices"
+            model_device = (
+                parameters[0].device
+                if parameters else buffers[0].device
+                if buffers else torch.device("cpu")
+            )
+            migration_memo = {}
+            migrated_factor_pool = _move_checkpoint_tensor_graph(
+                decoded["factor_pool"], model_device, migration_memo
+            )
+            migrated_distribution = _move_checkpoint_tensor_graph(
+                decoded["previous_initial_distribution"],
+                model_device, migration_memo,
+            )
+            for parameter, state in self.opt.state.items():
+                for key, value in tuple(state.items()):
+                    state[key] = _move_checkpoint_tensor_graph(
+                        value, parameter.device, migration_memo
+                    )
+            _revalidate_run_identity(
+                self, run_identity,
+                "load_checkpoint tensor device migration callback",
+            )
+            assignments = {
+                "best_score": "best_score", "best_formula": "best_formula",
+                "best_metrics": "best_metrics", "_best_snapshot": "best_snapshot",
+                "factor_pool": "factor_pool", "factor_pool_scores": "factor_pool_scores",
+                "_factor_pool_counter": "factor_pool_counter", "_elite_pool": "elite_pool",
+                "elite_pool_ages": "elite_pool_ages", "_elite_counter": "elite_counter",
+                "_restart_count": "restart_count", "_best_update_step": "best_update_step",
+                "_stagnation_steps": "stagnation_steps", "_reward_ema": "reward_ema",
+                "_reward_ema_step": "reward_ema_step",
+                "_low_entropy_streak": "low_entropy_streak",
+                "_previous_initial_distribution": "previous_initial_distribution",
+                "training_history": "training_history",
+            }
+            restore_field = "checkpoint_fields"
+            for attribute, field in assignments.items():
+                value = (
+                    migrated_factor_pool if field == "factor_pool"
+                    else migrated_distribution
+                    if field == "previous_initial_distribution"
+                    else decoded[field]
+                )
+                setattr(self, attribute, value)
+            if self.rank_monitor is not None:
+                self.rank_monitor.history = decoded["rank_monitor_history"]
+            restore_field = "python_random_state"
+            random.setstate(decoded["python_random_state"])
+            restore_field = "numpy_random_state"
+            np.random.set_state(decoded["numpy_random_state"])
+            restore_field = "torch_cpu_rng_state"
+            torch.set_rng_state(decoded["torch_cpu_rng_state"])
+            if torch.cuda.is_available():
+                restore_field = "torch_cuda_rng_state_all"
+                torch.cuda.set_rng_state_all(decoded["torch_cuda_rng_state_all"])
+            _revalidate_run_identity(
+                self, run_identity, "load_checkpoint state commit boundary"
+            )
+        except BaseException as failure:
+            rollback_failures: list[str] = []
 
-        completed = ckpt.get("step", 0)
-        tqdm.write(f"[检查点] 已从 {path} 恢复。"
-                   f" 当前步={completed}  最优={self.best_score:.4f}"
-                   f"  精英池={len(self._elite_pool)}（去重后）")
-        return completed
+            def rollback(label: str, operation) -> None:
+                try:
+                    operation()
+                except BaseException:
+                    rollback_failures.append(label)
+
+            def restore_values() -> None:
+                with torch.no_grad():
+                    for target, value in before["model_values"]:
+                        target.copy_(value)
+                    for target, value in before["buffer_values"]:
+                        target.copy_(value)
+                    for target, value in before["tensor_values"]:
+                        target.copy_(value)
+                for target, value in before["array_values"]:
+                    np.copyto(target, value)
+
+            rollback("values", restore_values)
+            rollback(
+                "object_graph",
+                lambda: _restore_exact_object_graph(before["containers"]),
+            )
+
+            def restore_optimizer() -> None:
+                self.opt = before["optimizer_object"]
+                self.opt.state = before["optimizer_state"]
+                self.opt.param_groups = before["optimizer_param_groups"]
+
+            rollback("optimizer", restore_optimizer)
+
+            def restore_gradients() -> None:
+                for parameter, gradient in before["gradients"]:
+                    parameter.grad = gradient
+
+            rollback("gradients", restore_gradients)
+
+            def restore_fields() -> None:
+                for name, value in before["fields"].items():
+                    setattr(self, name, value)
+
+            rollback("fields", restore_fields)
+            self.rank_monitor = before["rank_monitor"]
+            if before["rank_monitor"] is not None:
+                rollback(
+                    "rank_monitor",
+                    lambda: setattr(
+                        before["rank_monitor"], "history", before["rank"]
+                    ),
+                )
+            rollback("python_rng", lambda: random.setstate(before["python"]))
+            rollback("numpy_rng", lambda: np.random.set_state(before["numpy"]))
+            rollback("torch_cpu_rng", lambda: torch.set_rng_state(before["torch"]))
+            if torch.cuda.is_available():
+                rollback(
+                    "torch_cuda_rng",
+                    lambda: torch.cuda.set_rng_state_all(before["cuda"]),
+                )
+            if rollback_failures:
+                BaseException.add_note(
+                    failure,
+                    "checkpoint rollback incomplete: "
+                    + ",".join(rollback_failures),
+                )
+            if isinstance(failure, Exception):
+                raise _checkpoint_compatibility_error(
+                    restore_field, "atomic restorable checkpoint state",
+                    _safe_exception_category(failure), cause=failure,
+                )
+            raise
+        completed = decoded["step"]
+        tqdm.write(
+            f"[checkpoint] restored {path}; step={completed} "
+            f"best={self.best_score:.4f} elite_pool={len(self._elite_pool)}"
+        )
+        return completed + 1
+
+    def load_checkpoint(self, path: str) -> int:
+        run_identity = _validated_run_identity(self, "load_checkpoint")
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            try:
+                _revalidate_run_identity(
+                    self, run_identity, "load_checkpoint deserialize callback"
+                )
+            except ArtifactCompatibilityError as identity_failure:
+                raise identity_failure from exc
+            raise _checkpoint_compatibility_error(
+                "checkpoint_deserialize", "readable checkpoint-v2",
+                _safe_exception_category(exc), cause=exc,
+            )
+        _revalidate_run_identity(
+            self, run_identity, "load_checkpoint deserialize callback"
+        )
+
+        required = {
+            "checkpoint_schema_version", "run_identity", "step",
+            "model_state_dict", "optimizer_state_dict", "best_score",
+            "best_formula", "best_metrics", "best_snapshot", "factor_pool",
+            "factor_pool_scores", "factor_pool_counter", "elite_pool",
+            "elite_pool_ages", "elite_counter", "restart_count",
+            "best_update_step", "stagnation_steps", "reward_ema",
+            "reward_ema_step", "low_entropy_streak",
+            "previous_initial_distribution", "training_history",
+            "rank_monitor_history", "python_random_state", "numpy_random_state",
+            "torch_cpu_rng_state", "torch_cuda_rng_state_all",
+        }
+        if type(ckpt) is not dict:
+            raise ArtifactCompatibilityError(
+                "checkpoint payload mismatch: expected=dict actual=non-dict"
+            )
+        if set(ckpt) != required:
+            raise ArtifactCompatibilityError(
+                "checkpoint fields mismatch: "
+                f"expected={sorted(required)!r} actual={sorted(ckpt)!r}"
+            )
+        if ckpt["checkpoint_schema_version"] != "checkpoint-v2":
+            raise ArtifactCompatibilityError(
+                "checkpoint_schema_version mismatch: expected='checkpoint-v2' "
+                f"actual={ckpt['checkpoint_schema_version']!r}"
+            )
+        raw_run_identity = ckpt["run_identity"]
+        raw_artifact_identity = (
+            raw_run_identity.get("artifact_identity")
+            if type(raw_run_identity) is dict else None
+        )
+        if type(raw_artifact_identity) is dict:
+            for field, expected in (
+                ("vocab_version", run_identity.artifact_identity.vocab_version),
+                (
+                    "core_semantics_version",
+                    run_identity.artifact_identity.core_semantics_version,
+                ),
+            ):
+                actual = raw_artifact_identity.get(field, _MISSING_RUN_IDENTITY)
+                if actual != expected:
+                    raise _checkpoint_compatibility_error(
+                        field, repr(expected), _safe_value_category(actual)
+                    )
+        try:
+            actual_identity = TrainingRunIdentity.from_dict(ckpt["run_identity"])
+        except Exception as exc:
+            raise _checkpoint_compatibility_error(
+                "run_identity", "complete valid checkpoint identity",
+                _safe_exception_category(exc), cause=exc,
+            )
+        _revalidate_run_identity(
+            self, run_identity, "load_checkpoint identity deserialization callback"
+        )
+        expected_artifact = run_identity.artifact_identity
+        actual_artifact = actual_identity.artifact_identity
+        identity_fields = (
+            ("symbol", expected_artifact.symbol, actual_artifact.symbol),
+            ("timeframe", expected_artifact.timeframe, actual_artifact.timeframe),
+            (
+                "data_fingerprint",
+                expected_artifact.training_dataset.data_fingerprint,
+                actual_artifact.training_dataset.data_fingerprint,
+            ),
+            (
+                "training_config_hash",
+                expected_artifact.training_config_hash,
+                actual_artifact.training_config_hash,
+            ),
+            (
+                "vocab_version",
+                expected_artifact.vocab_version,
+                actual_artifact.vocab_version,
+            ),
+            (
+                "core_semantics_version",
+                expected_artifact.core_semantics_version,
+                actual_artifact.core_semantics_version,
+            ),
+        )
+        for field, expected, actual in identity_fields:
+            if expected != actual:
+                raise ArtifactCompatibilityError(
+                    f"{field} mismatch: expected={expected!r} actual={actual!r}"
+                )
+        verify_artifact_identity(
+            expected_artifact,
+            actual_artifact,
+        )
+        if run_identity.run_id != actual_identity.run_id:
+            raise ArtifactCompatibilityError(
+                "run_id mismatch: "
+                f"expected={run_identity.run_id!r} actual={actual_identity.run_id!r}"
+            )
+
+        _revalidate_run_identity(
+            self, run_identity, "load_checkpoint state installation boundary"
+        )
+        return self._install_checkpoint_v2_atomically(ckpt, path, run_identity)
 
     # ── Decode formula tokens to readable string ──────────────────────────────
 
