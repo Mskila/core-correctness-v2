@@ -901,7 +901,9 @@ def _snapshot_dataset_identity_payload(
     for field in _DATASET_IDENTITY_FIELDS:
         try:
             payload[field] = getattr(value, field)
-        except RuntimeError as exc:
+        except Exception as exc:
+            if isinstance(exc, AssertionError):
+                raise
             raise ArtifactCompatibilityError(
                 _bounded_public_message(
                     f"{context} attribute access failed: field={field} "
@@ -2041,6 +2043,14 @@ class BacktestMode(str, Enum):
     OUT_OF_SAMPLE_BACKTEST = "out_of_sample_backtest"
 
 
+@dataclass(frozen=True)
+class _DatasetIdentityDiagnosticSnapshot:
+    start_time_ns: object
+    end_time_ns: object
+    data_fingerprint: object
+    time_fingerprint: object
+
+
 def _backtest_context(
     *,
     mode: object,
@@ -2120,24 +2130,24 @@ def validate_backtest_dataset(
                 f"{_safe_diagnostic_text(exc)}",
                 cause=_safe_exception_cause(exc),
             )
-        raw_snapshot = DatasetIdentity(
-            schema_version=payload["schema_version"],  # type: ignore[arg-type]
-            symbol=payload["symbol"],  # type: ignore[arg-type]
-            timeframe=payload["timeframe"],  # type: ignore[arg-type]
-            start_time_ns=payload["start_time_ns"],  # type: ignore[arg-type]
-            end_time_ns=payload["end_time_ns"],  # type: ignore[arg-type]
-            bars=payload["bars"],  # type: ignore[arg-type]
-            data_fingerprint=payload["data_fingerprint"],  # type: ignore[arg-type]
-            time_fingerprint=payload["time_fingerprint"],  # type: ignore[arg-type]
+        diagnostic_snapshot = _DatasetIdentityDiagnosticSnapshot(
+            start_time_ns=payload["start_time_ns"],
+            end_time_ns=payload["end_time_ns"],
+            data_fingerprint=payload["data_fingerprint"],
+            time_fingerprint=payload["time_fingerprint"],
         )
         if label == "test":
             context = _backtest_context(
                 mode=mode,
                 train=safe_raw_train,
-                test=raw_snapshot,
+                test=diagnostic_snapshot,
             )
         else:
-            context = _backtest_context(mode=mode, train=raw_snapshot, test=test_identity)
+            context = _backtest_context(
+                mode=mode,
+                train=diagnostic_snapshot,
+                test=test_identity,
+            )
         try:
             return _dataset_identity_from_payload(
                 payload,

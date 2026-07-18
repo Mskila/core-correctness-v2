@@ -68,6 +68,21 @@ DATASET_FIELDS = (
 )
 
 
+def bypass_dataset_identity(
+    source: DatasetIdentity | None = None,
+    **changes: object,
+) -> DatasetIdentity:
+    """Build an isolated hostile identity without invoking T01 validation."""
+    valid_source = dataset_identity() if source is None else source
+    unknown = set(changes).difference(DATASET_FIELDS)
+    assert not unknown, f"unknown DatasetIdentity fields: {sorted(unknown)}"
+    hostile = object.__new__(DatasetIdentity)
+    for field in DATASET_FIELDS:
+        value = changes[field] if field in changes else getattr(valid_source, field)
+        object.__setattr__(hostile, field, value)
+    return hostile
+
+
 def instrumented_dataset_identity(
     *,
     failing_field: str | None = None,
@@ -311,25 +326,31 @@ def mutate_artifact_identity(identity: ArtifactIdentity, mutation: str) -> None:
         object.__setattr__(
             identity,
             "training_dataset",
-            replace(identity.training_dataset, data_fingerprint="short"),
+            bypass_dataset_identity(
+                identity.training_dataset,
+                data_fingerprint="short",
+            ),
         )
     elif mutation == "dataset_time_fingerprint":
         object.__setattr__(
             identity,
             "training_dataset",
-            replace(identity.training_dataset, time_fingerprint="G" * 64),
+            bypass_dataset_identity(
+                identity.training_dataset,
+                time_fingerprint="G" * 64,
+            ),
         )
     elif mutation == "dataset_range":
         object.__setattr__(
             identity,
             "training_dataset",
-            replace(identity.training_dataset, start_time_ns=10_000),
+            bypass_dataset_identity(identity.training_dataset, start_time_ns=10_000),
         )
     elif mutation == "dataset_bars":
         object.__setattr__(
             identity,
             "training_dataset",
-            replace(identity.training_dataset, bars=True),
+            bypass_dataset_identity(identity.training_dataset, bars=True),
         )
     else:
         raise AssertionError(f"unknown identity mutation: {mutation}")
@@ -1414,7 +1435,7 @@ def test_artifact_diagnostics_do_not_render_unknown_objects_and_are_bounded(
 
 
 def test_oversized_primitive_string_diagnostic_is_bounded() -> None:
-    source = dataset_identity(data_fingerprint="x" * 2_000_000)
+    source = bypass_dataset_identity(data_fingerprint="x" * 2_000_000)
     config = training_config()
     with pytest.raises(ArtifactCompatibilityError) as exc_info:
         ArtifactIdentity(
@@ -1660,7 +1681,10 @@ def test_filename_revalidates_internal_dataset_fingerprint() -> None:
     object.__setattr__(
         run.artifact_identity,
         "training_dataset",
-        replace(run.artifact_identity.training_dataset, data_fingerprint="short"),
+        bypass_dataset_identity(
+            run.artifact_identity.training_dataset,
+            data_fingerprint="short",
+        ),
     )
     with pytest.raises(ArtifactCompatibilityError, match="data_fingerprint"):
         run.checkpoint_filename(1)
@@ -3375,7 +3399,10 @@ def test_identity_non_loader_boundaries_reject_scalar_string_subclasses(
         object.__setattr__(
             candidate,
             "training_dataset",
-            replace(candidate.training_dataset, symbol=ExactKeyString("EURUSD")),
+            bypass_dataset_identity(
+                candidate.training_dataset,
+                symbol=ExactKeyString("EURUSD"),
+            ),
         )
     else:
         object.__setattr__(candidate, "symbol", ExactKeyString("EURUSD"))
@@ -3390,7 +3417,7 @@ def test_identity_non_loader_boundaries_reject_scalar_string_subclasses(
                 symbol=ExactKeyString("EURUSD") if not nested_dataset else "EURUSD",
                 timeframe="H1",
                 training_dataset=(
-                    replace(dataset_identity(), symbol=ExactKeyString("EURUSD"))
+                    bypass_dataset_identity(symbol=ExactKeyString("EURUSD"))
                     if nested_dataset
                     else dataset_identity()
                 ),
@@ -3627,7 +3654,10 @@ def test_identity_non_token_integers_reject_hostile_metaclass_without_protocols(
                 symbol=base.symbol,
                 timeframe=base.timeframe,
                 training_dataset=(
-                    replace(base.training_dataset, start_time_ns=hostile)
+                    bypass_dataset_identity(
+                        base.training_dataset,
+                        start_time_ns=hostile,
+                    )
                     if location.startswith("training_dataset")
                     else base.training_dataset
                 ),
@@ -3642,7 +3672,10 @@ def test_identity_non_token_integers_reject_hostile_metaclass_without_protocols(
             object.__setattr__(
                 candidate,
                 "training_dataset",
-                replace(candidate.training_dataset, start_time_ns=hostile),
+                bypass_dataset_identity(
+                    candidate.training_dataset,
+                    start_time_ns=hostile,
+                ),
             )
         else:
             config = candidate.to_dict()["training_config"]
