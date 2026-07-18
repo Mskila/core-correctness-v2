@@ -66,6 +66,34 @@ class BacktestHostileMetaInteger(int, metaclass=BacktestHostileIntegerMeta):
     pass
 
 
+BACKTEST_HOSTILE_GETTER_EXCEPTION_CALLS = {"name": 0, "repr": 0, "str": 0}
+
+
+class BacktestHostileGetterExceptionMeta(type):
+    def __getattribute__(cls, name: str) -> object:
+        if name == "__name__":
+            BACKTEST_HOSTILE_GETTER_EXCEPTION_CALLS["name"] += 1
+            raise AssertionError("HOSTILE_EXCEPTION_CLASS_NAME")
+        return super().__getattribute__(name)
+
+
+class BacktestHostileGetterError(
+    Exception,
+    metaclass=BacktestHostileGetterExceptionMeta,
+):
+    def __repr__(self) -> str:
+        BACKTEST_HOSTILE_GETTER_EXCEPTION_CALLS["repr"] += 1
+        raise AssertionError("HOSTILE_EXCEPTION_REPR")
+
+    def __str__(self) -> str:
+        BACKTEST_HOSTILE_GETTER_EXCEPTION_CALLS["str"] += 1
+        raise AssertionError("HOSTILE_EXCEPTION_STR")
+
+
+class BacktestCustomGetterBaseException(BaseException):
+    pass
+
+
 BACKTEST_HOSTILE_NUMERIC_CALLS = {
     "name": 0,
     "repr": 0,
@@ -198,7 +226,39 @@ def dataset(
     )
 
 
-def hostile_dataset(field: str, **overrides: object) -> DatasetIdentity:
+DATASET_FIELDS = (
+    "schema_version",
+    "symbol",
+    "timeframe",
+    "start_time_ns",
+    "end_time_ns",
+    "bars",
+    "data_fingerprint",
+    "time_fingerprint",
+)
+
+
+def bypass_dataset_identity(
+    source: DatasetIdentity | None = None,
+    **changes: object,
+) -> DatasetIdentity:
+    """Build an isolated hostile identity without invoking T01 validation."""
+    valid_source = dataset() if source is None else source
+    unknown = set(changes).difference(DATASET_FIELDS)
+    assert not unknown, f"unknown DatasetIdentity fields: {sorted(unknown)}"
+    hostile = object.__new__(DatasetIdentity)
+    for field in DATASET_FIELDS:
+        value = changes[field] if field in changes else getattr(valid_source, field)
+        object.__setattr__(hostile, field, value)
+    return hostile
+
+
+def hostile_dataset(
+    field: str,
+    *,
+    failure: BaseException | None = None,
+    **overrides: object,
+) -> DatasetIdentity:
     values: dict[str, object] = {
         "schema_version": "ohlcv-v2",
         "symbol": "EURUSD",
@@ -214,7 +274,12 @@ def hostile_dataset(field: str, **overrides: object) -> DatasetIdentity:
     class HostileDatasetIdentity(DatasetIdentity):
         def __getattribute__(self, name: str) -> object:
             if name == field:
-                raise RuntimeError(f"hostile attribute access: {field}")
+                actual_failure = (
+                    failure
+                    if failure is not None
+                    else RuntimeError(f"hostile attribute access: {field}")
+                )
+                raise actual_failure
             return super().__getattribute__(name)
 
     return HostileDatasetIdentity(**values)  # type: ignore[arg-type]
@@ -786,11 +851,11 @@ def test_mode_must_be_explicit_enum() -> None:
 @pytest.mark.parametrize(
     "malformed",
     [
-        dataset(bars=True),
-        dataset(bars=-1),
-        dataset(start=20_000, end=10_000),
-        dataset(data_fp="short"),
-        dataset(time_fp="G" * 64),
+        bypass_dataset_identity(bars=True),
+        bypass_dataset_identity(bars=-1),
+        bypass_dataset_identity(start_time_ns=20_000, end_time_ns=10_000),
+        bypass_dataset_identity(data_fingerprint="short"),
+        bypass_dataset_identity(time_fingerprint="G" * 64),
     ],
 )
 def test_backtest_rejects_directly_constructed_malformed_test_identity(
@@ -802,7 +867,7 @@ def test_backtest_rejects_directly_constructed_malformed_test_identity(
 
 def test_backtest_rejects_directly_constructed_malformed_training_identity() -> None:
     artifact = strategy()
-    malformed = replace(
+    malformed = bypass_dataset_identity(
         artifact.run_identity.artifact_identity.training_dataset,
         data_fingerprint="short",
     )
@@ -869,6 +934,88 @@ def test_hostile_test_dataset_attribute_access_is_a_mode_error(field: str) -> No
     assert "mode=in_sample_replay" in message
     assert f"field={field}" in message
     assert "test_range=" in message
+
+
+@pytest.mark.parametrize("label", ["test", "training"])
+@pytest.mark.parametrize(
+    "exception_type",
+    [ValueError, TypeError, KeyError, BacktestHostileGetterError],
+    ids=["value", "type", "key", "custom-hostile"],
+)
+def test_dataset_getter_ordinary_exceptions_are_bounded_mode_errors(
+    label: str,
+    exception_type: type[Exception],
+) -> None:
+    for key in BACKTEST_HOSTILE_GETTER_EXCEPTION_CALLS:
+        BACKTEST_HOSTILE_GETTER_EXCEPTION_CALLS[key] = 0
+    failure = exception_type("getter failure")
+    malformed = hostile_dataset("bars", failure=failure)
+    artifact = strategy()
+    test_identity = dataset()
+    if label == "test":
+        test_identity = malformed
+    else:
+        object.__setattr__(
+            artifact.run_identity.artifact_identity,
+            "training_dataset",
+            malformed,
+        )
+
+    with pytest.raises(BacktestModeError) as exc_info:
+        validate_backtest_dataset(
+            artifact,
+            test_identity,
+            BacktestMode.IN_SAMPLE_REPLAY,
+        )
+
+    message = str(exc_info.value)
+    assert f"invalid {label} dataset identity" in message
+    assert f"{label}_dataset attribute access failed: field=bars" in message
+    assert len(message) <= 1_024
+    assert exc_info.value.__cause__ is failure
+    assert BACKTEST_HOSTILE_GETTER_EXCEPTION_CALLS == {
+        "name": 0,
+        "repr": 0,
+        "str": 0,
+    }
+
+
+@pytest.mark.parametrize("label", ["test", "training"])
+@pytest.mark.parametrize(
+    "exception_type",
+    [
+        KeyboardInterrupt,
+        SystemExit,
+        GeneratorExit,
+        BacktestCustomGetterBaseException,
+    ],
+    ids=["keyboard-interrupt", "system-exit", "generator-exit", "custom-base"],
+)
+def test_dataset_getter_base_exceptions_propagate_by_exact_identity(
+    label: str,
+    exception_type: type[BaseException],
+) -> None:
+    failure = exception_type("getter base failure")
+    malformed = hostile_dataset("bars", failure=failure)
+    artifact = strategy()
+    test_identity = dataset()
+    if label == "test":
+        test_identity = malformed
+    else:
+        object.__setattr__(
+            artifact.run_identity.artifact_identity,
+            "training_dataset",
+            malformed,
+        )
+
+    with pytest.raises(exception_type) as exc_info:
+        validate_backtest_dataset(
+            artifact,
+            test_identity,
+            BacktestMode.IN_SAMPLE_REPLAY,
+        )
+
+    assert exc_info.value is failure
 
 
 @pytest.mark.parametrize("render_mode", ["oversized", "throwing"])
@@ -1116,7 +1263,10 @@ def test_backtest_revalidation_rejects_scalar_string_subclasses(
         object.__setattr__(
             identity,
             "training_dataset",
-            replace(identity.training_dataset, symbol=StringSubclass("EURUSD")),
+            bypass_dataset_identity(
+                identity.training_dataset,
+                symbol=StringSubclass("EURUSD"),
+            ),
         )
     else:
         object.__setattr__(identity, "symbol", StringSubclass("EURUSD"))
@@ -1193,7 +1343,10 @@ def test_backtest_maps_non_token_hostile_integer_state_without_protocols(
             object.__setattr__(
                 identity,
                 "training_dataset",
-                replace(identity.training_dataset, start_time_ns=hostile),
+                bypass_dataset_identity(
+                    identity.training_dataset,
+                    start_time_ns=hostile,
+                ),
             )
         else:
             config = dict(identity.training_config)
@@ -1262,7 +1415,7 @@ def test_backtest_maps_huge_exact_integer_to_bounded_domain_error(
         object.__setattr__(
             identity,
             "training_dataset",
-            replace(identity.training_dataset, start_time_ns=huge),
+            bypass_dataset_identity(identity.training_dataset, start_time_ns=huge),
         )
     else:
         object.__setattr__(artifact, "best_score", huge)
