@@ -8,7 +8,7 @@ import torch
 
 import model_core.backtest as backtest_module
 from model_core.backtest import MT5Backtest, compute_ic_metrics
-from model_core.execution import ExecutionResult, performance_metrics
+from model_core.execution import ExecutionResult, build_execution_ledger, performance_metrics
 from model_core.semantics import DataValidationError
 from model_core.walk_forward import build_walk_forward_folds
 
@@ -24,6 +24,77 @@ def segment_inputs(length: int = 12):
         * 1_000_000_000
     )
     return factors, target_ret, target_valid, bar_time_ns
+
+
+def test_backtest_fold_consumes_promoted_execution_ledger_without_dtype_drift() -> None:
+    factors = torch.tensor(
+        [[
+            0.1,
+            0.2,
+            0.3,
+            0.4,
+            0.4000001,
+            0.4000002,
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+            0.0,
+            0.0,
+        ]],
+        dtype=torch.float32,
+    )
+    target_ret = torch.tensor(
+        [[
+            -0.002,
+            0.001,
+            -0.0015,
+            0.0012,
+            -0.001,
+            0.001,
+            -0.002,
+            0.001,
+            -0.001,
+            0.002,
+            0.0,
+            0.0,
+        ]],
+        dtype=torch.float32,
+    )
+    target_valid = torch.ones_like(factors, dtype=torch.bool)
+    target_valid[:, -2:] = False
+    bar_time_ns = (
+        torch.arange(12, dtype=torch.int64).unsqueeze(0)
+        * 3_600
+        * 1_000_000_000
+    )
+    backtest = MT5Backtest(cost_rate=1.0e-4)
+
+    train_score, val_score = backtest.evaluate_fold(
+        factors=factors,
+        target_ret=target_ret,
+        target_valid=target_valid,
+        bar_time_ns=bar_time_ns,
+        train_start=0,
+        train_end=4,
+        val_start=5,
+        val_end=9,
+    )
+    validation = backtest._run_execution(
+        factors[:, 5:12],
+        target_ret[:, 5:12],
+        target_valid[:, 5:12],
+        bar_time_ns[:, 5:12],
+    )
+    ledger = build_execution_ledger(validation, ["EURUSD"])
+
+    assert train_score.dtype is torch.float64
+    assert val_score.dtype is torch.float64
+    assert validation.position.dtype is torch.float32
+    assert validation.net_pnl.dtype is torch.float64
+    assert sum(row.net_pnl for row in ledger) == pytest.approx(
+        validation.net_pnl.sum().item(), abs=1.0e-12
+    )
 
 
 def test_constructor_has_no_fixed_periods_per_year() -> None:
@@ -501,7 +572,10 @@ def test_evaluate_fold_executes_train_and_validation_slices_independently(
         valid_count = int(result.target_valid.sum().item())
         torch.testing.assert_close(
             result.final_liquidation_cost,
-            result.position[:, valid_count - 1].abs() * 0.01,
+            result.position[:, valid_count - 1]
+            .abs()
+            .to(result.final_liquidation_cost.dtype)
+            * 0.01,
         )
     assert torch.isfinite(train_score)
     assert torch.isfinite(val_score)

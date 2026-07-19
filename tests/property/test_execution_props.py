@@ -117,7 +117,10 @@ def _assert_execution_properties(
     )
     torch.testing.assert_close(
         result.final_liquidation_cost,
-        result.position[:, valid_count - 1].abs() * cost_rate,
+        result.position[:, valid_count - 1]
+        .abs()
+        .to(result.final_liquidation_cost.dtype)
+        * cost_rate,
     )
 
     ledger = build_execution_ledger(result, ["EURUSD"])
@@ -184,4 +187,45 @@ def test_execution_cost_liquidation_ledger_and_cost_monotonicity(
     assert (
         higher_cost.net_pnl.sum().item()
         <= base.net_pnl.sum().item() + 1e-6
+    )
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_deterministic_smooth_float32_paths_preserve_every_nonzero_cost(
+    seed: int,
+) -> None:
+    generator = torch.Generator().manual_seed(seed)
+    increments = torch.rand(64, generator=generator, dtype=torch.float32) * 2.0e-7
+    factors = (0.4 + increments.cumsum(0)).unsqueeze(0)
+    returns = (
+        0.001
+        + torch.rand(64, generator=generator, dtype=torch.float32) * 2.0e-4
+    ).unsqueeze(0)
+    valid = torch.ones_like(factors, dtype=torch.bool)
+    valid[:, -2:] = False
+    times = (
+        torch.arange(64, dtype=torch.int64).unsqueeze(0)
+        * 3_600
+        * 1_000_000_000
+    )
+
+    result = run_execution(
+        factors=factors,
+        target_ret=returns,
+        target_valid=valid,
+        bar_time_ns=times,
+        cost_rate=1.0e-4,
+        min_exposure=0.0,
+    )
+
+    assert result.gross_pnl.dtype is torch.float64
+    assert result.cost.dtype is torch.float64
+    assert result.net_pnl.dtype is torch.float64
+    nonzero_turnover = result.turnover[valid] != 0
+    assert bool((result.cost[valid][nonzero_turnover] > 0).all())
+    torch.testing.assert_close(
+        result.gross_pnl[valid] - result.cost[valid],
+        result.net_pnl[valid],
+        rtol=0.0,
+        atol=0.0,
     )

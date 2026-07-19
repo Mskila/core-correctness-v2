@@ -26,6 +26,7 @@ from torch import nn
 import model_core.engine as engine_module
 import model_core.backtest as backtest_module
 from model_core.backtest import MT5Backtest
+from model_core.execution import run_execution
 from model_core.artifacts import TrainingRunIdentity
 from model_core.config import ModelConfig
 from model_core.engine import AlphaEngine
@@ -1218,6 +1219,47 @@ def _assert_no_failed_batch_side_effects(
         assert torch.equal(engine.model.state_dict()[name], expected)
     if not scoring_may_have_run:
         assert engine.bt.fold_inputs == []
+
+
+def test_float64_additive_preservation_error_propagates_transactionally(
+    monkeypatch, tmp_path
+) -> None:
+    engine, factor, calls, before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+
+    class AbsorbingBacktest:
+        def evaluate_fold(self, **_kwargs):
+            return run_execution(
+                factors=torch.tensor(
+                    [[1_000.0, 0.0, 0.0]], dtype=torch.float64
+                ),
+                target_ret=torch.tensor(
+                    [[1.0e16, 0.0, 0.0]], dtype=torch.float64
+                ),
+                target_valid=torch.tensor([[True, False, False]]),
+                bar_time_ns=torch.tensor(
+                    [[0, 3_600_000_000_000, 7_200_000_000_000]],
+                    dtype=torch.int64,
+                ),
+                cost_rate=0.25,
+                min_exposure=0.0,
+            )
+
+    engine.bt = AbsorbingBacktest()
+
+    with pytest.raises(
+        DataValidationError,
+        match="net PnL.*component.*preserv",
+    ):
+        engine.train(end_step=1, verbose_header=False)
+
+    _assert_no_failed_batch_side_effects(
+        engine,
+        calls,
+        before,
+        scoring_may_have_run=True,
+    )
 
 
 def test_training_fails_closed_on_first_vm_none_without_batch_side_effects(

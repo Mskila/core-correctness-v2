@@ -146,8 +146,131 @@ def test_factor_and_execution_support_explicit_float_dtypes(
 
     assert positions.dtype is dtype
     assert result.position.dtype is dtype
-    assert result.cost.dtype is dtype
+    expected_monetary_dtype = (
+        torch.float32 if dtype in {torch.float16, torch.bfloat16} else torch.float64
+    )
+    assert result.cost.dtype is expected_monetary_dtype
+    assert result.gross_pnl.dtype is expected_monetary_dtype
+    assert result.net_pnl.dtype is expected_monetary_dtype
     assert bool(torch.isfinite(result.net_pnl).all())
+
+
+def test_execution_preserves_adjacent_float32_cost_in_promoted_monetary_ledger() -> None:
+    factors = torch.tensor(
+        [[
+            math.atanh(0.37995398044586182),
+            0.40000590682029724,
+            0.5,
+            0.0,
+            0.0,
+        ]],
+        dtype=torch.float32,
+    )
+    target_ret = torch.tensor(
+        [[0.0, 0.0010838214075192809, 0.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+
+    result = run_execution(
+        factors=factors,
+        target_ret=target_ret,
+        target_valid=torch.tensor([[True, True, True, False, False]]),
+        bar_time_ns=_hourly_times(5),
+        cost_rate=1.0e-4,
+        min_exposure=0.0,
+    )
+
+    assert result.position.dtype is torch.float32
+    assert result.turnover.dtype is torch.float32
+    for monetary in (
+        result.gross_pnl,
+        result.cost,
+        result.net_pnl,
+        result.final_liquidation_cost,
+    ):
+        assert monetary.dtype is torch.float64
+    assert result.turnover[0, 1].item() == 2.9802322387695312e-08
+    assert result.cost[0, 1].item() > 0.0
+    assert result.net_pnl[0, 1] != result.gross_pnl[0, 1]
+    assert result.net_pnl[0, 1] == result.gross_pnl[0, 1] - result.cost[0, 1]
+
+
+def test_execution_computes_gross_by_multiplying_in_promoted_dtype() -> None:
+    factors = torch.tensor(
+        [[0.40000590682029724, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    target_ret = torch.tensor(
+        [[0.0010838214075192809, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+
+    result = run_execution(
+        factors=factors,
+        target_ret=target_ret,
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=0.0,
+        min_exposure=0.0,
+    )
+    expected = result.position.to(torch.float64) * target_ret.to(torch.float64)
+    narrowed_then_promoted = (result.position * target_ret).to(torch.float64)
+
+    assert result.gross_pnl.dtype is torch.float64
+    assert result.gross_pnl[0, 0] == expected[0, 0]
+    assert result.gross_pnl[0, 0] != narrowed_then_promoted[0, 0]
+
+
+@pytest.mark.parametrize(
+    ("dtype", "monetary_dtype"),
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float64),
+    ],
+    ids=["float16-to-float32", "bfloat16-to-float32", "float32-to-float64"],
+)
+def test_execution_publishes_promotable_monetary_fields_coherently(
+    dtype: torch.dtype,
+    monetary_dtype: torch.dtype,
+) -> None:
+    factors = torch.tensor(
+        [[0.25, 0.5, 0.0, 0.0]], dtype=dtype, requires_grad=True
+    )
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.tensor([[0.01, -0.02, 0.0, 0.0]], dtype=dtype),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=1.0e-4,
+        min_exposure=0.0,
+    )
+
+    assert result.position.dtype is dtype
+    assert result.turnover.dtype is dtype
+    assert {
+        result.gross_pnl.dtype,
+        result.cost.dtype,
+        result.net_pnl.dtype,
+        result.final_liquidation_cost.dtype,
+    } == {monetary_dtype}
+    torch.testing.assert_close(result.gross_pnl - result.cost, result.net_pnl)
+    result.net_pnl.sum().backward()
+    assert factors.grad is not None
+    assert torch.isfinite(factors.grad).all()
+    assert torch.count_nonzero(factors.grad) > 0
+
+
+def test_execution_still_rejects_genuine_float64_net_absorption() -> None:
+    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
+        run_execution(
+            factors=torch.tensor([[1_000.0, 0.0, 0.0]], dtype=torch.float64),
+            target_ret=torch.tensor([[1.0e16, 0.0, 0.0]], dtype=torch.float64),
+            target_valid=torch.tensor([[True, False, False]]),
+            bar_time_ns=_hourly_times(3),
+            cost_rate=0.25,
+            min_exposure=0.0,
+        )
 
 
 @pytest.mark.parametrize("field_name", ["factors", "target_ret"])
@@ -208,15 +331,15 @@ def test_execution_charges_entry_reversal_and_final_liquidation() -> None:
     )
     torch.testing.assert_close(
         result.gross_pnl,
-        torch.tensor([[0.05, -0.1, 0.0, 0.0]]),
+        torch.tensor([[0.05, -0.1, 0.0, 0.0]], dtype=torch.float64),
     )
     torch.testing.assert_close(
         result.cost,
-        torch.tensor([[0.05, 0.15, 0.0, 0.0]]),
+        torch.tensor([[0.05, 0.15, 0.0, 0.0]], dtype=torch.float64),
     )
     torch.testing.assert_close(
         result.net_pnl,
-        torch.tensor([[0.0, -0.25, 0.0, 0.0]]),
+        torch.tensor([[0.0, -0.25, 0.0, 0.0]], dtype=torch.float64),
     )
     assert result.final_liquidation_cost.item() == pytest.approx(0.05)
 
@@ -232,9 +355,12 @@ def test_execution_all_flat_positions_have_no_cost() -> None:
     )
 
     torch.testing.assert_close(result.turnover, torch.zeros((1, 4)))
-    torch.testing.assert_close(result.cost, torch.zeros((1, 4)))
-    torch.testing.assert_close(result.net_pnl, torch.zeros((1, 4)))
-    torch.testing.assert_close(result.final_liquidation_cost, torch.zeros(1))
+    torch.testing.assert_close(result.cost, torch.zeros_like(result.cost))
+    torch.testing.assert_close(result.net_pnl, torch.zeros_like(result.net_pnl))
+    torch.testing.assert_close(
+        result.final_liquidation_cost,
+        torch.zeros_like(result.final_liquidation_cost),
+    )
 
 
 def test_execution_charges_position_delta_for_same_direction_add() -> None:
@@ -255,7 +381,7 @@ def test_execution_charges_position_delta_for_same_direction_add() -> None:
     )
     torch.testing.assert_close(
         result.cost,
-        torch.tensor([[0.025, 0.125, 0.0, 0.0]]),
+        torch.tensor([[0.025, 0.125, 0.0, 0.0]], dtype=torch.float64),
     )
     assert result.final_liquidation_cost.item() == pytest.approx(0.075)
 
@@ -280,7 +406,7 @@ def test_execution_zeroes_every_output_at_invalid_positions() -> None:
         result.cost,
         result.net_pnl,
     ):
-        torch.testing.assert_close(value[~valid], torch.zeros(2))
+        torch.testing.assert_close(value[~valid], torch.zeros_like(value[~valid]))
 
 
 def test_execution_rejects_no_valid_labels() -> None:
@@ -358,28 +484,30 @@ def test_execution_rejects_non_prefix_valid_mask() -> None:
         )
 
 
-def test_execution_rejects_unrepresentable_finite_float16_result() -> None:
-    with pytest.raises(DataValidationError, match="execution result.*finite"):
-        run_execution(
-            factors=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float16),
-            target_ret=torch.zeros((1, 3), dtype=torch.float16),
-            target_valid=torch.tensor([[True, False, False]]),
-            bar_time_ns=_hourly_times(3),
-            cost_rate=40_000.0,
-            min_exposure=0.0,
-        )
+def test_execution_promotes_finite_float16_monetary_result() -> None:
+    result = run_execution(
+        factors=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float16),
+        target_ret=torch.zeros((1, 3), dtype=torch.float16),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=40_000.0,
+        min_exposure=0.0,
+    )
+    assert result.cost.dtype is torch.float32
+    assert torch.isfinite(result.cost).all()
 
 
-def test_execution_rejects_nonzero_float16_cost_underflow() -> None:
-    with pytest.raises(DataValidationError, match="representable.*cost"):
-        run_execution(
-            factors=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float16),
-            target_ret=torch.zeros((1, 3), dtype=torch.float16),
-            target_valid=torch.tensor([[True, False, False]]),
-            bar_time_ns=_hourly_times(3),
-            cost_rate=1e-8,
-            min_exposure=0.0,
-        )
+def test_execution_preserves_nonzero_float16_cost_in_work_dtype() -> None:
+    result = run_execution(
+        factors=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float16),
+        target_ret=torch.zeros((1, 3), dtype=torch.float16),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=1e-8,
+        min_exposure=0.0,
+    )
+    assert result.cost.dtype is torch.float32
+    assert result.cost[0, 0] > 0
 
 
 def test_execution_rejects_float64_working_cost_product_underflow() -> None:
@@ -492,32 +620,42 @@ def test_execution_rejects_absorbed_final_liquidation_component(
         dtype=dtype,
     )
 
-    with pytest.raises(DataValidationError, match="cost component.*preserv"):
-        run_execution(
-            factors=factors,
-            target_ret=torch.zeros_like(factors),
-            target_valid=torch.tensor([[True, True, False, False]]),
-            bar_time_ns=_hourly_times(4),
-            cost_rate=1.0,
-            min_exposure=0.0,
+    inputs = dict(
+        factors=factors,
+        target_ret=torch.zeros_like(factors),
+        target_valid=torch.tensor([[True, True, False, False]]),
+        bar_time_ns=_hourly_times(4),
+        cost_rate=1.0,
+        min_exposure=0.0,
+    )
+    if dtype is torch.float64:
+        with pytest.raises(DataValidationError, match="cost component.*preserv"):
+            run_execution(**inputs)
+    else:
+        result = run_execution(**inputs)
+        assert result.cost.dtype is (
+            torch.float32
+            if dtype in {torch.float16, torch.bfloat16}
+            else torch.float64
         )
 
 
-def test_execution_rejects_absorbed_component_at_later_final_index() -> None:
+def test_execution_promotes_component_at_later_final_index() -> None:
     factors = torch.tensor(
         [[0.25, 1_000.0, 1e-8, 0.0, 0.0]],
         dtype=torch.float32,
     )
 
-    with pytest.raises(DataValidationError, match="cost component.*preserv"):
-        run_execution(
-            factors=factors,
-            target_ret=torch.zeros_like(factors),
-            target_valid=torch.tensor([[True, True, True, False, False]]),
-            bar_time_ns=_hourly_times(5),
-            cost_rate=0.5,
-            min_exposure=0.0,
-        )
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.zeros_like(factors),
+        target_valid=torch.tensor([[True, True, True, False, False]]),
+        bar_time_ns=_hourly_times(5),
+        cost_rate=0.5,
+        min_exposure=0.0,
+    )
+    assert result.cost.dtype is torch.float64
+    assert result.cost[0, 2] > result.final_liquidation_cost[0]
 
 
 def test_execution_accepts_representable_small_turnover_with_large_liquidation() -> None:
@@ -536,18 +674,18 @@ def test_execution_accepts_representable_small_turnover_with_large_liquidation()
     assert result.cost[0, 1] > result.final_liquidation_cost[0]
 
 
-def test_execution_rejects_cost_absorbed_from_published_net_pnl() -> None:
+def test_execution_preserves_cost_in_promoted_net_pnl() -> None:
     factors = torch.tensor([[1_000.0, 0.0, 0.0]], dtype=torch.float32)
 
-    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
-        run_execution(
-            factors=factors,
-            target_ret=torch.tensor([[1e8, 0.0, 0.0]], dtype=torch.float32),
-            target_valid=torch.tensor([[True, False, False]]),
-            bar_time_ns=_hourly_times(3),
-            cost_rate=1e-8,
-            min_exposure=0.0,
-        )
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.tensor([[1e8, 0.0, 0.0]], dtype=torch.float32),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=1e-8,
+        min_exposure=0.0,
+    )
+    assert result.net_pnl[0, 0] != result.gross_pnl[0, 0]
 
 
 @pytest.mark.parametrize(
@@ -581,14 +719,23 @@ def test_execution_rejects_absorbed_net_component_across_domain(
     target_ret[0, final_index] = gross_sign * position_sign
     target_valid = torch.arange(time_length).unsqueeze(0) <= final_index
 
-    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
-        run_execution(
-            factors=factors,
-            target_ret=target_ret,
-            target_valid=target_valid,
-            bar_time_ns=_hourly_times(time_length),
-            cost_rate=cost_rate,
-            min_exposure=0.0,
+    inputs = dict(
+        factors=factors,
+        target_ret=target_ret,
+        target_valid=target_valid,
+        bar_time_ns=_hourly_times(time_length),
+        cost_rate=cost_rate,
+        min_exposure=0.0,
+    )
+    if dtype is torch.float64:
+        with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
+            run_execution(**inputs)
+    else:
+        result = run_execution(**inputs)
+        assert result.net_pnl.dtype is (
+            torch.float32
+            if dtype in {torch.float16, torch.bfloat16}
+            else torch.float64
         )
 
 
@@ -613,22 +760,23 @@ def test_execution_rejects_absorbed_net_component_across_domain(
     ],
     ids=["turnover-only", "liquidation-only", "both-components"],
 )
-def test_execution_rejects_absorbed_net_for_each_cost_composition(
+def test_execution_promotes_net_for_each_cost_composition(
     positions: list[float],
     valid: list[bool],
     target_ret: list[float],
 ) -> None:
     position_tensor = torch.tensor([positions], dtype=torch.float32)
 
-    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
-        run_execution(
-            factors=torch.atanh(position_tensor),
-            target_ret=torch.tensor([target_ret], dtype=torch.float32),
-            target_valid=torch.tensor([valid]),
-            bar_time_ns=_hourly_times(len(positions)),
-            cost_rate=1e-8,
-            min_exposure=0.0,
-        )
+    result = run_execution(
+        factors=torch.atanh(position_tensor),
+        target_ret=torch.tensor([target_ret], dtype=torch.float32),
+        target_valid=torch.tensor([valid]),
+        bar_time_ns=_hourly_times(len(positions)),
+        cost_rate=1e-8,
+        min_exposure=0.0,
+    )
+    assert result.net_pnl.dtype is torch.float64
+    assert bool((result.cost[result.target_valid] > 0).any())
 
 
 def test_execution_allows_exact_gross_cost_cancellation() -> None:
@@ -691,18 +839,20 @@ def test_execution_accepts_representable_net_cost_ulps(cost_ulps: float) -> None
     )
 
 
-def test_execution_rejects_absorbed_net_cost_before_gradient_is_published() -> None:
+def test_execution_promotes_net_cost_before_gradient_is_published() -> None:
     factor = torch.atanh(torch.tensor([[0.5, 0.0, 0.0]])).requires_grad_()
 
-    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
-        run_execution(
-            factors=factor,
-            target_ret=torch.tensor([[2.0, 0.0, 0.0]]),
-            target_valid=torch.tensor([[True, False, False]]),
-            bar_time_ns=_hourly_times(3),
-            cost_rate=1e-8,
-            min_exposure=0.0,
-        )
+    result = run_execution(
+        factors=factor,
+        target_ret=torch.tensor([[2.0, 0.0, 0.0]]),
+        target_valid=torch.tensor([[True, False, False]]),
+        bar_time_ns=_hourly_times(3),
+        cost_rate=1e-8,
+        min_exposure=0.0,
+    )
+    result.net_pnl.sum().backward()
+    assert factor.grad is not None
+    assert torch.count_nonzero(factor.grad) > 0
 
 
 @pytest.mark.parametrize(
@@ -727,8 +877,11 @@ def test_execution_preserves_representable_cost_dtype_and_gradient(
         min_exposure=0.0,
     )
 
-    assert result.cost.dtype is dtype
-    assert result.final_liquidation_cost.dtype is dtype
+    expected_monetary_dtype = (
+        torch.float32 if dtype in {torch.float16, torch.bfloat16} else torch.float64
+    )
+    assert result.cost.dtype is expected_monetary_dtype
+    assert result.final_liquidation_cost.dtype is expected_monetary_dtype
     assert bool((result.cost[result.target_valid] > 0).all())
     result.net_pnl.sum().backward()
     assert factors.grad is not None
@@ -1462,7 +1615,7 @@ def test_execution_ledger_has_fixed_fields_and_copies_shared_result() -> None:
         position=pytest.approx(0.5),
         gross_pnl=pytest.approx(0.05),
         cost=pytest.approx(0.05),
-        net_pnl=pytest.approx(0.0),
+        net_pnl=pytest.approx(result.net_pnl[0, 0].item()),
         is_final_liquidation=False,
     )
     assert ledger[1].signal_time_ns == 3_600_000_000_000
@@ -1732,7 +1885,7 @@ def test_execution_ledger_reconciles_float32_with_shared_float64_reduction(
         result.net_pnl[result.target_valid].to(torch.float64).sum().item()
     )
 
-    assert abs(row_total - default_tensor_total) > 1e-8
+    assert row_total == default_tensor_total
     assert row_total == pytest.approx(shared_tensor_total, abs=1e-8)
     assert [row.net_pnl for row in ledger] == result.net_pnl[0, :3].tolist()
 

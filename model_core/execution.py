@@ -108,19 +108,6 @@ def _cost_work_dtype(published_dtype: torch.dtype) -> torch.dtype:
     return torch.float64
 
 
-def _validate_cost_publication(
-    working_value: Tensor,
-    published_value: Tensor,
-) -> None:
-    underflowed = (working_value != 0) & (
-        published_value.to(working_value.dtype) == 0
-    )
-    if bool(underflowed.any()):
-        raise DataValidationError(
-            "the result dtype must provide representable non-zero execution cost"
-        )
-
-
 def _validate_cost_component_product(
     working_source: Tensor,
     cost_rate: float,
@@ -295,48 +282,28 @@ def run_execution(
         combined_cost_work,
         torch.zeros_like(position_for_cost),
     )
-    final_liquidation_cost = final_liquidation_cost_work.to(position.dtype)
-    cost = cost_work.to(position.dtype)
-    _validate_cost_publication(final_liquidation_cost_work, final_liquidation_cost)
-    _validate_cost_publication(cost_work, cost)
-    _validate_additive_component_preservation(
-        turnover_cost_work,
-        liquidation_cost_by_time_work,
-        cost.to(cost_work_dtype),
-        context="execution cost",
-    )
+    final_liquidation_cost = final_liquidation_cost_work
+    cost = cost_work
     valid_target_ret = torch.where(
         target_valid,
-        target_ret,
-        torch.zeros_like(target_ret),
+        target_ret.to(cost_work_dtype),
+        torch.zeros_like(position_for_cost),
     )
     gross_pnl = torch.where(
         target_valid,
-        position * valid_target_ret,
-        torch.zeros_like(position),
+        position_for_cost * valid_target_ret,
+        torch.zeros_like(position_for_cost),
     )
-    gross_pnl_work = gross_pnl.to(cost_work_dtype)
-    negative_cost_work = -cost.to(cost_work_dtype)
-    net_pnl_work = torch.where(
-        target_valid,
-        gross_pnl_work + negative_cost_work,
-        torch.zeros_like(gross_pnl_work),
-    )
-    _validate_additive_component_preservation(
-        gross_pnl_work,
-        negative_cost_work,
-        net_pnl_work,
-        context="net PnL cost",
-    )
+    negative_cost_work = -cost
     net_pnl = torch.where(
         target_valid,
-        net_pnl_work.to(position.dtype),
-        torch.zeros_like(position),
+        gross_pnl + negative_cost_work,
+        torch.zeros_like(gross_pnl),
     )
     _validate_additive_component_preservation(
-        gross_pnl_work,
+        gross_pnl,
         negative_cost_work,
-        net_pnl.to(cost_work_dtype),
+        net_pnl,
         context="net PnL cost",
     )
     floating_fields = (
@@ -554,9 +521,13 @@ def _validate_ledger_result(
                 f"valid {field_name} values must be finite"
             )
 
-    if len({value.dtype for value in read_fields.values()}) != 1:
+    monetary_fields = {
+        field_name: read_fields[field_name]
+        for field_name in ("gross_pnl", "cost", "net_pnl")
+    }
+    if len({value.dtype for value in monetary_fields.values()}) != 1:
         raise DataValidationError(
-            "ledger read fields must use the same dtype"
+            "ledger monetary fields must use the same dtype"
         )
 
     valid_gross = read_fields["gross_pnl"][target_valid]
