@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from model_core.vocab import VOCAB_VERSION
+from data_pipeline.validation import normalize_timeframe_name
+from model_core.artifacts import StrategyArtifact
+from model_core.walk_forward import formula_warmup_bars
 from strategy_manager.live_signal import evaluate_signal, min_exposure
 from web.data_sources.base import bars_to_raw_dict
 from web.data_sources.factory import SOURCE_KINDS, get_source
@@ -42,9 +44,12 @@ _TF_SECONDS = {
     "1M": 2592000,  # 近似 30 天
 }
 _DEFAULT_CADENCE = 60
-_N_BARS = 500                 # 每次拉取的历史 bar 数（喂给特征引擎）
 _HISTORY_LEN = 60             # 保留的信号强度历史点数（供 sparkline）
 _VALID_KINDS = {k for k, _ in SOURCE_KINDS}
+_SOURCE_TO_CANONICAL_TIMEFRAME = {
+    "1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30",
+    "1h": "H1", "4h": "H4", "1d": "D1", "1w": "W1", "1M": "MN1",
+}
 
 
 def _cadence_for(tf: str) -> int:
@@ -93,15 +98,19 @@ def _ensure_closed_bars(bars: list, timeframe: str, now: float | None = None) ->
 
 
 def _load_strategy_meta(path: str) -> dict[str, Any]:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if isinstance(data, list):
-        return {"formula": data, "vocab_version": "legacy", "symbol": None, "timeframe": None, "best_score": None}
+    strategy_path = Path(path)
+    data = json.loads(strategy_path.read_text(encoding="utf-8"))
+    artifact = StrategyArtifact.from_dict(data)
+    expected_name = artifact.run_identity.strategy_filename()
+    if strategy_path.name != expected_name:
+        raise ValueError(
+            f"strategy filename is not canonical: expected={expected_name} actual={strategy_path.name}"
+        )
+    identity = artifact.run_identity.artifact_identity
     return {
-        "formula": data.get("formula"),
-        "vocab_version": data.get("vocab_version"),
-        "symbol": data.get("symbol"),
-        "timeframe": data.get("timeframe"),
-        "best_score": data.get("best_score"),
+        "formula": list(artifact.formula_tokens), "vocab_version": identity.vocab_version,
+        "symbol": identity.symbol, "timeframe": identity.timeframe,
+        "best_score": artifact.best_score, "fingerprint": artifact.fingerprint,
     }
 
 
@@ -240,11 +249,15 @@ class RealtimeManager:
         name = Path(path).stem
         task_id = f"{source}:{symbol}:{timeframe}:{name}"
 
+        canonical_timeframe = normalize_timeframe_name(
+            _SOURCE_TO_CANONICAL_TIMEFRAME.get(timeframe, timeframe)
+        )
+        if meta["symbol"] != symbol or meta["timeframe"] != canonical_timeframe:
+            raise ValueError(
+                "strategy watch identity mismatch: "
+                f"expected={symbol}/{canonical_timeframe} actual={meta['symbol']}/{meta['timeframe']}"
+            )
         warn = ""
-        if meta.get("vocab_version") and meta["vocab_version"] not in (VOCAB_VERSION, "legacy"):
-            warn = f"词表版本不符（{meta['vocab_version']} vs {VOCAB_VERSION}），信号可能失真"
-        elif meta.get("symbol") and meta["symbol"] != symbol:
-            warn = f"该因子为 {meta['symbol']} 训练，跨品种运行仅供参考"
 
         task = WatchTask(
             id=task_id,
@@ -335,23 +348,26 @@ class RealtimeManager:
             task.next_due = now + task.cadence_s
             self._executor.submit(self._evaluate_task, task)
 
-    def _get_bars(self, source: str, symbol: str, timeframe: str):
+    def _get_bars(self, source: str, symbol: str, timeframe: str, required_count: int):
         """带短 TTL 缓存的 K 线抓取（同一 源/品种/周期 的多因子复用）。"""
         key = (source, symbol, timeframe)
         ttl = max(10.0, _cadence_for(timeframe) * 0.8)
         now = time.monotonic()
         cached = self._bar_cache.get(key)
-        if cached and (now - cached[0]) < ttl:
+        if cached and (now - cached[0]) < ttl and len(cached[1]) >= required_count:
             return cached[1]
         src = get_source(source)
-        bars = src.fetch_bars(symbol, timeframe, _N_BARS, drop_forming=True)
+        bars = src.fetch_bars(symbol, timeframe, required_count, drop_forming=True)
         bars = _ensure_closed_bars(bars, timeframe)
         self._bar_cache[key] = (now, bars)
         return bars
 
     def _evaluate_task(self, task: WatchTask) -> None:
         try:
-            bars = self._get_bars(task.source, task.symbol, task.timeframe)
+            required_count = formula_warmup_bars(len(task.formula))
+            bars = self._get_bars(
+                task.source, task.symbol, task.timeframe, required_count
+            )
             if not bars:
                 self._set_error(task, "未获取到 K 线")
                 return

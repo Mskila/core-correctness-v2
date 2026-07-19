@@ -15,10 +15,39 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from numbers import Real
 
 import torch
 from loguru import logger
+
+
+def _generated_at_utc(value: str) -> tuple[datetime, Fraction]:
+    if type(value) is not str:
+        raise ValueError("generated_at ordering requires an exact string")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError("generated_at ordering requires a valid UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError("generated_at ordering requires an aware UTC timestamp")
+    body = value[:-1] if value.endswith("Z") else value
+    if not value.endswith("Z"):
+        zone_start = max(body.rfind("+", 10), body.rfind("-", 10))
+        if zone_start < 0:
+            raise ValueError("generated_at ordering requires an explicit UTC offset")
+        body = body[:zone_start]
+    separator = max(body.rfind("."), body.rfind(","))
+    fraction = Fraction(0)
+    if separator >= 0:
+        digits = body[separator + 1 :]
+        if not digits or not digits.isdigit():
+            raise ValueError("generated_at ordering requires decimal fractional digits")
+        fraction = Fraction(int(digits), 10 ** len(digits))
+    whole_second = parsed.astimezone(timezone.utc).replace(microsecond=0)
+    return whole_second, fraction
 
 try:
     import MetaTrader5 as mt5
@@ -82,6 +111,8 @@ except ImportError:
 
         def close_all_positions(self, symbol, magic=None, *, filter_magic=True):
             self._unavailable("close_all_positions()")
+from model_core.execution import factor_to_position
+from model_core import walk_forward
 from model_core.vm import StackVM
 from strategy_manager.portfolio import MT5PortfolioManager
 from strategy_manager.risk import MT5RiskEngine
@@ -107,150 +138,53 @@ class MT5StrategyRunner:
     """
 
     def __init__(self) -> None:
-        from model_core.vocab import VOCAB_VERSION as _CURRENT_VER
-        from pathlib import Path as _Path
+        from pathlib import Path as _V2Path
+        from data_pipeline.validation import normalize_timeframe_name
+        from model_core.artifacts import StrategyArtifact
 
-        # ── 加载策略：支持每品种多公式（信号取平均合并）──────────────
-        # symbol_formulas_multi: {sym: [[token,...], [token,...], ...]}
-        # 每品种可对应多条公式，信号层取平均后合并为单一仓位方向。
-        self.symbol_formulas_multi: dict[str, list[list[int]]] = {}
-        # 向后兼容：self.symbol_formulas 保留为"每品种第一条公式"（供旧代码引用）
         self.symbol_formulas: dict[str, list[int]] = {}
-
-        strategies_dir = _Path("strategies")
-        archive_dir    = strategies_dir / "archive"
-
-        def _load_formula(path: "_Path") -> "list[int] | None":
-            """加载单个策略文件，返回 formula token 列表，失败返回 None。"""
-            if not path.exists():
-                return None
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    return None
-                formula = data.get("formula") or data.get("formula_tokens")
-                if not formula:
-                    return None
-                ver = data.get("vocab_version", "unknown")
-                if ver != _CURRENT_VER:
-                    logger.warning(f"[Runner] {path.name}: vocab_version={ver} != {_CURRENT_VER}, skip")
-                    return None
-                score = data.get("best_score") or data.get("train_best_score") or 0.0
-                if score <= 0.0:
-                    logger.warning(f"[Runner] {path.name}: best_score={score:.4f} <= 0, skip (invalid strategy)")
-                    return None
-                return [int(t) for t in formula]
-            except Exception as exc:
-                logger.warning(f"[Runner] {path.name}: 加载失败 {exc}")
-                return None
-
-        # ── 品种分组定义 ─────────────────────────────────────────────
-        forex_group       = ["EURUSD", "USDJPY"]
-        metals_comm_group = ["XAUUSD", "AAVUSD", "COCOA.c"]
-
-        # ── 为每品种收集所有有效公式（支持多条）────────────────────
-        # 查找顺序：
-        #   forex 组：
-        #     1. strategies/best_{sym}.json（per-symbol 主策略）
-        #     2. strategies/best_forex.json（组策略，forex_v2）
-        #     3. strategies/archive/best_forex_*.json（归档，forex_v1）
-        #   metals_comm 组：
-        #     1. strategies/best_{sym}.json（per-symbol 主策略）
-        #     2. strategies/best_metals_comm.json（组策略，metals_comm_v2）
-
-        for sym in Config.SYMBOLS:
-            formulas_for_sym: list[list[int]] = []
-            seen: set[str] = set()  # 去重，避免同一公式加两次
-
-            def _add(f: "list[int] | None", label: str) -> None:
-                if f is None:
-                    return
-                key = str(f)
-                if key in seen:
-                    return
-                seen.add(key)
-                formulas_for_sym.append(f)
-                logger.info(f"[Runner] {sym}: 加载公式 [{label}] {f}")
-
-            # 1. per-symbol 策略文件
-            _add(_load_formula(strategies_dir / f"best_{sym}.json"), f"best_{sym}")
-
-            # 2. forex 组共享策略（forex_v2）
-            if sym in forex_group:
-                _add(_load_formula(strategies_dir / "best_forex.json"), "best_forex(v2)")
-
-            # 3. 归档版本（forex_v1）
-            if sym in forex_group:
-                _add(_load_formula(archive_dir / "best_forex_20250705_pre_refactor.json"),
-                     "archive_forex_v1")
-
-            # 4. metals_comm 组共享策略（metals_comm_v2，旧版）
-            if sym in metals_comm_group:
-                _add(_load_formula(strategies_dir / "best_metals_comm.json"),
-                     "best_metals_comm(v2)")
-
-            if formulas_for_sym:
-                self.symbol_formulas_multi[sym] = formulas_for_sym
-                self.symbol_formulas[sym] = formulas_for_sym[0]  # 向后兼容
-            else:
-                logger.warning(f"[Runner] {sym}: 无有效公式，该品种将保持空仓")
-
-        # ── 若多因子均无，回退到 best_mt5_strategy.json ──────────────
-        if not self.symbol_formulas_multi:
-            strategy_path = Config.STRATEGY_FILE
-            if not os.path.exists(strategy_path):
-                logger.critical(
-                    f"未找到任何策略文件（strategies/best_*.json 或 {strategy_path}）。"
-                    "请先运行 main.py 训练。"
-                )
-                sys.exit(1)
-            try:
-                with open(strategy_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.critical(f"加载策略失败: {exc}")
-                sys.exit(1)
-
-            if isinstance(data, list):
-                logger.critical(
-                    "[Runner] 不支持旧格式策略（vocab v2.0 后特征顺序已变）。"
-                    "请重新训练（python main.py）。"
-                )
-                sys.exit(1)
-            elif isinstance(data, dict) and "formula" in data:
-                ver = data.get("vocab_version", "unknown")
-                if ver != _CURRENT_VER:
-                    logger.critical(
-                        f"[Runner] vocab_version={ver} != {_CURRENT_VER}，请重新训练。"
+        self.strategy_fingerprints: dict[str, str] = {}
+        self.missing_strategy_reasons: dict[str, str] = {}
+        expected_timeframe = normalize_timeframe_name(Config.TIMEFRAME)
+        for symbol in Config.SYMBOLS:
+            candidates: list[tuple[tuple[datetime, Fraction], str, StrategyArtifact]] = []
+            for path in _V2Path("strategies").glob("best_v2_*.json"):
+                try:
+                    artifact = StrategyArtifact.from_dict(
+                        json.loads(path.read_text(encoding="utf-8"))
                     )
-                    sys.exit(1)
-                formula = [int(t) for t in data["formula"]]
-                for sym in Config.SYMBOLS:
-                    self.symbol_formulas_multi[sym] = [formula]
-                    self.symbol_formulas[sym] = formula
-                logger.info("[Runner] 使用单公式回退模式（所有品种共用）")
-            else:
-                logger.critical("策略文件格式不支持。")
-                sys.exit(1)
+                    identity = artifact.run_identity.artifact_identity
+                    if (identity.symbol == symbol and identity.timeframe == expected_timeframe
+                            and path.name == artifact.run_identity.strategy_filename()):
+                        candidates.append(
+                            (_generated_at_utc(artifact.generated_at), path.name, artifact)
+                        )
+                except Exception as exc:
+                    logger.warning(f"[Runner] {path.name}: incompatible V2 artifact: {exc}")
+            if not candidates:
+                reason = f"no identity-valid {expected_timeframe} V2 strategy"
+                self.missing_strategy_reasons[symbol] = reason
+                logger.warning(f"[Runner] {symbol}: {reason}; flat")
+                continue
+            artifact = max(candidates, key=lambda row: (row[0], row[1]))[2]
+            formula = list(artifact.formula_tokens)
+            self.symbol_formulas[symbol] = formula
+            self.strategy_fingerprints[symbol] = artifact.fingerprint
+            logger.info(f"[Runner] {symbol}: loaded fingerprint={artifact.fingerprint}")
 
-        # ── 打印加载汇总 ─────────────────────────────────────────────
-        for sym, fmls in self.symbol_formulas_multi.items():
-            logger.success(f"[Runner] {sym}: {len(fmls)} 条公式已加载")
-
-        # 向后兼容：取第一个品种的第一条公式
+        if not self.symbol_formulas:
+            raise RuntimeError(
+                "runner startup failed: no configured symbol has an identity-valid V2 strategy"
+            )
         self.formula = next(iter(self.symbol_formulas.values()))
-
-        self.vm        = StackVM()
+        self.vm = StackVM()
         self.portfolio = MT5PortfolioManager()
-        self.risk      = MT5RiskEngine()
-        self.trader    = MT5Trader()
-
-        self._fetcher: MT5DataFetcher | None       = None
-        self._data_manager: MT5DataManager | None  = None
-        self._last_refresh: float                   = 0.0
-        self._last_bar_time: torch.Tensor | None    = None
-
+        self.risk = MT5RiskEngine()
+        self.trader = MT5Trader()
+        self._fetcher: MT5DataFetcher | None = None
+        self._data_manager: MT5DataManager | None = None
+        self._last_refresh: float = 0.0
+        self._last_bar_time: torch.Tensor | None = None
 
     # ──────────────────────────────────────────────────────────────────────
     # 公开接口
@@ -408,82 +342,57 @@ class MT5StrategyRunner:
             logger.warning(f"[Runner] Failed to mark stop signal: {exc}")
         return True
 
-    def _compute_targets(self) -> torch.Tensor | None:
-        """为每个品种计算合并后的目标仓位 [-1, +1]，形状 [N]。
 
-        多公式合并逻辑（信号平均）：
-          - 每个有效公式独立执行 StackVM，得到最新 bar 的因子值
-          - 对所有公式的 tanh(factor) 取算术平均，作为最终仓位信号
-          - 若两条公式方向相反，信号相互抵消 → 趋近于 0 → 不开仓
-          - 若两条方向一致，信号叠加强化 → 更大仓位比例
-        这是标准 alpha 合成方法，安全且符合回测逻辑。
-        """
+    def _compute_targets(self) -> torch.Tensor | None:
+        """Map each symbol's selected V2 factor through the shared execution contract."""
         if self._data_manager is None:
             return None
         try:
             from model_core.features import MT5FeatureEngineer
-            raw_dict = self._data_manager.raw_dict
-            symbols  = self._data_manager.symbols
-            N        = len(symbols)
-            feat_all = MT5FeatureEngineer.compute_features(raw_dict)  # [N, F, T]
 
-            targets   = torch.zeros(N, dtype=torch.float32)
-            prev_dirs = torch.zeros(N, dtype=torch.float32)
-            for i, sym in enumerate(symbols):
-                prev_dirs[i] = float(self.portfolio.get_direction(sym))
+            symbols = self._data_manager.symbols
+            features = MT5FeatureEngineer.compute_features(self._data_manager.raw_dict)
+            targets = torch.zeros(len(symbols), dtype=torch.float32)
+            self.target_reasons: dict[str, str] = {}
+            history_bars = int(features.shape[-1])
 
-            for i, sym in enumerate(symbols):
-                formulas = self.symbol_formulas_multi.get(sym)
-                if not formulas:
-                    logger.warning(f"[Runner] {sym}: 无策略公式，保持空仓")
+            for index, symbol in enumerate(symbols):
+                formula = self.symbol_formulas.get(symbol)
+                if formula is None:
+                    reason = getattr(self, "missing_strategy_reasons", {}).get(
+                        symbol, "no identity-valid V2 strategy"
+                    )
+                    logger.warning(f"[Runner] {symbol}: {reason}; flat")
+                    self.target_reasons[symbol] = reason
                     continue
 
-                feat_i = feat_all[i:i+1]   # [1, F, T]
-
-                # ── 多公式信号平均 ────────────────────────────────────
-                valid_signals: list[float] = []
-                for fi, formula in enumerate(formulas):
-                    raw_i = self.vm.execute(formula, feat_i)   # [1, T] or None
-                    if raw_i is None:
-                        logger.warning(f"[Runner] {sym} formula[{fi}]: StackVM 返回 None，跳过")
-                        continue
-                    latest_val = raw_i[0, -1].item()   # 最新 bar 因子值（标量）
-                    signal = float(torch.tanh(torch.tensor(latest_val)).item())
-                    valid_signals.append(signal)
-                    logger.debug(f"[Runner] {sym} formula[{fi}]: factor={latest_val:+.4f} → tanh={signal:+.4f}")
-
-                if not valid_signals:
-                    logger.error(f"[Runner] {sym}: 所有公式均失败，保持空仓")
+                required_bars = walk_forward.formula_warmup_bars(len(formula))
+                if history_bars < required_bars:
+                    reason = (
+                        f"insufficient history: actual={history_bars} "
+                        f"required={required_bars}"
+                    )
+                    self.target_reasons[symbol] = reason
+                    logger.warning(f"[Runner] {symbol}: {reason}; flat")
                     continue
 
-                # 算术平均（两条反向信号相互抵消，同向信号叠加）
-                avg_signal = sum(valid_signals) / len(valid_signals)
-
-                # 应用 MIN_TRADE_EXPOSURE 门槛（与回测一致）
-                from config import Config as _Cfg
-                min_exp = getattr(_Cfg, "MIN_TRADE_EXPOSURE", 0.05)
-                if abs(avg_signal) < min_exp:
-                    avg_signal = 0.0
-
-                targets[i] = avg_signal
-
-                # 详细日志：显示各公式信号和合并结果
-                signals_str = " / ".join(f"{s:+.3f}" for s in valid_signals)
-                direction_str = "多" if avg_signal > 0 else ("空" if avg_signal < 0 else "空仓")
+                factor = self.vm.execute(formula, features[index:index + 1])
+                if factor is None:
+                    reason = "StackVM returned no factor"
+                    self.target_reasons[symbol] = reason
+                    logger.error(f"[Runner] {symbol}: {reason}; flat")
+                    continue
+                position = factor_to_position(
+                    factor[:, -1:],
+                    min_exposure=float(Config.MIN_TRADE_EXPOSURE),
+                )
+                targets[index] = position.reshape(-1)[0]
                 logger.info(
-                    f"[Runner] {sym}: 各公式信号=[{signals_str}] → "
-                    f"均值={avg_signal:+.4f} ({direction_str})"
+                    f"[Runner] {symbol}: fingerprint="
+                    f"{getattr(self, 'strategy_fingerprints', {}).get(symbol, 'unknown')} "
+                    f"target={targets[index].item():+.4f}"
                 )
-
-            logger.info(
-                "[Runner] 最终目标仓位: " +
-                " | ".join(
-                    f"{sym}={targets[i].item():+.3f}"
-                    for i, sym in enumerate(symbols)
-                )
-            )
-            return targets.float()
-
+            return targets
         except Exception as exc:
             logger.error(f"[Runner] _compute_targets failed: {exc}")
             return None

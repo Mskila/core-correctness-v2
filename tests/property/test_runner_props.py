@@ -13,6 +13,7 @@ For any signal score tensor:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Dict, List
 from unittest.mock import MagicMock, patch
 
@@ -24,12 +25,33 @@ from hypothesis.strategies import composite
 from config import Config
 from strategy_manager.runner import MT5StrategyRunner
 from strategy_manager.portfolio import MT5PortfolioManager, Position
+from model_core.execution import factor_to_position
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 # MT5 BUY_THRESHOLD constant (0.70)
 _THRESHOLD = Config.BUY_THRESHOLD
+
+
+@given(st.floats(min_value=-5, max_value=5, allow_nan=False, allow_infinity=False))
+def test_runner_position_mapping_matches_shared_execution(value: float) -> None:
+    runner = MT5StrategyRunner.__new__(MT5StrategyRunner)
+    runner._data_manager = MagicMock(symbols=["EURUSD"], raw_dict={})
+    runner.symbol_formulas = {"EURUSD": [0]}
+    runner.vm = MagicMock()
+    factor = torch.tensor([[value]], dtype=torch.float32)
+    runner.vm.execute.return_value = factor
+    with patch(
+        "model_core.features.MT5FeatureEngineer.compute_features",
+        return_value=torch.zeros(1, 1, 1),
+    ), patch("model_core.walk_forward.formula_warmup_bars", return_value=1):
+        actual = runner._compute_targets()
+    expected = factor_to_position(
+        factor,
+        min_exposure=float(Config.MIN_TRADE_EXPOSURE),
+    )
+    torch.testing.assert_close(actual, expected.flatten())
 
 
 def _make_runner(
@@ -47,6 +69,10 @@ def _make_runner(
     mock_account = {"equity": 10_000.0, "margin_free": 5_000.0}
     mock_trader.get_account_info.return_value = mock_account
     mock_trader.buy.return_value = True
+    mock_trader.open_short.return_value = True
+    mock_trader.get_positions.side_effect = lambda symbol, magic: (
+        [SimpleNamespace(type=0, volume=1.0)] if symbol in held_symbols else []
+    )
     runner.trader = mock_trader
 
     mock_portfolio = MagicMock(spec=MT5PortfolioManager)
@@ -64,6 +90,9 @@ def _make_runner(
     mock_data_manager.symbols = symbols
     runner._data_manager = mock_data_manager
     runner._last_refresh = 0.0
+    runner._calc_lot = MagicMock(return_value=0.01)
+    runner._close_symbol_positions = MagicMock(return_value=True)
+    runner._record_position_after_open = MagicMock()
 
     return runner
 
@@ -87,7 +116,7 @@ above_threshold_strategy = st.floats(
 
 # Scores clearly at or below threshold
 below_threshold_strategy = st.floats(
-    min_value=1e-9,
+    min_value=-1.0,
     max_value=_THRESHOLD,
     allow_nan=False,
     allow_infinity=False,
@@ -153,7 +182,7 @@ def test_property12_buy_signal_triggers_buy(scenario: dict):
     """
     from strategy_manager.signal import (
         reconcile_action, target_to_direction,
-        OPEN_LONG, OPEN_SHORT, CLOSE, HOLD,
+        OPEN_LONG, OPEN_SHORT, CLOSE, HOLD, REVERSE_TO_LONG, REVERSE_TO_SHORT,
     )
 
     symbols: List[str] = scenario["symbols"]
@@ -173,22 +202,38 @@ def test_property12_buy_signal_triggers_buy(scenario: dict):
     # 直接调用 _reconcile_positions，不走 StackVM
     runner._reconcile_positions(targets)
 
+    expected_buy_syms: set[str] = set()
+    expected_sell_syms: set[str] = set()
     # 验证每个品种的 reconcile 结果
     for idx, sym in enumerate(symbols):
         target  = target_to_direction(float(targets[idx].item()))
         current = 1 if sym in held_symbols else 0
         expected_action = reconcile_action(current, target)
 
-        if expected_action == OPEN_LONG:
-            runner.trader.buy.assert_any_call(
-                sym, pytest.approx(0.01, abs=1e-6), unittest=True
-            ) if False else None  # 只验证 buy 被调用过（mock 不追踪参数精度）
-        # 核心验证：open_long 时 buy 必须被调用过
-        # 由于 mock 是全局的，只验证 symbol 级别行为
-        buy_syms = {c.args[0] for c in runner.trader.buy.call_args_list if c.args}
-        sell_syms = {c.args[0] for c in runner.trader.sell.call_args_list if c.args}
+        if expected_action in (OPEN_LONG, REVERSE_TO_LONG):
+            expected_buy_syms.add(sym)
+        elif expected_action in (OPEN_SHORT, REVERSE_TO_SHORT):
+            expected_sell_syms.add(sym)
 
-        if expected_action == OPEN_LONG:
-            assert sym in buy_syms or True, f"{sym}: expected buy for OPEN_LONG"
-        elif expected_action == OPEN_SHORT:
-            assert sym in sell_syms or True, f"{sym}: expected sell for OPEN_SHORT"
+    buy_syms = {c.args[0] for c in runner.trader.buy.call_args_list if c.args}
+    sell_syms = {c.args[0] for c in runner.trader.open_short.call_args_list if c.args}
+    assert buy_syms == expected_buy_syms
+    assert sell_syms == expected_sell_syms
+    for call in runner.trader.buy.call_args_list + runner.trader.open_short.call_args_list:
+        assert call.args[1] == pytest.approx(0.01)
+
+
+def test_property_assertions_detect_suppressed_buy_call() -> None:
+    runner = _make_runner(["EURUSD"], [])
+    runner._reconcile_positions(torch.tensor([1.0]))
+    runner.trader.buy.reset_mock()
+    with pytest.raises(AssertionError):
+        assert {c.args[0] for c in runner.trader.buy.call_args_list} == {"EURUSD"}
+
+
+def test_property_assertions_detect_suppressed_sell_call() -> None:
+    runner = _make_runner(["EURUSD"], [])
+    runner._reconcile_positions(torch.tensor([-1.0]))
+    runner.trader.open_short.reset_mock()
+    with pytest.raises(AssertionError):
+        assert {c.args[0] for c in runner.trader.open_short.call_args_list} == {"EURUSD"}
