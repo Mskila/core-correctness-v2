@@ -1,0 +1,155 @@
+import json
+from dataclasses import replace
+
+import pytest
+
+import web.progress as progress
+import web.strategy_file as strategy_file
+from model_core.artifacts import ArtifactIdentity, StrategyArtifact, TrainingRunIdentity
+from model_core.vocab import FORMULA_VOCAB
+from tests.unit.test_artifacts import strategy_artifact
+from web.strategy_file import inspect_strategy_file
+
+
+@pytest.mark.parametrize("payload", [[0], {"formula": [0]}, {"schema_version": "strategy-v2"}])
+def test_strategy_inspection_rejects_legacy_or_identityless(tmp_path, payload) -> None:
+    path = tmp_path / "best_EURUSD.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(Exception, match="strategy|artifact|schema|identity|V2|v2"):
+        inspect_strategy_file(str(path))
+
+
+def _timeframe_artifact(
+    timeframe: str, generated_at: str, token: int = 0, run_id: str | None = None
+) -> StrategyArtifact:
+    template = strategy_artifact()
+    source = template.run_identity.artifact_identity
+    dataset = replace(source.training_dataset, timeframe=timeframe)
+    identity = ArtifactIdentity(
+        core_semantics_version=source.core_semantics_version,
+        vocab_version=source.vocab_version,
+        label_semantics_version=source.label_semantics_version,
+        execution_semantics_version=source.execution_semantics_version,
+        symbol=source.symbol,
+        timeframe=timeframe,
+        training_dataset=dataset,
+        training_config=source.training_config,
+        training_config_hash=source.training_config_hash,
+    )
+    run = (
+        TrainingRunIdentity.create(identity)
+        if run_id is None
+        else TrainingRunIdentity(run_id=run_id, artifact_identity=identity)
+    )
+    return StrategyArtifact.create(
+        run_identity=run,
+        formula_tokens=[token],
+        decoded_formula=FORMULA_VOCAB.token_names[token],
+        best_score=template.best_score,
+        fold_evidence=template.fold_evidence,
+        generated_at=generated_at,
+    )
+
+
+def _write_artifact(directory, artifact):
+    path = directory / artifact.run_identity.strategy_filename()
+    path.write_text(json.dumps(artifact.to_dict()), encoding="utf-8")
+    return path
+
+
+def test_strategy_resolution_is_exact_per_symbol_and_timeframe(monkeypatch, tmp_path) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    h1_old = _write_artifact(
+        strategies, _timeframe_artifact("H1", "2026-07-15T00:00:00Z")
+    )
+    h1_new = _write_artifact(
+        strategies, _timeframe_artifact("H1", "2026-07-16T00:00:00Z")
+    )
+    h4 = _write_artifact(
+        strategies, _timeframe_artifact("H4", "2026-07-17T00:00:00Z")
+    )
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    assert strategy_file.strategy_path_for_symbol("EURUSD", "H1") == h1_new
+    assert strategy_file.strategy_path_for_symbol("EURUSD", "H4") == h4
+    assert strategy_file.strategy_path_for_symbol("EURUSD", "H1") != h1_old
+
+
+def test_strategy_resolution_orders_generated_at_as_utc_instant(monkeypatch, tmp_path) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    earlier = _write_artifact(
+        strategies, _timeframe_artifact("H1", "2026-07-16T00:00:00Z", 0)
+    )
+    later = _write_artifact(
+        strategies, _timeframe_artifact("H1", "2026-07-16T00:00:00.500000Z", 1)
+    )
+    before = {path.name: path.read_bytes() for path in strategies.iterdir()}
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    selected = strategy_file.strategy_path_for_symbol("EURUSD", "H1")
+    assert selected == later
+    assert selected != earlier
+    assert json.loads(selected.read_text(encoding="utf-8"))["formula_tokens"] == [1]
+    assert {path.name: path.read_bytes() for path in strategies.iterdir()} == before
+
+
+def test_equal_utc_instants_use_filename_not_timestamp_spelling(monkeypatch, tmp_path) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    z_path = _write_artifact(
+        strategies,
+        _timeframe_artifact(
+            "H1", "2026-07-16T00:00:00Z", 0, "0" * 32
+        ),
+    )
+    offset_path = _write_artifact(
+        strategies,
+        _timeframe_artifact(
+            "H1", "2026-07-16T00:00:00+00:00", 1, "f" * 32
+        ),
+    )
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    assert offset_path.name > z_path.name
+    assert strategy_file.strategy_path_for_symbol("EURUSD", "H1") == offset_path
+
+
+def test_strategy_resolution_preserves_submicrosecond_order(monkeypatch, tmp_path) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    earlier = _write_artifact(
+        strategies,
+        _timeframe_artifact(
+            "H1", "2026-07-16T00:00:00.0000001Z", 0, "f" * 32
+        ),
+    )
+    later = _write_artifact(
+        strategies,
+        _timeframe_artifact(
+            "H1", "2026-07-16T00:00:00.0000002Z", 1, "0" * 32
+        ),
+    )
+    assert earlier.name > later.name
+    before = {path.name: path.read_bytes() for path in strategies.iterdir()}
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    assert strategy_file.strategy_path_for_symbol("EURUSD", "H1") == later
+    assert {path.name: path.read_bytes() for path in strategies.iterdir()} == before
+
+
+def test_numerically_equal_arbitrary_fractions_use_filename_tie(
+    monkeypatch, tmp_path
+) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    short = _write_artifact(
+        strategies,
+        _timeframe_artifact("H1", "2026-07-16T00:00:00.1Z", 0, "0" * 32),
+    )
+    padded = _write_artifact(
+        strategies,
+        _timeframe_artifact(
+            "H1", "2026-07-16T00:00:00.1000000+00:00", 1, "f" * 32
+        ),
+    )
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    assert padded.name > short.name
+    assert strategy_file.strategy_path_for_symbol("EURUSD", "H1") == padded
