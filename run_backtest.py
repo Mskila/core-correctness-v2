@@ -1,572 +1,1462 @@
-"""
-run_backtest.py — 多因子组合回测（含手续费/滑点、夏普、资金曲线）
+"""Strict V2 command-line replay and out-of-sample backtest entrypoint."""
 
-训练/回测一律使用本地 Parquet，不连接 MT5 在线拉数。
+from __future__ import annotations
 
-用法：
-    python run_backtest.py --strategy-file strategies/best_ADAUSD.json --data-file D:\\K线数据\\ADAUSD_H1.parquet
-    python run_backtest.py --strategy-file path\\to\\strategy.json
-        # 若策略 JSON 内含 data_file 字段，可省略 --data-file
-    python run_backtest.py --commission 0.02 --slippage 0.01
-        # 单边手续费/滑点（单位 %），默认 0.02 / 0.01
-"""
-
-import json, sys, math
+import argparse
+import ctypes
+from dataclasses import asdict
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import msvcrt
+import os
 from pathlib import Path
-import numpy as np
+import re
+import stat
+import struct
+from typing import BinaryIO, Sequence
+from uuid import uuid4
+
 import torch
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-from config import Config
-from data_pipeline.parquet_manager import ParquetDataManager
 from backtest_viz import BacktestEngine
-from model_core.vocab import FORMULA_VOCAB, VOCAB_VERSION
-from model_core.vm import StackVM
-from model_core.features import MT5FeatureEngineer
-from strategy_manager.signal import compute_target_positions_stateless
-
-_H1_PER_YEAR = 6240
-DEFAULT_COMMISSION_PCT = 0.02  # 单边手续费 %
-DEFAULT_SLIPPAGE_PCT = 0.01    # 单边滑点 %
+from data_pipeline.parquet_manager import ParquetDataManager
+from model_core.artifacts import (
+    BacktestMode,
+    StrategyArtifact,
+    validate_backtest_dataset,
+)
 
 
-def decode_formula(tokens: list[int]) -> str:
-    names = FORMULA_VOCAB.token_names
-    return " -> ".join(names[t] if 0 <= t < len(names) else f"?{t}" for t in tokens)
+DEFAULT_COMMISSION_PCT = 0.02
+DEFAULT_SLIPPAGE_PCT = 0.01
+DEFAULT_OUTPUT_DIR = "backtest_output"
+REPORT_SCHEMA_VERSION = "backtest-report-v2"
+SIGNATURE_READ_CHUNK_SIZE = 1024 * 1024
+MODE_LABELS = {
+    BacktestMode.IN_SAMPLE_REPLAY: "样本内复盘",
+    BacktestMode.OUT_OF_SAMPLE_BACKTEST: "独立样本外回测",
+}
 
 
-def load_strategy(path: Path) -> dict | None:
-    if not path.exists():
+def _nonnegative_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run an explicit V2 in-sample replay or independent OOS backtest."
+    )
+    parser.add_argument("--strategy-file", required=True)
+    parser.add_argument("--data-file", required=True)
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=[mode.value for mode in BacktestMode],
+    )
+    parser.add_argument("--commission", type=_nonnegative_float, default=DEFAULT_COMMISSION_PCT)
+    parser.add_argument("--slippage", type=_nonnegative_float, default=DEFAULT_SLIPPAGE_PCT)
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    return parser
+
+
+def load_strategy(path: str | Path) -> StrategyArtifact:
+    """Load only the exact current StrategyArtifact dictionary schema."""
+    strategy_path = Path(path)
+    if not strategy_path.is_file():
+        raise FileNotFoundError(f"strategy file does not exist: {strategy_path}")
+    try:
+        payload = json.loads(strategy_path.read_text(encoding="utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        from model_core.semantics import ArtifactCompatibilityError
+
+        raise ArtifactCompatibilityError(f"invalid strategy JSON: {strategy_path}") from exc
+    return StrategyArtifact.from_dict(payload)
+
+
+def _cycle_safe_secondary(
+    primary: BaseException,
+    candidate: BaseException,
+) -> BaseException | None:
+    """Return a safe explicit cause without invoking exception overrides."""
+    if candidate is primary:
         return None
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        return {"formula": data, "vocab_version": "legacy", "symbol": None}
-    return data
+
+    candidate_cause = BaseException.__getattribute__(candidate, "__cause__")
+    candidate_context = BaseException.__getattribute__(candidate, "__context__")
+    if candidate_cause is None and candidate_context is primary:
+        BaseException.__setattr__(candidate, "__context__", None)
+
+    visiting: set[int] = set()
+    complete: set[int] = set()
+    stack: list[tuple[BaseException, bool]] = [(candidate, False)]
+    examined = 0
+    while stack:
+        node, expanded = stack.pop()
+        if node is primary:
+            return None
+        identity = id(node)
+        if expanded:
+            visiting.discard(identity)
+            complete.add(identity)
+            continue
+        if identity in complete:
+            continue
+        if identity in visiting:
+            return None
+        examined += 1
+        if examined > 256:
+            return None
+        visiting.add(identity)
+        stack.append((node, True))
+        cause = BaseException.__getattribute__(node, "__cause__")
+        context = BaseException.__getattribute__(node, "__context__")
+        if context is not None:
+            stack.append((context, False))
+        if cause is not None:
+            stack.append((cause, False))
+    return candidate
 
 
-# ── 统计指标 ──────────────────────────────────────────────────────────────────
-
-def calc_sharpe(pnl: np.ndarray, periods_per_year: int = _H1_PER_YEAR) -> float:
-    """年化 Sharpe（无风险利率=0）。"""
-    m = pnl.mean()
-    s = pnl.std(ddof=0)
-    if s < 1e-10:
-        return 0.0
-    return float(m / s * math.sqrt(periods_per_year))
+def _add_fixed_note(error: BaseException, note: str) -> None:
+    """Attach a bounded note without invoking exception subclass protocols."""
+    BaseException.add_note(error, note)
 
 
-def calc_sortino(pnl: np.ndarray, periods_per_year: int = _H1_PER_YEAR) -> float:
-    """年化 Sortino（下行标准差）。"""
-    m    = pnl.mean()
-    down = pnl[pnl < 0]
-    ds   = down.std(ddof=0) if len(down) > 0 else 1e-10
-    ds   = max(ds, abs(m), 1e-10)
-    return float(np.clip(m / ds * math.sqrt(periods_per_year), -20, 20))
+def _move_no_replace(source: Path, destination: Path) -> None:
+    """Atomically move on Windows and fail when destination already exists."""
+    os.rename(source, destination)
 
 
-def calc_rolling_sharpe(
-    pnl: np.ndarray,
-    window: int = 500,
-    periods_per_year: int = _H1_PER_YEAR,
-) -> np.ndarray:
-    """滚动年化夏普；窗口不足处为 nan。"""
-    T = len(pnl)
-    out = np.full(T, np.nan, dtype=np.float64)
-    if T == 0 or window <= 1:
-        return out
-    w = min(window, T)
-    # 累积和 / 累积平方和 → O(T) 滑动窗口
-    csum = np.concatenate([[0.0], np.cumsum(pnl, dtype=np.float64)])
-    csq = np.concatenate([[0.0], np.cumsum(pnl.astype(np.float64) ** 2)])
-    for i in range(w - 1, T):
-        s = csum[i + 1] - csum[i + 1 - w]
-        sq = csq[i + 1] - csq[i + 1 - w]
-        mean = s / w
-        var = sq / w - mean * mean
-        std = math.sqrt(var) if var > 0 else 0.0
-        if std < 1e-12:
-            out[i] = 0.0
-        else:
-            out[i] = float(np.clip(mean / std * math.sqrt(periods_per_year), -20, 20))
-    return out
+def _move_to_recovery(
+    source: Path,
+    *,
+    recovery_root: Path,
+    label: str,
+) -> list[BaseException]:
+    """Retain a path at a bounded content-addressed recovery location."""
+    errors: list[BaseException] = []
+    try:
+        signature = _file_signature(source)
+        recovery = recovery_root / (
+            f".{label}.recovery-{signature[3].hex()[:16]}-"
+            f"{signature[0]:x}-{signature[1]:x}"
+        )
+        try:
+            _move_no_replace(source, recovery)
+        except FileExistsError:
+            if _file_signature(recovery) != signature:
+                errors.append(FileExistsError("recovery destination is occupied"))
+    except BaseException as exc:
+        errors.append(exc)
+    return errors
 
 
-def _fmt_pl_ratio(results_map: dict) -> str:
-    vals = [
-        d["profit_loss_ratio"]
-        for d in results_map.values()
-        if d.get("profit_loss_ratio") is not None
-    ]
-    if not vals:
-        return "—"
-    return f"{sum(vals) / len(vals):.3f}"
+def _move_to_identity_recovery(
+    source: Path,
+    *,
+    recovery_root: Path,
+    label: str,
+    identity: tuple[int, int],
+    signature: tuple[int, int, int, bytes, int] | None = None,
+) -> list[BaseException]:
+    """Retain a staged object without reopening its replaceable pathname."""
+    suffix = (
+        f"{signature[3].hex()[:16]}-{identity[0]:x}-{identity[1]:x}"
+        if signature is not None
+        else f"{identity[0]:x}-{identity[1]:x}"
+    )
+    recovery = recovery_root / f".{label}.recovery-{suffix}"
+    try:
+        _move_no_replace(source, recovery)
+    except BaseException as exc:
+        return [exc]
+    return []
 
 
-# ── 资金曲线图 ────────────────────────────────────────────────────────────────
+def _cleanup_owned_temporary(
+    temporary: Path,
+    owned_identity: tuple[int, int],
+    *,
+    recovery_root: Path,
+    retain_owned: bool,
+    owned_label: str = "report-temp",
+    foreign_label: str = "foreign-report-temp",
+    owned_signature: tuple[int, int, int, bytes, int] | None = None,
+) -> list[BaseException]:
+    """Clean a reserved stage without reopening it for data or durability."""
+    if not temporary.exists():
+        return []
+    cleanup_path = temporary.with_name(f"{temporary.name}.cleanup")
+    errors: list[BaseException] = []
+    try:
+        _move_no_replace(temporary, cleanup_path)
+    except BaseException as exc:
+        errors.append(exc)
+        cleanup_identity = _identity_if_present(cleanup_path)
+        if cleanup_identity is not None:
+            errors.extend(
+                _move_to_identity_recovery(
+                    cleanup_path,
+                    recovery_root=recovery_root,
+                    label="foreign-report-temp-cleanup",
+                    identity=cleanup_identity,
+                )
+            )
+        temporary_identity = _identity_if_present(temporary)
+        if temporary_identity is not None:
+            if temporary_identity == owned_identity and not retain_owned:
+                try:
+                    _delete_owned_file(temporary, owned_identity)
+                except BaseException as cleanup_error:
+                    errors.append(cleanup_error)
+            else:
+                errors.extend(
+                    _move_to_identity_recovery(
+                        temporary,
+                        recovery_root=recovery_root,
+                        label=(
+                            owned_label
+                            if temporary_identity == owned_identity
+                            else foreign_label
+                        ),
+                        identity=temporary_identity,
+                        signature=(
+                            owned_signature
+                            if temporary_identity == owned_identity
+                            else None
+                        ),
+                    )
+                )
+        return errors
 
-def _setup_chinese_font() -> None:
-    """让 matplotlib 能正确显示中文（Windows 优先微软雅黑）。"""
+    moved_identity = _identity_if_present(cleanup_path)
+    if moved_identity is None:
+        errors.append(FileNotFoundError("staged cleanup object disappeared"))
+        return errors
+    if moved_identity == owned_identity and retain_owned:
+        errors.extend(
+            _move_to_identity_recovery(
+                cleanup_path,
+                recovery_root=recovery_root,
+                label=owned_label,
+                identity=owned_identity,
+                signature=owned_signature,
+            )
+        )
+    elif moved_identity == owned_identity:
+        try:
+            _delete_owned_file(cleanup_path, owned_identity)
+        except BaseException as exc:
+            errors.append(exc)
+    else:
+        errors.extend(
+            _move_to_identity_recovery(
+                cleanup_path,
+                recovery_root=recovery_root,
+                label=foreign_label,
+                identity=moved_identity,
+            )
+        )
+    return errors
+
+
+def _owned_stream_signature(
+    stream: BinaryIO,
+    owned_identity: tuple[int, int],
+    *,
+    digest: bytes | None = None,
+    expected_size: int | None = None,
+) -> tuple[int, int, int, bytes, int]:
+    """Derive stage content and metadata only through its reserved stream."""
+    current = os.fstat(stream.fileno())
+    if expected_size is not None and current.st_size != expected_size:
+        raise OSError("reserved stream size does not match completed write")
+    if digest is None:
+        stream.seek(0)
+        hasher = hashlib.sha256()
+        while chunk := stream.read(1024 * 1024):
+            hasher.update(chunk)
+        digest = hasher.digest()
+    return (
+        owned_identity[0],
+        owned_identity[1],
+        current.st_size,
+        digest,
+        current.st_mtime_ns,
+    )
+
+
+def _write_all(stream: BinaryIO, payload: bytes | memoryview) -> int:
+    """Write a complete payload without reopening the reserved stream path."""
+    remaining = memoryview(payload).cast("B")
+    total = len(remaining)
+    offset = 0
+    while offset < total:
+        accepted = stream.write(remaining[offset:])
+        pending = total - offset
+        if (
+            isinstance(accepted, bool)
+            or not isinstance(accepted, int)
+            or accepted <= 0
+            or accepted > pending
+        ):
+            raise OSError("invalid reserved stream write progress")
+        offset += accepted
+    return total
+
+
+class _WriteAllStream:
+    """Make each renderer write complete on the exact reserved stream."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+
+    def write(self, payload: bytes | memoryview) -> int:
+        return _write_all(self._stream, payload)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+
+def _write_report_atomic(
+    report: dict[str, object],
+    path: Path,
+) -> tuple[int, int, int, bytes, int]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    ownership: list[tuple[int, int]] = []
+    owned_identity: tuple[int, int] | None = None
+    owned_signature: tuple[int, int, int, bytes, int] | None = None
+    write_complete = False
+    stage_published = False
+    stream: BinaryIO | None = None
+    try:
+        stream = _reserve_owned_file(temporary, ownership)
+        owned_identity = ownership[0]
+        payload = (
+            json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        # The stream.write operations stay inside _write_all after reservation.
+        _write_all(stream, payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+        owned_signature = _owned_stream_signature(
+            stream,
+            owned_identity,
+            digest=hashlib.sha256(payload).digest(),
+            expected_size=len(payload),
+        )
+        write_complete = True
+        _publish_no_replace(temporary, path)
+        stage_published = True
+        if _directory_identity(path) != owned_identity:
+            raise FileExistsError("report stage ownership changed during publication")
+        stream_to_close = stream
+        stream = None
+        stream_to_close.close()
+        cleanup_errors = _cleanup_owned_temporary(
+            temporary,
+            owned_identity,
+            recovery_root=(
+                path.parent.parent
+                if path.parent.name.startswith(".alphamaster-backtest-")
+                else path.parent
+            ),
+            retain_owned=False,
+            owned_signature=owned_signature,
+        )
+        if cleanup_errors:
+            raise cleanup_errors[0]
+        return owned_signature
+    except BaseException as primary_error:
+        cleanup_errors: list[BaseException] = []
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if owned_identity is None and ownership:
+            owned_identity = ownership[0]
+        if owned_identity is not None:
+            if stage_published:
+                try:
+                    _delete_owned_file(path, owned_identity)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            cleanup_errors.extend(
+                _cleanup_owned_temporary(
+                    temporary,
+                    owned_identity,
+                    recovery_root=(
+                        path.parent.parent
+                        if path.parent.name.startswith(".alphamaster-backtest-")
+                        else path.parent
+                    ),
+                    retain_owned=write_complete,
+                    owned_signature=owned_signature,
+                )
+            )
+        if cleanup_errors:
+            _raise_primary_after_cleanup(
+                primary_error,
+                cleanup_errors,
+                "secondary owned temporary cleanup failure",
+            )
+        raise
+
+
+def _write_equity_chart(result, destination: object, mode_label: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
     from matplotlib import font_manager
 
-    candidates = [
-        "Microsoft YaHei",
-        "SimHei",
-        "SimSun",
-        "Noto Sans CJK SC",
-        "Source Han Sans SC",
-        "Arial Unicode MS",
-    ]
-    available = {f.name for f in font_manager.fontManager.ttflist}
-    for name in candidates:
-        if name in available:
-            plt.rcParams["font.sans-serif"] = [name, "DejaVu Sans"]
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    for candidate in ("Microsoft YaHei", "SimHei", "SimSun", "Noto Sans CJK SC"):
+        if candidate in available:
+            plt.rcParams["font.sans-serif"] = [candidate, "DejaVu Sans"]
             break
     plt.rcParams["axes.unicode_minus"] = False
 
+    figure, axis = plt.subplots(figsize=(12, 5), dpi=110)
+    axis.plot(result.cum_pnl, linewidth=1.5)
+    axis.set_title(f"{mode_label} · {result.symbol} · V2 shared execution")
+    axis.set_xlabel("bar")
+    axis.set_ylabel("cumulative net log return")
+    axis.grid(alpha=0.25)
+    figure.savefig(destination, bbox_inches="tight", format="png")
+    plt.close(figure)
 
-def plot_equity_curves(results_map: dict, output_dir: str, times_arr: np.ndarray | None = None):
-    """绘制各品种 + 等权组合的资金曲线（中文标注）。
 
-    Args:
-        results_map: {symbol: {"pnl": np.array, "cum_pnl": np.array, ...}}
-        output_dir:  输出目录
-        times_arr:   时间戳数组（Unix秒），用于 X 轴刻度
-    """
-    _setup_chinese_font()
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    syms   = list(results_map.keys())
-    n_syms = len(syms)
-
-    fig, ax_eq = plt.subplots(figsize=(18, 7), dpi=110)
-
-    colors = ["#1565c0", "#00897b", "#e65100", "#6a1b9a", "#558b2f", "#b71c1c"]
-
-    # 等权组合 PnL
-    all_pnls = np.stack([results_map[s]["pnl"] for s in syms], axis=0)
-    port_pnl = all_pnls.mean(axis=0)
-    port_cum = np.cumsum(port_pnl)
-
-    T = len(port_cum)
-    x = np.arange(T)
-
-    if n_syms == 1:
-        sym = syms[0]
-        cum = results_map[sym]["cum_pnl"]
-        ax_eq.plot(
-            x, cum, linewidth=2.0, color="#1565c0",
-            label=f"{sym}（索提诺 {results_map[sym]['sortino']:+.2f}）",
-        )
-        ax_eq.fill_between(x, cum, 0, where=cum >= 0, alpha=0.08, color="#1565c0")
-        ax_eq.fill_between(x, cum, 0, where=cum < 0,  alpha=0.08, color="#b71c1c")
-        title_head = f"{sym} 资金曲线"
-        show_pnl, show_cum = results_map[sym]["pnl"], cum
-    else:
-        for i, sym in enumerate(syms):
-            cum = results_map[sym]["cum_pnl"]
-            ax_eq.plot(
-                x, cum, linewidth=0.8, alpha=0.65, color=colors[i % len(colors)],
-                label=f"{sym}（索提诺 {results_map[sym]['sortino']:+.2f}）",
+def _write_owned_chart(
+    result: object,
+    path: Path,
+    mode_label: str,
+) -> tuple[int, int, int, bytes, int]:
+    """Reserve chart identity before invoking the fallible renderer."""
+    ownership: list[tuple[int, int]] = []
+    owned_identity: tuple[int, int] | None = None
+    owned_signature: tuple[int, int, int, bytes, int] | None = None
+    stream: BinaryIO | None = None
+    try:
+        stream = _reserve_owned_file(path, ownership)
+        owned_identity = ownership[0]
+        _write_equity_chart(result, _WriteAllStream(stream), mode_label)
+        stream.flush()
+        os.fsync(stream.fileno())
+        owned_signature = _owned_stream_signature(stream, owned_identity)
+        if _directory_identity(path) != owned_identity:
+            raise FileExistsError("chart stage ownership changed during rendering")
+        stream_to_close = stream
+        stream = None
+        stream_to_close.close()
+        return owned_signature
+    except BaseException as primary_error:
+        close_errors: list[BaseException] = []
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+        if owned_identity is None and ownership:
+            owned_identity = ownership[0]
+        cleanup_errors = (
+            _cleanup_owned_temporary(
+                path,
+                owned_identity,
+                recovery_root=path.parent.parent,
+                retain_owned=False,
+                owned_label="chart-stage",
+                foreign_label="foreign-chart-stage",
+                owned_signature=owned_signature,
             )
-        ax_eq.plot(
-            x, port_cum, linewidth=2.2, color="black",
-            label=f"等权组合（索提诺 {calc_sortino(port_pnl):+.2f}）",
+            if owned_identity is not None
+            else []
         )
-        ax_eq.fill_between(x, port_cum, 0, where=port_cum >= 0, alpha=0.06, color="#1565c0")
-        ax_eq.fill_between(x, port_cum, 0, where=port_cum < 0,  alpha=0.06, color="#b71c1c")
-        title_head = "多因子组合资金曲线"
-        show_pnl, show_cum = port_pnl, port_cum
-
-    ax_eq.axhline(0, color="gray", linewidth=0.5, linestyle="--")
-    ax_eq.set_ylabel("累计对数收益", fontsize=10)
-    ax_eq.legend(loc="upper left", fontsize=9, framealpha=0.7)
-    ax_eq.grid(alpha=0.25)
-    ax_eq.set_title(
-        f"{title_head}  |  "
-        f"总收益={show_cum[-1]:+.3f}  "
-        f"夏普={calc_sharpe(show_pnl):+.2f}  "
-        f"索提诺={calc_sortino(show_pnl):+.2f}  "
-        f"盈亏比={_fmt_pl_ratio(results_map)}",
-        fontsize=11, pad=8,
-    )
-
-    # X 轴时间刻度
-    if times_arr is not None and len(times_arr) == T:
-        from datetime import datetime, timezone
-        step  = max(1, T // 10)
-        ticks = x[::step]
-        labels = [
-            datetime.fromtimestamp(int(times_arr[i]), tz=timezone.utc).strftime("%Y-%m-%d")
-            for i in range(0, T, step)
-        ]
-        ax_eq.set_xticks(ticks)
-        ax_eq.set_xticklabels(labels[:len(ticks)], fontsize=8, rotation=20)
-    ax_eq.set_xlabel("日期", fontsize=9)
-
-    path = str(Path(output_dir) / "portfolio_equity.png")
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  资金曲线图已保存 → {path}")
-    return path
+        cleanup_errors = close_errors + cleanup_errors
+        _raise_primary_after_cleanup(
+            primary_error,
+            cleanup_errors,
+            "secondary chart stage cleanup failure",
+        )
+        raise
 
 
-def export_equity_json(
-    results_map: dict,
-    output_dir: str,
-    times_arr: np.ndarray | None = None,
-    max_points: int = 1500,
-    rolling_window: int = 500,
-):
-    """导出资金曲线原始数据为 JSON，供前端渲染交互式 HTML 图表。
+def _publish_no_replace(staged_path: Path, final_path: Path) -> None:
+    """Atomically publish a complete staged file only when final is absent."""
+    os.link(staged_path, final_path)
 
-    结构：
-        {
-          "labels": [...时间标签],
-          "n_points": int, "total_bars": int,
-          "rolling_window": int,
-          "symbols": { sym: { equity, rolling_sharpe, sharpe, sortino,
-                              total_return, profit_loss_ratio } },
-          "portfolio": { ... }   # 多品种时才有
-        }
-    """
-    syms = list(results_map.keys())
-    if not syms:
+
+def _restore_no_replace(backup_path: Path, final_path: Path) -> None:
+    """Atomically restore an owned backup without replacing a competitor."""
+    os.link(backup_path, final_path)
+
+
+def _identity_from_stat(current: os.stat_result) -> tuple[int, int]:
+    """Normalize path snapshots to the native Windows handle identity shape."""
+    if os.name == "nt":
+        return current.st_dev & 0xFFFFFFFF, current.st_ino
+    return current.st_dev, current.st_ino
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    """Identify one directory entry without following a replacement link."""
+    return _identity_from_stat(path.lstat())
+
+
+def _identity_if_present(path: Path) -> tuple[int, int] | None:
+    try:
+        return _directory_identity(path)
+    except FileNotFoundError:
         return None
 
-    all_pnls = np.stack([results_map[s]["pnl"] for s in syms], axis=0)
-    port_pnl = all_pnls.mean(axis=0)
-    port_cum = np.cumsum(port_pnl)
-    T = len(port_cum)
 
-    # 均匀降采样，保证首尾点在内，避免 JSON 过大导致前端卡顿
-    if T > max_points:
-        idx = np.unique(np.linspace(0, T - 1, max_points).astype(int))
-    else:
-        idx = np.arange(T)
-
-    def _sample(arr: np.ndarray) -> list[float | None]:
-        out = []
-        for i in idx:
-            v = arr[i]
-            if v is None or (isinstance(v, float) and math.isnan(v)):
-                out.append(None)
-            else:
-                out.append(round(float(v), 6))
-        return out
-
-    if times_arr is not None and len(times_arr) == T:
-        from datetime import datetime, timezone
-
-        labels = [
-            datetime.fromtimestamp(int(times_arr[i]), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-            for i in idx
-        ]
-    else:
-        labels = [str(int(i)) for i in idx]
-
-    out: dict = {
-        "labels": labels,
-        "n_points": int(len(idx)),
-        "total_bars": int(T),
-        "rolling_window": int(rolling_window),
-        "symbols": {},
-    }
-    for s in syms:
-        cum = results_map[s]["cum_pnl"]
-        roll = calc_rolling_sharpe(results_map[s]["pnl"], window=rolling_window)
-        pl = results_map[s].get("profit_loss_ratio")
-        out["symbols"][s] = {
-            "equity": _sample(cum),
-            "rolling_sharpe": _sample(roll),
-            "sharpe": round(float(results_map[s]["sharpe"]), 4),
-            "sortino": round(float(results_map[s]["sortino"]), 4),
-            "total_return": round(float(results_map[s]["total_return"]), 6),
-            "profit_loss_ratio": round(float(pl), 4) if pl is not None else None,
-        }
-
-    if len(syms) > 1:
-        pl_vals = [
-            results_map[s]["profit_loss_ratio"]
-            for s in syms
-            if results_map[s].get("profit_loss_ratio") is not None
-        ]
-        port_pl = float(sum(pl_vals) / len(pl_vals)) if pl_vals else None
-        out["portfolio"] = {
-            "equity": _sample(port_cum),
-            "rolling_sharpe": _sample(calc_rolling_sharpe(port_pnl, window=rolling_window)),
-            "sharpe": round(float(calc_sharpe(port_pnl)), 4),
-            "sortino": round(float(calc_sortino(port_pnl)), 4),
-            "total_return": round(float(port_cum[-1]), 6),
-            "profit_loss_ratio": round(port_pl, 4) if port_pl is not None else None,
-        }
-
-    path = Path(output_dir) / "equity_curve.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False)
-    print(f"  资金曲线数据已保存 → {path}")
-    return str(path)
+def _ordinary_final_identity_if_present(path: Path) -> tuple[int, int] | None:
+    """Identify an occupied final without following a reparse entry."""
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return None
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or bool(getattr(current, "st_file_attributes", 0) & reparse_attribute)
+        or bool(getattr(current, "st_reparse_tag", 0))
+    ):
+        raise OSError("output target is not an ordinary regular file")
+    return _identity_from_stat(current)
 
 
-# ── 主流程 ────────────────────────────────────────────────────────────────────
-
-def main():
-    OUTPUT_DIR  = "backtest_output"
-    single_mode = "--single" in sys.argv
-    # 回测强制离线：只用本地 Parquet，永不连 MT5 在线
-    if "--online" in sys.argv or "--mt5" in sys.argv:
-        print("[ERROR] 回测已禁用在线/MT5 拉数。请使用本地 Parquet（--data-file 或策略内 data_file）。")
-        sys.exit(1)
-
-    strategy_file = None
-    data_file_arg = None
-    commission_pct = DEFAULT_COMMISSION_PCT
-    slippage_pct = DEFAULT_SLIPPAGE_PCT
-    for i, arg in enumerate(sys.argv):
-        if arg == "--strategy-file" and i + 1 < len(sys.argv):
-            strategy_file = sys.argv[i + 1]
-        elif arg == "--data-file" and i + 1 < len(sys.argv):
-            data_file_arg = sys.argv[i + 1]
-        elif arg == "--commission" and i + 1 < len(sys.argv):
-            commission_pct = float(sys.argv[i + 1])
-        elif arg == "--slippage" and i + 1 < len(sys.argv):
-            slippage_pct = float(sys.argv[i + 1])
-
-    if commission_pct < 0 or slippage_pct < 0:
-        print("[ERROR] 手续费/滑点不能为负"); sys.exit(1)
-    cost_rate_all = (commission_pct + slippage_pct) / 100.0
-    print(
-        f"\n交易成本（单边）: "
-        f"手续费={commission_pct:g}%  滑点={slippage_pct:g}%  "
-        f"→ cost_rate={cost_rate_all:.8f}"
+def _open_owned_read_stream(
+    path: Path,
+    expected_identity: tuple[int, int],
+) -> BinaryIO:
+    """Open the exact ordinary Windows file while denying replacement."""
+    if os.name != "nt":
+        raise OSError("owned signature reads require Windows handle semantics")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
     )
-    print("数据模式: 强制离线 Parquet（不连接 MT5）")
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x80000000,
+        0x00000001,
+        None,
+        3,
+        0x00000080 | 0x00200000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        current_identity = _windows_handle_identity(int(handle))
+        if current_identity != expected_identity:
+            raise FileExistsError("signature path no longer names the approved file")
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        raise
+    return os.fdopen(descriptor, "rb", buffering=0)
 
-    # ── 2. 加载策略 ─────────────────────────────────────────────────
-    strategy_data_file = None
-    print(f"\n{'='*62}")
-    if strategy_file:
-        data = load_strategy(Path(strategy_file))
-        if data is None:
-            print(f"[ERROR] 找不到: {strategy_file}"); sys.exit(1)
-        strategy_data_file = data.get("data_file")
-        sym = data.get("symbol")
-        if not sym:
-            stem = Path(strategy_file).stem
-            if stem.startswith("best_"):
-                sym = stem.replace("best_", "", 1)
-            elif stem.startswith("strategy_"):
-                # strategy_ADAUSD_step0084_score2.4021 / strategy_ADAUSD (1)
-                rest = stem.replace("strategy_", "", 1)
-                sym = rest.split("_step")[0].split(" ")[0]
-        if not sym:
-            print("[ERROR] 策略文件未包含 symbol，且无法从文件名识别"); sys.exit(1)
-        symbol_formulas = {sym: data["formula"]}
-        sc = data.get("best_score", "N/A")
-        score_txt = f"{sc:.3f}" if isinstance(sc, (int, float)) else str(sc)
-        print(f"  模式: 单策略文件 ({Path(strategy_file).name})")
-        print(f"  {sym}: score={score_txt}  {decode_formula(data['formula'])}")
-        if strategy_data_file:
-            print(f"  策略记录数据: {strategy_data_file}")
-    elif single_mode:
-        data = load_strategy(Path(Config.STRATEGY_FILE))
-        if data is None:
-            print(f"[ERROR] 找不到: {Config.STRATEGY_FILE}"); sys.exit(1)
-        strategy_data_file = data.get("data_file")
-        symbol_formulas = {sym: data["formula"] for sym in Config.SYMBOLS}
-        print("  模式: 单公式（所有品种共用）")
-    else:
-        symbol_formulas = {}
-        for sym in Config.SYMBOLS:
-            path = Path("strategies") / f"best_{sym}.json"
-            data = load_strategy(path)
-            if data is None:
-                print(f"  [缺失] {sym}")
-                continue
-            ver = data.get("vocab_version", "unknown")
-            if ver != VOCAB_VERSION:
-                print(f"  [跳过] {sym}: vocab_version 不符 ({ver} vs {VOCAB_VERSION})")
-                continue
-            symbol_formulas[sym] = data["formula"]
-            if not strategy_data_file and data.get("data_file"):
-                strategy_data_file = data.get("data_file")
-            sc = data.get("best_score", "N/A")
-            print(f"  {sym}: score={sc:.3f}  {decode_formula(data['formula'])}")
 
-    if not symbol_formulas:
-        print("[ERROR] 没有有效策略，请先运行训练"); sys.exit(1)
+def _file_signature(
+    path: Path,
+    expected_identity: tuple[int, int] | None = None,
+    *,
+    generated_at_out: list[str] | None = None,
+) -> tuple[int, int, int, bytes, int]:
+    """Hash one exact ordinary file using bounded locked-handle reads."""
+    expected = (
+        _ordinary_final_identity_if_present(path)
+        if expected_identity is None
+        else expected_identity
+    )
+    if expected is None:
+        raise FileNotFoundError(path)
+    hasher = hashlib.sha256()
+    generated_window = b""
+    generated_at: str | None = None
+    with _open_owned_read_stream(path, expected) as stream:
+        before = os.fstat(stream.fileno())
+        if _identity_from_stat(before) != expected:
+            raise FileExistsError("signature stream identity changed before read")
+        while True:
+            chunk = stream.read(SIGNATURE_READ_CHUNK_SIZE)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            if generated_at_out is not None and generated_at is None:
+                generated_window += chunk
+                match = re.search(
+                    rb'"generated_at"\s*:\s*"([^"\\]{1,256})"',
+                    generated_window,
+                )
+                if match is not None:
+                    generated_at = match.group(1).decode("ascii")
+                else:
+                    generated_window = generated_window[-1024:]
+            if len(chunk) > SIGNATURE_READ_CHUNK_SIZE:
+                raise OSError("signature reader exceeded bounded chunk size")
+        after = os.fstat(stream.fileno())
+    before_metadata = (
+        _identity_from_stat(before),
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_metadata = (
+        _identity_from_stat(after),
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if before_metadata != after_metadata or after_metadata[0] != expected:
+        raise OSError("output changed while its identity was captured")
+    if generated_at_out is not None and generated_at is not None:
+        generated_at_out.append(generated_at)
+    return expected[0], expected[1], after.st_size, hasher.digest(), after.st_mtime_ns
 
-    cost_rates = {sym: cost_rate_all for sym in symbol_formulas}
-    print(f"{'='*62}\n")
 
-    # ── 3. 加载数据（仅本地 Parquet）────────────────────────────────
-    if not data_file_arg and strategy_data_file:
-        data_file_arg = str(strategy_data_file).strip() or None
+def _file_metadata_matches(
+    path: Path,
+    signature: tuple[int, int, int, bytes, int],
+) -> bool:
+    """Revalidate an already-hashed file without rescanning its content."""
+    expected = signature[:2]
+    try:
+        if _ordinary_final_identity_if_present(path) != expected:
+            return False
+        with _open_owned_read_stream(path, expected) as stream:
+            current = os.fstat(stream.fileno())
+    except (OSError, ValueError):
+        return False
+    return (
+        _identity_from_stat(current) == expected
+        and current.st_size == signature[2]
+        and current.st_mtime_ns == signature[4]
+    )
 
-    if not data_file_arg:
-        print(
-            "[ERROR] 未指定本地 Parquet。\n"
-            "请传入 --data-file PATH\\TO\\SYMBOL_TF.parquet，\n"
-            "或使用包含 data_file 字段的策略 JSON（本软件训练生成）。\n"
-            "回测不会连接 MT5 / 不会使用在线行情。"
+
+def _windows_handle_identity(handle: int) -> tuple[int, int]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    information = (ctypes.c_ubyte * 52)()
+    if not kernel32.GetFileInformationByHandle(
+        ctypes.c_void_p(handle), ctypes.byref(information)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    values = struct.unpack("<13I", bytes(information))
+    return values[7], (values[11] << 32) | values[12]
+
+
+def _reserve_owned_file(
+    path: Path,
+    ownership: list[tuple[int, int]],
+) -> BinaryIO:
+    """Create and return the exact locked file stream with identity recorded."""
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80000000 | 0x40000000,
+            0x00000001 | 0x00000002,
+            None,
+            1,
+            0x00000080,
+            None,
         )
-        sys.exit(1)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            owned_identity = _windows_handle_identity(int(handle))
+            ownership.append(owned_identity)
+            descriptor = msvcrt.open_osfhandle(
+                int(handle), os.O_RDWR | os.O_BINARY
+            )
+        except BaseException:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            raise
+        return os.fdopen(descriptor, "w+b", buffering=0)
 
-    parquet_path = Path(data_file_arg)
-    if not parquet_path.exists():
-        print(f"[ERROR] Parquet 不存在: {parquet_path}")
-        sys.exit(1)
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    try:
+        current = os.fstat(descriptor)
+        ownership.append((current.st_dev, current.st_ino))
+        return os.fdopen(descriptor, "w+b", buffering=0)
+    except BaseException:
+        os.close(descriptor)
+        raise
 
-    print(f"正在加载数据（离线 Parquet: {parquet_path}）...")
-    pm = ParquetDataManager(str(parquet_path))
-    pm.load()
-    raw_dict = pm.raw_dict
-    syms = pm.symbols
-    # 策略品种名与 Parquet 品种不一致时（单策略 + 单品种文件），映射公式到数据品种
-    if strategy_file and len(symbol_formulas) == 1 and len(syms) == 1:
-        strat_sym = next(iter(symbol_formulas))
-        data_sym = syms[0]
-        if strat_sym != data_sym:
-            formula = symbol_formulas[strat_sym]
-            print(f"  [映射] 策略品种 {strat_sym} → 数据品种 {data_sym}")
-            symbol_formulas = {data_sym: formula}
-            cost_rates = {data_sym: cost_rate_all}
 
-    T = raw_dict["open"].shape[1]
-    times_all = raw_dict.get("time", None)
-    print(f"  品种: {syms}  T={T} bars\n")
+def _reserve_owned_directory(
+    path: Path,
+    ownership: list[tuple[int, int]],
+) -> None:
+    """Atomically create a directory and capture identity from its locked handle."""
+    if os.name == "nt":
+        class UnicodeString(ctypes.Structure):
+            _fields_ = [
+                ("Length", ctypes.c_ushort),
+                ("MaximumLength", ctypes.c_ushort),
+                ("Buffer", ctypes.c_wchar_p),
+            ]
 
-    # ── 4. 为每品种计算因子 + 回测 ───────────────────────────────
-    vm   = StackVM()
-    # 因果特征化：_robust_norm 现为滚动窗口实现，传入全量序列是安全的
-    # 每个时间步 t 的归一化参数只依赖 [t-w+1..t]，无 look-ahead
-    feat = MT5FeatureEngineer.compute_features(raw_dict)  # [N, F, T]，因果安全
+        class ObjectAttributes(ctypes.Structure):
+            _fields_ = [
+                ("Length", ctypes.c_ulong),
+                ("RootDirectory", ctypes.c_void_p),
+                ("ObjectName", ctypes.POINTER(UnicodeString)),
+                ("Attributes", ctypes.c_ulong),
+                ("SecurityDescriptor", ctypes.c_void_p),
+                ("SecurityQualityOfService", ctypes.c_void_p),
+            ]
 
-    results_map = {}
-    backtest_results = []
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_void_p)]
 
-    for i, sym in enumerate(syms):
-        if sym not in symbol_formulas:
-            print(f"  [跳过] {sym}（无策略）")
-            continue
+        native_path = "\\??\\" + str(path.resolve())
+        buffer = ctypes.create_unicode_buffer(native_path)
+        name = UnicodeString(
+            len(native_path) * 2,
+            (len(native_path) + 1) * 2,
+            ctypes.cast(buffer, ctypes.c_wchar_p),
+        )
+        attributes = ObjectAttributes(
+            ctypes.sizeof(ObjectAttributes),
+            None,
+            ctypes.pointer(name),
+            0x00000040,
+            None,
+            None,
+        )
+        status_block = IoStatusBlock()
+        handle = ctypes.c_void_p()
+        ntdll = ctypes.WinDLL("ntdll")
+        status = ntdll.NtCreateFile(
+            ctypes.byref(handle),
+            0x00010000 | 0x00000080 | 0x00100000,
+            ctypes.byref(attributes),
+            ctypes.byref(status_block),
+            None,
+            0x00000080,
+            0x00000001 | 0x00000002,
+            2,
+            0x00000001 | 0x00000020,
+            None,
+            0,
+        )
+        if status != 0:
+            unsigned_status = ctypes.c_ulong(status).value
+            if unsigned_status == 0xC0000035:
+                raise FileExistsError("owned directory candidate already exists")
+            raise OSError(f"NtCreateFile directory status 0x{unsigned_status:08x}")
+        try:
+            native_identity = _windows_handle_identity(int(handle.value))
+            ownership.append(native_identity)
+        finally:
+            ctypes.WinDLL("kernel32").CloseHandle(handle)
+        return
 
-        formula   = symbol_formulas[sym]
-        cost_rate = cost_rates.get(sym, cost_rate_all)
-        feat_i    = feat[i:i+1]
-        raw_i     = {k: v[i:i+1] for k, v in raw_dict.items()}
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CREAT | os.O_EXCL)
+    try:
+        current = os.fstat(descriptor)
+        ownership.append((current.st_dev, current.st_ino))
+    finally:
+        os.close(descriptor)
 
-        engine    = BacktestEngine(formula=formula, cost_rate=cost_rate)
-        sym_res   = engine.run(raw_i, feat_i, [sym])
-        backtest_results.extend(sym_res)
 
-        r = sym_res[0]
-        pnl_arr = r.pnl
-        cum_arr = r.cum_pnl
-        sharpe  = calc_sharpe(pnl_arr)
-        sortino = calc_sortino(pnl_arr)
-        pl_ratio = r.profit_loss_ratio
+def _open_owned_delete_handle(
+    path: Path,
+    owned_identity: tuple[int, int],
+    *,
+    directory: bool,
+) -> int:
+    """Open and lock the exact Windows object against rename/delete."""
+    if os.name != "nt":
+        raise OSError("owned cleanup requires Windows handle semantics")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    flags = 0x00200000 | (0x02000000 if directory else 0)
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x00010000 | 0x00000080,
+        0x00000001 | 0x00000002,
+        None,
+        3,
+        flags,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        current_identity = _windows_handle_identity(int(handle))
+    except BaseException:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        raise
+    if current_identity != owned_identity:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        raise FileExistsError("cleanup path no longer names the owned object")
+    return int(handle)
 
-        results_map[sym] = {
-            "pnl":          pnl_arr,
-            "cum_pnl":      cum_arr,
-            "total_return": r.total_return,
-            "sharpe":       sharpe,
-            "sortino":      sortino,
-            "n_trades":     r.n_trades,
-            "win_rate":     r.win_rate,
-            "avg_hold":     r.avg_hold_bars,
-            "profit_loss_ratio": pl_ratio,
-            "cost_rate":    cost_rate,
-        }
 
-    # ── 5. 打印各品种统计 ─────────────────────────────────────────────
-    print(f"\n{'='*62}")
-    print(f"  多因子回测报告")
-    print(f"{'='*62}")
-    header = f"{'品种':12s} {'PnL':>8} {'Sharpe':>8} {'Sortino':>8} {'盈亏比':>8} {'Trades':>7} {'WinRate':>8} {'AvgH':>6}"
-    print(f"  {header}")
-    print(f"  {'─'*72}")
-    for sym, d in results_map.items():
-        pl = d["profit_loss_ratio"]
-        pl_s = f"{pl:8.3f}" if pl is not None else f"{'—':>8}"
-        print(f"  {sym:12s} "
-              f"{d['total_return']:+8.3f} "
-              f"{d['sharpe']:+8.3f} "
-              f"{d['sortino']:+8.3f} "
-              f"{pl_s} "
-              f"{d['n_trades']:7d} "
-              f"{d['win_rate']:8.1%} "
-              f"{d['avg_hold']:6.1f}h")
+def _dispose_owned_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    disposition = ctypes.c_ubyte(1)
+    if not kernel32.SetFileInformationByHandle(
+        ctypes.c_void_p(handle),
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
 
-    # 等权组合
-    p_pl_ratio = None
-    if results_map:
-        all_pnls = np.stack([d["pnl"] for d in results_map.values()], axis=0)
-        port_pnl = all_pnls.mean(axis=0)
-        port_cum = np.cumsum(port_pnl)
-        p_sharpe  = calc_sharpe(port_pnl)
-        p_sortino = calc_sortino(port_pnl)
-        pl_vals = [d["profit_loss_ratio"] for d in results_map.values()
-                   if d["profit_loss_ratio"] is not None]
-        p_pl_ratio = float(sum(pl_vals) / len(pl_vals)) if pl_vals else None
-        pl_s = f"{p_pl_ratio:8.3f}" if p_pl_ratio is not None else f"{'—':>8}"
-        print(f"  {'─'*72}")
-        print(f"  {'Portfolio':12s} "
-              f"{port_cum[-1]:+8.3f} "
-              f"{p_sharpe:+8.3f} "
-              f"{p_sortino:+8.3f} "
-              f"{pl_s}")
-        print(f"\n  正收益品种: {sum(1 for d in results_map.values() if d['total_return']>0)}/{len(results_map)}")
-        print(f"  Sharpe>1 品种: {sum(1 for d in results_map.values() if d['sharpe']>1)}/{len(results_map)}")
-    print(f"{'='*62}\n")
 
-    # ── 6. 资金曲线图 ─────────────────────────────────────────────────
-    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-    if results_map:
-        times_np = times_all[0].numpy() if times_all is not None else None
-        plot_equity_curves(results_map, OUTPUT_DIR, times_np)
-        export_equity_json(results_map, OUTPUT_DIR, times_np)
+def _close_windows_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.CloseHandle(ctypes.c_void_p(handle)):
+        raise ctypes.WinError(ctypes.get_last_error())
 
-    # ── 7. 资金曲线图已在步骤 6 生成；跳过 K 线/逐笔交易图以加快回测 ─────
 
-    # ── 8. 保存 JSON 报告 ─────────────────────────────────────────────
-    report = {
-        "mode": "single" if single_mode else "multi_factor",
-        "cost_rates": cost_rates,
-        "symbols": {},
-        "portfolio": {},
+def _delete_owned_file(path: Path, owned_identity: tuple[int, int]) -> None:
+    handle = _open_owned_delete_handle(path, owned_identity, directory=False)
+    try:
+        _dispose_owned_handle(handle)
+    except BaseException:
+        _close_windows_handle(handle)
+        raise
+    _close_windows_handle(handle)
+
+
+def _delete_owned_transaction_tree(
+    root: Path,
+    owned_identity: tuple[int, int],
+    owned_children: dict[str, tuple[int, int]],
+) -> None:
+    """Delete only manifest-owned children and their locked owning directory."""
+    handle = _open_owned_delete_handle(root, owned_identity, directory=True)
+    try:
+        entries = list(os.scandir(root))
+        for entry in entries:
+            entry_path = Path(entry.path)
+            expected_identity = owned_children.get(entry.name)
+            if expected_identity is None:
+                continue
+            try:
+                entry_stat = entry_path.lstat()
+                if stat.S_ISDIR(entry_stat.st_mode) or stat.S_ISLNK(
+                    entry_stat.st_mode
+                ):
+                    continue
+                _delete_owned_file(entry_path, expected_identity)
+            except BaseException:
+                continue
+        if list(os.scandir(root)):
+            raise OSError("transaction cleanup retained unowned or changed children")
+        _dispose_owned_handle(handle)
+    except BaseException:
+        _close_windows_handle(handle)
+        raise
+    _close_windows_handle(handle)
+
+
+def _cleanup_owned_empty_directory(
+    root: Path,
+    owned_identity: tuple[int, int],
+) -> list[BaseException]:
+    """Remove an empty directory only while its exact object is locked."""
+    try:
+        handle = _open_owned_delete_handle(root, owned_identity, directory=True)
+    except BaseException as exc:
+        return [exc]
+    try:
+        if list(os.scandir(root)):
+            raise OSError("owned output directory is no longer empty")
+        _dispose_owned_handle(handle)
+    except BaseException as exc:
+        try:
+            _close_windows_handle(handle)
+        except BaseException:
+            pass
+        return [exc]
+    try:
+        _close_windows_handle(handle)
+    except BaseException as exc:
+        return [exc]
+    return []
+
+
+def _raise_primary_after_cleanup(
+    primary_error: BaseException,
+    cleanup_errors: list[BaseException],
+    note: str,
+) -> None:
+    """Attach bounded cleanup evidence; the active handler must bare re-raise."""
+    if cleanup_errors:
+        _add_fixed_note(primary_error, note)
+        if isinstance(primary_error, Exception):
+            safe_cause = _cycle_safe_secondary(primary_error, cleanup_errors[0])
+            BaseException.__setattr__(primary_error, "__cause__", safe_cause)
+            BaseException.__setattr__(primary_error, "__suppress_context__", True)
+
+
+def _allocate_owned_directory(
+    parent: Path,
+    prefix: str,
+) -> tuple[Path, tuple[int, int]]:
+    """Boundedly allocate a directory whose identity survives callback failure."""
+    path = parent / f"{prefix}{uuid4().hex}"
+    ownership: list[tuple[int, int]] = []
+    try:
+        _reserve_owned_directory(path, ownership)
+    except BaseException as primary_error:
+        cleanup_errors = (
+            _cleanup_owned_empty_directory(path, ownership[0])
+            if ownership
+            else []
+        )
+        _raise_primary_after_cleanup(
+            primary_error,
+            cleanup_errors,
+            "secondary owned directory allocation cleanup failure",
+        )
+        raise
+    return path, ownership[0]
+
+
+def _acquire_output_root(output_root: Path) -> tuple[int, int] | None:
+    """Publish an exact-owned directory without replacing an existing root."""
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+    candidate, owned_identity = _allocate_owned_directory(
+        output_root.parent,
+        ".alphamaster-output-",
+    )
+    try:
+        _move_no_replace(candidate, output_root)
+    except FileExistsError:
+        cleanup_errors = _cleanup_owned_empty_directory(candidate, owned_identity)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+        try:
+            root_stat = output_root.lstat()
+        except OSError as exc:
+            raise OSError(
+                "pre-existing output root is not an ordinary directory"
+            ) from exc
+        reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or bool(getattr(root_stat, "st_file_attributes", 0) & reparse_attribute)
+            or bool(getattr(root_stat, "st_reparse_tag", 0))
+        ):
+            raise OSError("pre-existing output root is not an ordinary directory")
+        return None
+    except BaseException as primary_error:
+        cleanup_errors: list[BaseException] = []
+        if _identity_if_present(output_root) == owned_identity:
+            cleanup_errors.extend(
+                _cleanup_owned_empty_directory(output_root, owned_identity)
+            )
+        elif _identity_if_present(candidate) == owned_identity:
+            cleanup_errors.extend(
+                _cleanup_owned_empty_directory(candidate, owned_identity)
+            )
+        _raise_primary_after_cleanup(
+            primary_error,
+            cleanup_errors,
+            "secondary output directory acquisition cleanup failure",
+        )
+        raise
+    return owned_identity
+
+
+def _cleanup_owned_transaction(
+    transaction_root: Path,
+    owned_identity: tuple[int, int],
+    owned_children: dict[str, tuple[int, int]] | None = None,
+) -> list[BaseException]:
+    """Quarantine, verify, then remove only the exact created directory."""
+    cleanup_root = transaction_root.with_name(f"{transaction_root.name}.cleanup")
+    errors: list[BaseException] = []
+    move_error: BaseException | None = None
+    try:
+        _move_no_replace(transaction_root, cleanup_root)
+    except BaseException as exc:
+        move_error = exc
+
+    try:
+        cleanup_identity = _identity_if_present(cleanup_root)
+        source_identity = _identity_if_present(transaction_root)
+    except BaseException as exc:
+        errors.append(exc)
+        if move_error is not None:
+            errors.insert(0, move_error)
+        return errors
+
+    if cleanup_identity != owned_identity:
+        if cleanup_identity is not None:
+            try:
+                _move_no_replace(cleanup_root, transaction_root)
+            except BaseException as exc:
+                errors.append(exc)
+        if move_error is not None:
+            errors.insert(0, move_error)
+        else:
+            errors.insert(0, OSError("transaction directory ownership changed"))
+        return errors
+
+    if source_identity is not None:
+        errors.append(FileExistsError("transaction path was replaced during cleanup"))
+
+    try:
+        if _directory_identity(cleanup_root) != owned_identity:
+            raise OSError("transaction cleanup identity changed")
+        _delete_owned_transaction_tree(
+            cleanup_root,
+            owned_identity,
+            dict(owned_children or {}),
+        )
+    except BaseException as exc:
+        errors.append(exc)
+    if move_error is not None:
+        errors.insert(0, move_error)
+    return errors
+
+
+def _publish_output_set(
+    *,
+    report: dict[str, object],
+    result: object,
+    output_dir: str | Path,
+    stem: str,
+    mode_label: str,
+) -> Path:
+    """Publish a report/chart pair without mutating the tree on failure."""
+    output_root = Path(output_dir)
+    output_root_identity = _acquire_output_root(output_root)
+    report_path = output_root / f"{stem}.json"
+    chart_path = output_root / f"{stem}.png"
+    finals = (report_path, chart_path)
+    initial_final_identities = {
+        path: _ordinary_final_identity_if_present(path) for path in finals
     }
-    for sym, d in results_map.items():
-        formula = symbol_formulas.get(sym, [])
-        pl = d["profit_loss_ratio"]
-        report["symbols"][sym] = {
-            "formula":      formula,
-            "readable":     decode_formula(formula),
-            "cost_rate":    d["cost_rate"],
-            "total_return": round(d["total_return"], 6),
-            "sharpe":       round(d["sharpe"], 4),
-            "sortino":      round(d["sortino"], 4),
-            "n_trades":     d["n_trades"],
-            "win_rate":     round(d["win_rate"], 4),
-            "avg_hold_bars":round(d["avg_hold"], 2),
-            "profit_loss_ratio": round(pl, 4) if pl is not None else None,
+
+    try:
+        transaction_root, transaction_identity = _allocate_owned_directory(
+            output_root.parent,
+            ".alphamaster-backtest-",
+        )
+    except BaseException as primary_error:
+        cleanup_errors = (
+            _cleanup_owned_empty_directory(output_root, output_root_identity)
+            if output_root_identity is not None
+            else []
+        )
+        _raise_primary_after_cleanup(
+            primary_error,
+            cleanup_errors,
+            "secondary output directory cleanup failure",
+        )
+        raise
+    staged_report = transaction_root / "report.stage"
+    staged_chart = transaction_root / "chart.stage"
+    publication_identities: dict[Path, tuple[int, int]] = {}
+    validated_final_signatures: (
+        dict[Path, tuple[int, int, int, bytes, int]] | None
+    ) = None
+    existing_final_signatures: (
+        dict[Path, tuple[int, int, int, bytes, int]] | None
+    ) = None
+    rollback_root: Path | None = None
+    rollback_identity: tuple[int, int] | None = None
+    transaction_children: dict[str, tuple[int, int]] = {}
+    rollback_children: dict[str, tuple[int, int]] = {}
+
+    def ensure_rollback_root() -> Path:
+        nonlocal rollback_root, rollback_identity
+        if rollback_root is None:
+            rollback_root, rollback_identity = _allocate_owned_directory(
+                output_root.parent,
+                ".alphamaster-rollback-",
+            )
+        return rollback_root
+
+    def preserve_foreign(moved_path: Path, final_path: Path) -> list[BaseException]:
+        errors: list[BaseException] = []
+        try:
+            signature = _file_signature(moved_path)
+            recovery_path = output_root.parent / (
+                f".{final_path.name}.recovery-"
+                f"{signature[3].hex()[:16]}-{signature[0]:x}-{signature[1]:x}"
+            )
+            try:
+                _restore_no_replace(moved_path, recovery_path)
+            except FileExistsError:
+                if _file_signature(recovery_path) != signature:
+                    errors.append(
+                        FileExistsError("foreign recovery path is occupied")
+                    )
+            try:
+                _restore_no_replace(moved_path, final_path)
+            except FileExistsError:
+                pass
+        except BaseException as exc:
+            errors.append(exc)
+        return errors
+
+    def restore_output_tree() -> list[BaseException]:
+        errors: list[BaseException] = []
+        for final_path in finals:
+            owned_final = False
+            if final_path in publication_identities:
+                try:
+                    final_stat = final_path.stat()
+                    owned_final = _identity_from_stat(
+                        final_stat
+                    ) == publication_identities[final_path]
+                except BaseException as exc:
+                    errors.append(exc)
+            if owned_final:
+                try:
+                    quarantine = ensure_rollback_root() / (
+                        f"{final_path.suffix[1:]}.rollback.quarantine"
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                    try:
+                        _delete_owned_file(
+                            final_path,
+                            publication_identities[final_path],
+                        )
+                    except BaseException as delete_error:
+                        errors.append(delete_error)
+                    continue
+                move_error: BaseException | None = None
+                try:
+                    _move_no_replace(final_path, quarantine)
+                except BaseException as exc:
+                    move_error = exc
+                    errors.append(exc)
+                try:
+                    quarantine_stat = quarantine.stat()
+                    moved_identity = _identity_from_stat(quarantine_stat)
+                    if moved_identity != publication_identities[final_path]:
+                        errors.extend(preserve_foreign(quarantine, final_path))
+                    else:
+                        rollback_children[quarantine.name] = moved_identity
+                except BaseException as exc:
+                    if move_error is None:
+                        errors.append(exc)
+        if output_root_identity is not None:
+            errors.extend(
+                _cleanup_owned_empty_directory(output_root, output_root_identity)
+            )
+        return errors
+
+    def cleanup_transaction() -> BaseException | None:
+        errors = _cleanup_owned_transaction(
+            transaction_root,
+            transaction_identity,
+            transaction_children,
+        )
+        if rollback_root is not None and rollback_identity is not None:
+            errors.extend(
+                _cleanup_owned_transaction(
+                    rollback_root,
+                    rollback_identity,
+                    rollback_children,
+                )
+            )
+        return errors[0] if errors else None
+
+    try:
+        chart_signature = _write_owned_chart(result, staged_chart, mode_label)
+        transaction_children[staged_chart.name] = chart_signature[:2]
+        report_to_write = report
+        reusable_identities = {
+            path: _ordinary_final_identity_if_present(path) for path in finals
         }
-    if results_map:
-        report["portfolio"] = {
-            "total_return": round(float(port_cum[-1]), 6),
-            "sharpe":       round(p_sharpe, 4),
-            "sortino":      round(p_sortino, 4),
-            "profit_loss_ratio": round(p_pl_ratio, 4) if p_pl_ratio is not None else None,
+        if reusable_identities == initial_final_identities and all(
+            identity is not None for identity in reusable_identities.values()
+        ):
+            generated_at_values: list[str] = []
+            existing_final_signatures = {
+                report_path: _file_signature(
+                    report_path,
+                    reusable_identities[report_path],
+                    generated_at_out=generated_at_values,
+                ),
+                chart_path: _file_signature(
+                    chart_path,
+                    reusable_identities[chart_path],
+                ),
+            }
+            if not all(
+                _file_metadata_matches(path, existing_final_signatures[path])
+                for path in finals
+            ):
+                raise FileExistsError("occupied output pair changed during validation")
+            if generated_at_values:
+                existing_generated_at = generated_at_values[0]
+                try:
+                    if existing_generated_at.endswith("Z"):
+                        datetime.fromisoformat(
+                            existing_generated_at.replace("Z", "+00:00")
+                        )
+                        report_to_write = dict(report)
+                        report_to_write["generated_at"] = existing_generated_at
+                except ValueError:
+                    pass
+        report_signature = _write_report_atomic(report_to_write, staged_report)
+        transaction_children[staged_report.name] = report_signature[:2]
+        staged_identities = {
+            report_path: report_signature[:2],
+            chart_path: chart_signature[:2],
         }
-    rp = f"{OUTPUT_DIR}/multi_factor_report.json"
-    with open(rp, "w") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-    print(f"\n  JSON 报告已保存 → {rp}")
-    print("完成。\n")
+        staged_signatures = {
+            report_path: report_signature,
+            chart_path: chart_signature,
+        }
+        occupied = {
+            path: _ordinary_final_identity_if_present(path) for path in finals
+        }
+        if any(identity is not None for identity in occupied.values()):
+            if not all(identity is not None for identity in occupied.values()):
+                raise FileExistsError("output pair is incomplete or occupied")
+            if existing_final_signatures is not None:
+                if any(
+                    occupied[path] != existing_final_signatures[path][:2]
+                    for path in finals
+                ):
+                    raise FileExistsError("occupied output pair changed during validation")
+                final_signatures = existing_final_signatures
+            else:
+                final_signatures = {
+                    path: _file_signature(path, occupied[path]) for path in finals
+                }
+            if any(
+                (
+                    final_signatures[path][2],
+                    final_signatures[path][3],
+                )
+                != (
+                    staged_signatures[path][2],
+                    staged_signatures[path][3],
+                )
+                for path in finals
+            ):
+                raise FileExistsError("occupied output pair differs from candidate")
+            if not all(
+                _file_metadata_matches(path, final_signatures[path]) for path in finals
+            ):
+                raise FileExistsError("occupied output pair changed during validation")
+            validated_final_signatures = final_signatures
+        else:
+            _publish_no_replace(staged_report, report_path)
+            publication_identities[report_path] = staged_identities[report_path]
+            _publish_no_replace(staged_chart, chart_path)
+            publication_identities[chart_path] = staged_identities[chart_path]
+            validated_final_signatures = staged_signatures
+    except BaseException as primary_error:
+        restore_errors = restore_output_tree()
+        cleanup_error = cleanup_transaction()
+        secondary_errors = restore_errors + (
+            [cleanup_error] if cleanup_error is not None else []
+        )
+        _raise_primary_after_cleanup(
+            primary_error,
+            secondary_errors,
+            "secondary rollback/cleanup failure occurred",
+        )
+        raise
+
+    cleanup_error = cleanup_transaction()
+    if cleanup_error is not None:
+        raise cleanup_error
+    if validated_final_signatures is not None and not all(
+        _file_metadata_matches(path, validated_final_signatures[path])
+        for path in finals
+    ):
+        try:
+            raise FileExistsError(
+                "new output pair changed after transaction cleanup"
+                if publication_identities
+                else (
+                    "occupied output pair changed before idempotent return "
+                    "after transaction cleanup"
+                )
+            )
+        except BaseException as validation_error:
+            restore_errors = restore_output_tree()
+            if rollback_root is not None and rollback_identity is not None:
+                restore_errors.extend(
+                    _cleanup_owned_transaction(
+                        rollback_root,
+                        rollback_identity,
+                        rollback_children,
+                    )
+                )
+            _raise_primary_after_cleanup(
+                validation_error,
+                restore_errors,
+                "secondary post-cleanup output restoration failure",
+            )
+            raise
+    return report_path
+
+
+def run_backtest(
+    *,
+    strategy_file: str | Path,
+    data_file: str | Path,
+    mode: str | BacktestMode,
+    commission: float = DEFAULT_COMMISSION_PCT,
+    slippage: float = DEFAULT_SLIPPAGE_PCT,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+) -> Path:
+    if not math.isfinite(commission) or commission < 0:
+        raise ValueError("commission must be finite and non-negative")
+    if not math.isfinite(slippage) or slippage < 0:
+        raise ValueError("slippage must be finite and non-negative")
+    selected_mode = mode if isinstance(mode, BacktestMode) else BacktestMode(mode)
+    strategy = load_strategy(strategy_file)
+
+    data_path = Path(data_file)
+    if not data_path.is_file():
+        raise FileNotFoundError(f"data file does not exist: {data_path}")
+    manager = ParquetDataManager(data_path)
+    manager.load()
+    test_identity = manager.data_identities[0]
+    validate_backtest_dataset(strategy, test_identity, selected_mode)
+
+    identity = strategy.run_identity.artifact_identity
+    min_exposure = float(identity.training_config["neutral_band"])
+    cost_rate = (commission + slippage) / 100.0
+    engine = BacktestEngine(
+        formula=list(strategy.formula_tokens),
+        cost_rate=cost_rate,
+        min_exposure=min_exposure,
+    )
+    result = engine.run(manager.raw_dict, manager.feat_tensor, manager.symbols)[0]
+
+    ledger_total = sum(row.net_pnl for row in result.ledger)
+    execution_total = float(
+        result.execution.net_pnl[result.execution.target_valid]
+        .to(dtype=torch.float64)
+        .sum()
+        .detach()
+        .cpu()
+    )
+    difference = abs(ledger_total - execution_total)
+    if not math.isfinite(difference) or difference > 1e-8:
+        raise RuntimeError(
+            "ledger reconciliation exceeded tolerance: "
+            f"difference={difference!r} tolerance=1e-8"
+        )
+
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    mode_label = MODE_LABELS[selected_mode]
+    report: dict[str, object] = {
+        "report_schema": REPORT_SCHEMA_VERSION,
+        "mode": selected_mode.value,
+        "mode_label": mode_label,
+        "symbol": identity.symbol,
+        "timeframe": identity.timeframe,
+        "strategy_fingerprint": strategy.fingerprint,
+        "artifact_fingerprint": identity.fingerprint,
+        "versions": {
+            "artifact_schema": strategy.schema_version,
+            "strategy_schema": strategy.schema_version,
+            "core_semantics": identity.core_semantics_version,
+            "vocab": identity.vocab_version,
+            "label_semantics": identity.label_semantics_version,
+            "execution_semantics": identity.execution_semantics_version,
+        },
+        "training_dataset": identity.training_dataset.to_dict(),
+        "test_dataset": test_identity.to_dict(),
+        "training_start_time_ns": identity.training_dataset.start_time_ns,
+        "training_end_time_ns": identity.training_dataset.end_time_ns,
+        "test_start_time_ns": test_identity.start_time_ns,
+        "test_end_time_ns": test_identity.end_time_ns,
+        "cost": {
+            "commission_pct": commission,
+            "slippage_pct": slippage,
+            "cost_rate": cost_rate,
+            "total_cost_rate": cost_rate,
+        },
+        "min_exposure": min_exposure,
+        "formula_tokens": list(strategy.formula_tokens),
+        "decoded_formula": strategy.decoded_formula,
+        "metrics": asdict(result.metrics),
+        "ledger": [asdict(row) for row in result.ledger],
+        "ledger_reconciliation": {
+            "ledger_net_pnl": ledger_total,
+            "execution_net_pnl": execution_total,
+            "absolute_difference": difference,
+            "tolerance": 1e-8,
+            "reconciled": True,
+        },
+        "generated_at": generated_at,
+    }
+    stem = (
+        f"backtest_v2_{selected_mode.value}_{identity.symbol}_"
+        f"{test_identity.data_fingerprint[:12]}_{strategy.fingerprint[:12]}"
+    )
+    report_path = _publish_output_set(
+        report=report,
+        result=result,
+        output_dir=output_dir,
+        stem=stem,
+        mode_label=mode_label,
+    )
+    print(f"{mode_label}: {identity.symbol} {identity.timeframe}")
+    print(
+        f"net={execution_total:+.8f} sharpe={result.metrics.sharpe:+.4f} "
+        f"reconciliation={difference:.3g}"
+    )
+    print(f"report: {report_path}")
+    return report_path
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        run_backtest(
+            strategy_file=args.strategy_file,
+            data_file=args.data_file,
+            mode=args.mode,
+            commission=args.commission,
+            slippage=args.slippage,
+            output_dir=args.output_dir,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
