@@ -127,6 +127,56 @@ def _validated_run_identity(owner: object, operation: str) -> TrainingRunIdentit
         require_same_entry(f"{operation} identity serialization callback")
         TrainingRunIdentity.from_dict(payload)
         require_same_entry(f"{operation} identity deserialization callback")
+        lord = value.artifact_identity.training_config["lord"]
+        effective = {
+            "use_lord_regularization": attributes.get(
+                "use_lord_regularization", _MISSING_RUN_IDENTITY
+            ),
+            "lord_decay_rate": attributes.get(
+                "lord_decay_rate", _MISSING_RUN_IDENTITY
+            ),
+            "lord_num_iterations": attributes.get(
+                "lord_num_iterations", _MISSING_RUN_IDENTITY
+            ),
+        }
+        for field, actual in effective.items():
+            expected = lord[field]
+            if type(actual) is not type(expected) or actual != expected:
+                raise _checkpoint_compatibility_error(
+                    f"training_config.lord.{field}",
+                    repr(expected),
+                    _safe_value_category(actual)
+                    if actual is _MISSING_RUN_IDENTITY
+                    else repr(actual),
+                )
+        if lord["use_lord_regularization"]:
+            lord_optimizer = attributes.get("lord_opt", _MISSING_RUN_IDENTITY)
+            try:
+                optimizer_attributes = object.__getattribute__(
+                    lord_optimizer, "__dict__"
+                )
+            except (AttributeError, TypeError):
+                raise _checkpoint_compatibility_error(
+                    "training_config.lord.use_lord_regularization",
+                    "True with initialized LoRD optimizer",
+                    _safe_value_category(lord_optimizer),
+                )
+            for optimizer_field, identity_field in (
+                ("decay_rate", "lord_decay_rate"),
+                ("num_iterations", "lord_num_iterations"),
+            ):
+                expected = lord[identity_field]
+                actual = optimizer_attributes.get(
+                    optimizer_field, _MISSING_RUN_IDENTITY
+                )
+                if type(actual) is not type(expected) or actual != expected:
+                    raise _checkpoint_compatibility_error(
+                        f"training_config.lord.{identity_field}",
+                        repr(expected),
+                        _safe_value_category(actual)
+                        if actual is _MISSING_RUN_IDENTITY
+                        else repr(actual),
+                    )
         return value
     except ArtifactCompatibilityError:
         object.__setattr__(owner, "run_identity", value)
@@ -900,7 +950,7 @@ def _preflight_true_transaction_snapshot(engine: "AlphaEngine") -> None:
                 _preflight_true_transaction_value(
                     value, "training_history.value", seen
                 )
-    for name in ("sampler", "scheduler", "scaler"):
+    for name in ("sampler", "scheduler", "scaler", "lord_opt"):
         value = dict.get(attributes, name)
         if value is None:
             continue
@@ -1374,9 +1424,9 @@ class _BatchTransaction:
             sampler_attributes = None
         auxiliary_sources = {}
         self._true_auxiliary_objects = {}
-        for name in ("scheduler", "scaler"):
+        for name in ("scheduler", "scaler", "lord_opt"):
             value = attributes.get(name, _MISSING_RUN_IDENTITY)
-            if value is _MISSING_RUN_IDENTITY:
+            if value is _MISSING_RUN_IDENTITY or value is None:
                 continue
             value_attributes = object.__getattribute__(value, "__dict__")
             self._true_auxiliary_objects[name] = value
@@ -2682,12 +2732,34 @@ class AlphaEngine:
         self.model   = AlphaGPT().to(ModelConfig.DEVICE)
         self.opt     = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
 
-        self.use_lord = use_lord_regularization
-        if self.use_lord:
+        if type(use_lord_regularization) is not bool:
+            raise ArtifactCompatibilityError(
+                "use_lord_regularization mismatch: expected=bool "
+                f"actual={type(use_lord_regularization).__name__}"
+            )
+        if (
+            type(lord_decay_rate) not in (int, float)
+            or not math.isfinite(lord_decay_rate)
+            or lord_decay_rate < 0
+        ):
+            raise ArtifactCompatibilityError(
+                "lord_decay_rate mismatch: expected=finite-nonnegative-number "
+                f"actual={type(lord_decay_rate).__name__}"
+            )
+        if type(lord_num_iterations) is not int or lord_num_iterations < 1:
+            raise ArtifactCompatibilityError(
+                "lord_num_iterations mismatch: expected=positive-int "
+                f"actual={type(lord_num_iterations).__name__}"
+            )
+        self.use_lord_regularization = use_lord_regularization
+        self.lord_decay_rate = lord_decay_rate
+        self.lord_num_iterations = lord_num_iterations
+        self.use_lord = self.use_lord_regularization
+        if self.use_lord_regularization:
             self.lord_opt = NewtonSchulzLowRankDecay(
                 self.model.named_parameters(),
-                decay_rate=lord_decay_rate,
-                num_iterations=lord_num_iterations,
+                decay_rate=self.lord_decay_rate,
+                num_iterations=self.lord_num_iterations,
                 target_keywords=["attention", "qk_norm"],
             )
             self.rank_monitor = StableRankMonitor(
@@ -3240,7 +3312,7 @@ class AlphaEngine:
 
         if verbose_header:
             print("开始 Alpha 因子挖掘训练" +
-                  ("（含 LoRD 正则化）..." if self.use_lord else "..."))
+                  ("（含 LoRD 正则化）..." if self.use_lord_regularization else "..."))
             print(f"   策略熵: 坍塌阈值={ModelConfig.ENTROPY_COLLAPSE_THRESH}  "
                   f"系数上限={ModelConfig.ENTROPY_COEFF_MAX}  "
                   f"连续坍塌步数={ModelConfig.ENTROPY_COLLAPSE_STEPS}")
@@ -3710,7 +3782,7 @@ class AlphaEngine:
                 max_norm=1.0,
             )
             transaction.run(self.opt.step)
-            if self.use_lord:
+            if self.use_lord_regularization:
                 transaction.run(self.lord_opt.step)
 
             # ── Part D2: 分布细化指标 ────────────────────────────────
@@ -3774,7 +3846,7 @@ class AlphaEngine:
                 'KL上步': f"{dst['kl_prev']:.3f}",
             })
 
-            if self.use_lord and step % 10 == 0:
+            if self.use_lord_regularization and step % 10 == 0:
                 sr = self.rank_monitor.compute()
                 self.training_history['stable_rank'].append(sr)
 
@@ -4555,6 +4627,30 @@ class AlphaEngine:
                 if actual != expected:
                     raise _checkpoint_compatibility_error(
                         field, repr(expected), _safe_value_category(actual)
+                    )
+            raw_config = raw_artifact_identity.get("training_config")
+            raw_lord = (
+                raw_config.get("lord") if type(raw_config) is dict else None
+            )
+            expected_lord = run_identity.artifact_identity.training_config["lord"]
+            if type(raw_lord) is not dict:
+                raise _checkpoint_compatibility_error(
+                    "training_config.lord", "complete exact LoRD controls", "missing"
+                )
+            for field in (
+                "use_lord_regularization",
+                "lord_decay_rate",
+                "lord_num_iterations",
+            ):
+                expected = expected_lord[field]
+                actual = raw_lord.get(field, _MISSING_RUN_IDENTITY)
+                if type(actual) is not type(expected) or actual != expected:
+                    raise _checkpoint_compatibility_error(
+                        f"training_config.lord.{field}",
+                        repr(expected),
+                        _safe_value_category(actual)
+                        if actual is _MISSING_RUN_IDENTITY
+                        else repr(actual),
                     )
         try:
             actual_identity = TrainingRunIdentity.from_dict(ckpt["run_identity"])

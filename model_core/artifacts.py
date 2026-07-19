@@ -89,6 +89,7 @@ _REQUIRED_TRAINING_CONFIG_FIELDS = {
     "elite",
     "restart",
     "noise",
+    "lord",
     "walk_forward",
     "cost_rate",
     "neutral_band",
@@ -159,6 +160,11 @@ _TRAINING_CONFIG_CONTAINER_SCHEMA = {
         "min": "nonnegative_number",
         "max": "nonnegative_number",
         "boost_factor": "nonnegative_number",
+    },
+    "lord": {
+        "use_lord_regularization": "bool",
+        "lord_decay_rate": "nonnegative_number",
+        "lord_num_iterations": "positive_int",
     },
     "walk_forward": {
         "blocks": "exact_five_int",

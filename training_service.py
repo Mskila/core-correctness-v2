@@ -95,6 +95,11 @@ def _training_config(random_seed: int) -> dict[str, object]:
             "max": ModelConfig.NOISE_MAX,
             "boost_factor": ModelConfig.NOISE_BOOST_FACTOR,
         },
+        "lord": {
+            "use_lord_regularization": ModelConfig.USE_LORD_REGULARIZATION,
+            "lord_decay_rate": ModelConfig.LORD_DECAY_RATE,
+            "lord_num_iterations": ModelConfig.LORD_NUM_ITERATIONS,
+        },
         "walk_forward": {
             "blocks": ModelConfig.WF_N_BLOCKS,
             "gap": ModelConfig.WF_GAP,
@@ -477,6 +482,9 @@ def run_training_session(
         data_manager=data_manager,
         target_symbol=identity.symbol,
         run_identity=run_identity,
+        use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
+        lord_decay_rate=ModelConfig.LORD_DECAY_RATE,
+        lord_num_iterations=ModelConfig.LORD_NUM_ITERATIONS,
     )
     engine.source_path = None if source_path is None else str(source_path)
     start_step = 0

@@ -163,6 +163,11 @@ def training_config(*, seed: int = 42) -> dict[str, object]:
             "max": 0.60,
             "boost_factor": 2.0,
         },
+        "lord": {
+            "use_lord_regularization": False,
+            "lord_decay_rate": 1.0e-3,
+            "lord_num_iterations": 5,
+        },
         "walk_forward": {
             "blocks": 5,
             "gap": LABEL_LOOKAHEAD_BARS,
@@ -174,6 +179,53 @@ def training_config(*, seed: int = 42) -> dict[str, object]:
         "neutral_band": 0.05,
         "random_seed": seed,
     }
+
+
+def _training_config_with_lord(**changes: object) -> dict[str, object]:
+    config = training_config()
+    config["lord"] = {
+        "use_lord_regularization": True,
+        "lord_decay_rate": 1.0e-3,
+        "lord_num_iterations": 5,
+        **changes,
+    }
+    return config
+
+
+def test_training_identity_requires_exact_lord_behavior_schema() -> None:
+    config = _training_config_with_lord()
+    identity = artifact_identity_with_config(config)
+
+    assert identity.training_config["lord"] == config["lord"]
+
+    missing = training_config()
+    missing.pop("lord")
+    with pytest.raises(ArtifactCompatibilityError, match=r"missing=.*lord"):
+        artifact_identity_with_config(missing)
+
+    extra = _training_config_with_lord(unexpected=True)
+    with pytest.raises(ArtifactCompatibilityError, match=r"lord.*unknown"):
+        artifact_identity_with_config(extra)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("use_lord_regularization", 1, "boolean"),
+        ("lord_decay_rate", True, "finite number"),
+        ("lord_decay_rate", -0.01, "finite number >= 0"),
+        ("lord_num_iterations", 0, "integer >= 1"),
+        ("lord_num_iterations", 1.5, "integer >= 1"),
+    ],
+)
+def test_training_identity_rejects_invalid_lord_values(
+    field: str, value: object, expected: str
+) -> None:
+    with pytest.raises(
+        ArtifactCompatibilityError,
+        match=rf"training_config\.lord\.{field}.*expected={expected}",
+    ):
+        artifact_identity_with_config(_training_config_with_lord(**{field: value}))
 
 
 def actual_entropy_config() -> dict[str, object]:
@@ -241,6 +293,11 @@ NESTED_BEHAVIOR_CONFIG_PATHS = (
         "min",
         "max",
         "boost_factor",
+    )),
+    *(("lord", field) for field in (
+        "use_lord_regularization",
+        "lord_decay_rate",
+        "lord_num_iterations",
     )),
     *(("walk_forward", field) for field in (
         "blocks",
@@ -867,7 +924,7 @@ def test_training_config_requires_every_declared_nested_behavior_leaf(
 
 def test_full_nested_training_config_is_order_independent_and_round_trips() -> None:
     config = training_config()
-    assert len(NESTED_BEHAVIOR_CONFIG_PATHS) == 49
+    assert len(NESTED_BEHAVIOR_CONFIG_PATHS) == 52
     reordered = {
         key: dict(reversed(list(value.items()))) if isinstance(value, dict) else value
         for key, value in reversed(list(config.items()))

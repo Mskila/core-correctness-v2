@@ -16,6 +16,8 @@ from model_core.artifacts import (
 from model_core.engine import AlphaEngine
 from model_core.config import ModelConfig
 import model_core.engine as engine_module
+import training_service
+from tests.unit.test_training_service_v2 import OneManager
 from tests.unit.test_artifacts import artifact_identity
 
 
@@ -178,6 +180,170 @@ def test_checkpoint_identity_mismatch_is_rejected_before_mutation(tmp_path) -> N
     with pytest.raises(ArtifactCompatibilityError, match="training_config.*expected=.*actual="):
         target.load_checkpoint(str(path))
     assert all(torch.equal(before[k], v) for k, v in target.model.state_dict().items())
+
+
+def _service_run_identity() -> TrainingRunIdentity:
+    return TrainingRunIdentity(
+        run_id="e" * 32,
+        artifact_identity=training_service._artifact_identity(OneManager(), 42),
+    )
+
+
+def test_checkpoint_missing_lord_identity_is_rejected_without_rewriting_bytes(
+    tmp_path,
+) -> None:
+    identity = _service_run_identity()
+    source = AlphaEngine(
+        None,
+        use_lord_regularization=getattr(ModelConfig, "USE_LORD_REGULARIZATION", True),
+        lord_decay_rate=getattr(ModelConfig, "LORD_DECAY_RATE", 1.0e-3),
+        lord_num_iterations=getattr(ModelConfig, "LORD_NUM_ITERATIONS", 5),
+        target_symbol="EURUSD",
+        run_identity=identity,
+    )
+    path = tmp_path / "old-missing-lord.pt"
+    source.save_checkpoint(0, str(path))
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    config = payload["run_identity"]["artifact_identity"]["training_config"]
+    config.pop("lord", None)
+    payload["run_identity"]["artifact_identity"]["training_config_hash"] = sha256_json(config)
+    torch.save(payload, path)
+    old_bytes = path.read_bytes()
+    target = AlphaEngine(
+        None,
+        use_lord_regularization=getattr(ModelConfig, "USE_LORD_REGULARIZATION", True),
+        lord_decay_rate=getattr(ModelConfig, "LORD_DECAY_RATE", 1.0e-3),
+        lord_num_iterations=getattr(ModelConfig, "LORD_NUM_ITERATIONS", 5),
+        target_symbol="EURUSD",
+        run_identity=identity,
+    )
+    before = copy.deepcopy(target.model.state_dict())
+
+    with pytest.raises(ArtifactCompatibilityError, match=r"lord|missing"):
+        target.load_checkpoint(str(path))
+
+    assert path.read_bytes() == old_bytes
+    assert all(torch.equal(before[name], value) for name, value in target.model.state_dict().items())
+
+
+@pytest.mark.parametrize(
+    ("field", "mutant"),
+    [("decay_rate", 0.5), ("num_iterations", 1)],
+)
+def test_checkpoint_rejects_divergent_effective_lord_optimizer_before_write(
+    monkeypatch, tmp_path, field: str, mutant: object
+) -> None:
+    identity = _service_run_identity()
+    current = AlphaEngine(
+        None,
+        use_lord_regularization=True,
+        lord_decay_rate=1.0e-3,
+        lord_num_iterations=5,
+        target_symbol="EURUSD",
+        run_identity=identity,
+    )
+    path = tmp_path / "owned-checkpoint.pt"
+    current.save_checkpoint(0, str(path))
+    old_bytes = path.read_bytes()
+    before = copy.deepcopy(current.model.state_dict())
+    real_state_dict = current.model.state_dict
+
+    def diverge_before_serialization(*args, **kwargs):
+        setattr(current.lord_opt, field, mutant)
+        return real_state_dict(*args, **kwargs)
+
+    monkeypatch.setattr(current.model, "state_dict", diverge_before_serialization)
+
+    with pytest.raises(
+        ArtifactCompatibilityError,
+        match=rf"training_config\.lord\.lord_{field}",
+    ):
+        current.save_checkpoint(1, str(path))
+
+    expected = current.lord_decay_rate if field == "decay_rate" else current.lord_num_iterations
+    assert getattr(current.lord_opt, field) == expected
+    assert path.read_bytes() == old_bytes
+    for name, value in before.items():
+        assert torch.equal(real_state_dict()[name], value)
+
+
+def test_identical_lord_runtime_controls_save_and_load_exactly(tmp_path) -> None:
+    identity = _service_run_identity()
+    source = AlphaEngine(
+        None,
+        use_lord_regularization=True,
+        lord_decay_rate=1.0e-3,
+        lord_num_iterations=5,
+        target_symbol="EURUSD",
+        run_identity=identity,
+    )
+    path = tmp_path / "matching-lord.pt"
+    source.save_checkpoint(0, str(path))
+    target = AlphaEngine(
+        None,
+        use_lord_regularization=True,
+        lord_decay_rate=1.0e-3,
+        lord_num_iterations=5,
+        target_symbol="EURUSD",
+        run_identity=identity,
+    )
+
+    assert target.load_checkpoint(str(path)) == 1
+    for name, value in source.model.state_dict().items():
+        assert torch.equal(target.model.state_dict()[name], value)
+    assert target.lord_opt.decay_rate == source.lord_opt.decay_rate == 1.0e-3
+    assert target.lord_opt.num_iterations == source.lord_opt.num_iterations == 5
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("use_lord_regularization", False),
+        ("lord_decay_rate", 0.5),
+        ("lord_num_iterations", 1),
+    ],
+)
+def test_checkpoint_lord_mismatch_is_rejected_before_state_installation(
+    tmp_path, field: str, value: object
+) -> None:
+    identity = _service_run_identity()
+    source = AlphaEngine(
+        None,
+        use_lord_regularization=getattr(ModelConfig, "USE_LORD_REGULARIZATION", True),
+        lord_decay_rate=getattr(ModelConfig, "LORD_DECAY_RATE", 1.0e-3),
+        lord_num_iterations=getattr(ModelConfig, "LORD_NUM_ITERATIONS", 5),
+        target_symbol="EURUSD",
+        run_identity=identity,
+    )
+    path = tmp_path / f"mismatch-{field}.pt"
+    source.save_checkpoint(0, str(path))
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    artifact = payload["run_identity"]["artifact_identity"]
+    lord = artifact["training_config"].setdefault(
+        "lord",
+        {
+            "use_lord_regularization": True,
+            "lord_decay_rate": 1.0e-3,
+            "lord_num_iterations": 5,
+        },
+    )
+    lord[field] = value
+    artifact["training_config_hash"] = sha256_json(artifact["training_config"])
+    torch.save(payload, path)
+    target = AlphaEngine(
+        None,
+        use_lord_regularization=getattr(ModelConfig, "USE_LORD_REGULARIZATION", True),
+        lord_decay_rate=getattr(ModelConfig, "LORD_DECAY_RATE", 1.0e-3),
+        lord_num_iterations=getattr(ModelConfig, "LORD_NUM_ITERATIONS", 5),
+        target_symbol="EURUSD",
+        run_identity=identity,
+    )
+    before = copy.deepcopy(target.model.state_dict())
+
+    with pytest.raises(ArtifactCompatibilityError, match=field):
+        target.load_checkpoint(str(path))
+
+    assert all(torch.equal(before[name], value) for name, value in target.model.state_dict().items())
 
 
 @pytest.mark.parametrize(

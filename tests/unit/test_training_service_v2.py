@@ -16,6 +16,7 @@ from model_core.artifacts import (
     TrainingRunIdentity,
 )
 from model_core.engine import AlphaEngine
+from model_core.config import ModelConfig
 import model_core.engine as engine_module
 import training_service
 from training_service import run_training_session
@@ -107,16 +108,61 @@ class OneManager:
 
 
 class DummyEngine:
-    def __init__(self, *, data_manager, target_symbol, run_identity):
+    def __init__(self, *, data_manager, target_symbol, run_identity, **kwargs):
         self.data_manager = data_manager
         self.target_symbol = target_symbol
         self.run_identity = run_identity
         self.best_formula = None
         self.best_metrics = None
         self.trained_from = None
+        self.engine_options = kwargs
 
     def train(self, *, start_step):
         self.trained_from = start_step
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("USE_LORD_REGULARIZATION", False),
+        ("LORD_DECAY_RATE", 0.5),
+        ("LORD_NUM_ITERATIONS", 1),
+    ],
+)
+def test_each_lord_control_changes_training_identity(
+    monkeypatch, field: str, replacement: object
+) -> None:
+    baseline = training_service._artifact_identity(OneManager(), 42)
+    monkeypatch.setattr(ModelConfig, field, replacement, raising=False)
+    changed = training_service._artifact_identity(OneManager(), 42)
+
+    assert set(baseline.training_config["lord"]) == {
+        "use_lord_regularization",
+        "lord_decay_rate",
+        "lord_num_iterations",
+    }
+    assert baseline.training_config_hash != changed.training_config_hash
+    assert baseline.fingerprint != changed.fingerprint
+
+
+def test_service_passes_exact_identity_lord_controls_to_engine(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(training_service, "AlphaEngine", DummyEngine)
+    engine = run_training_session(
+        OneManager(), source_path="fake", from_scratch=True, random_seed=42
+    )
+
+    assert engine.engine_options == {
+        "use_lord_regularization": ModelConfig.USE_LORD_REGULARIZATION,
+        "lord_decay_rate": ModelConfig.LORD_DECAY_RATE,
+        "lord_num_iterations": ModelConfig.LORD_NUM_ITERATIONS,
+    }
+    assert dict(engine.run_identity.artifact_identity.training_config["lord"]) == {
+        "use_lord_regularization": ModelConfig.USE_LORD_REGULARIZATION,
+        "lord_decay_rate": ModelConfig.LORD_DECAY_RATE,
+        "lord_num_iterations": ModelConfig.LORD_NUM_ITERATIONS,
+    }
 
 
 def test_from_scratch_never_scans_or_changes_old_artifacts(monkeypatch, tmp_path) -> None:
@@ -150,7 +196,7 @@ def test_resume_uses_internal_identity_not_filename(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(training_service, "CHECKPOINT_DIR", tmp_path)
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="3" * 32, artifact_identity=identity)
-    source = AlphaEngine(None, use_lord_regularization=False,
+    source = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     lying_name = tmp_path / "ckpt_v2_EURUSD_H1_wrong_filename_step_999.pt"
     source.save_checkpoint(7, str(lying_name))
@@ -164,7 +210,7 @@ def test_incompatible_candidate_fails_explicitly(monkeypatch, tmp_path) -> None:
     wanted = training_service._artifact_identity(OneManager(), 42)
     other = training_service._artifact_identity(OneManager(), 43)
     run = TrainingRunIdentity(run_id="4" * 32, artifact_identity=other)
-    source = AlphaEngine(None, use_lord_regularization=False,
+    source = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     source.save_checkpoint(2, str(tmp_path / "ckpt_v2_EURUSD_candidate.pt"))
     with pytest.raises(ArtifactCompatibilityError, match="none has exact internal identity.*from-scratch"):
@@ -190,7 +236,7 @@ def test_strategy_publication_is_idempotent_and_immutable(monkeypatch, tmp_path)
     monkeypatch.setattr(training_service, "STRATEGY_DIR", tmp_path)
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="5" * 32, artifact_identity=identity)
-    engine = AlphaEngine(None, use_lord_regularization=False,
+    engine = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     engine.best_formula = [0]
     engine.best_score = 1.0
@@ -228,7 +274,7 @@ def test_corrupt_candidate_does_not_block_valid_internal_latest(
     corrupt.write_bytes(b"corrupt")
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="6" * 32, artifact_identity=identity)
-    source = AlphaEngine(None, use_lord_regularization=False,
+    source = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     valid = tmp_path / "ckpt_v2_EURUSD_zzz_step_0.pt"
     source.save_checkpoint(17, str(valid))
@@ -256,7 +302,7 @@ def test_resume_discovers_canonicalized_filename_by_internal_identity(
     monkeypatch.setattr(training_service, "CHECKPOINT_DIR", tmp_path)
     identity = training_service._artifact_identity(CanonicalManager(), 42)
     run = TrainingRunIdentity(run_id="8" * 32, artifact_identity=identity)
-    source = AlphaEngine(None, use_lord_regularization=False,
+    source = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol=symbol, run_identity=run)
     path = tmp_path / run.checkpoint_filename(23)
     source.save_checkpoint(23, str(path))
@@ -284,7 +330,7 @@ def _identity_for_symbol(symbol, fingerprint="e"):
 def _write_checkpoint(path, identity, step, run_id):
     run = TrainingRunIdentity(run_id=run_id, artifact_identity=identity)
     engine = AlphaEngine(
-        None, use_lord_regularization=False,
+        None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
         target_symbol=identity.symbol, run_identity=run,
     )
     engine.save_checkpoint(step, str(path))
@@ -378,7 +424,7 @@ def test_strategy_publish_race_preserves_foreign_competitor(
     monkeypatch.setattr(training_service, "STRATEGY_DIR", tmp_path)
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="9" * 32, artifact_identity=identity)
-    engine = AlphaEngine(None, use_lord_regularization=False,
+    engine = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     engine.best_formula = [0]
     engine.best_score = 1.0
@@ -405,7 +451,7 @@ def test_strategy_publish_race_accepts_identical_competitor(
     seed_dir.mkdir()
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="b" * 32, artifact_identity=identity)
-    engine = AlphaEngine(None, use_lord_regularization=False,
+    engine = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     engine.best_formula = [0]
     engine.best_score = 1.0
@@ -432,7 +478,7 @@ def test_strategy_publication_translates_ordinary_write_failure(
     monkeypatch.setattr(training_service, "STRATEGY_DIR", tmp_path)
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="c" * 32, artifact_identity=identity)
-    engine = AlphaEngine(None, use_lord_regularization=False,
+    engine = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     engine.best_formula = [0]
     engine.best_score = 1.0
@@ -452,7 +498,7 @@ def test_strategy_publication_preserves_base_exception_identity(
     monkeypatch.setattr(training_service, "STRATEGY_DIR", tmp_path)
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="d" * 32, artifact_identity=identity)
-    engine = AlphaEngine(None, use_lord_regularization=False,
+    engine = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     engine.best_formula = [0]
     engine.best_score = 1.0
@@ -493,7 +539,7 @@ def test_strategy_hostile_cleanup_never_replaces_primary_baseexception(
     monkeypatch.setattr(training_service, "STRATEGY_DIR", tmp_path)
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="7" * 32, artifact_identity=identity)
-    engine = AlphaEngine(None, use_lord_regularization=False,
+    engine = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
     engine.best_formula = [0]
     engine.best_score = 1.0
@@ -564,7 +610,7 @@ def test_strategy_validation_callbacks_reject_before_later_callbacks_or_io(
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="9" * 32, artifact_identity=identity)
     engine = AlphaEngine(
-        None, use_lord_regularization=False,
+        None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
         target_symbol="EURUSD", run_identity=run,
     )
     engine.best_formula = [0]
@@ -680,7 +726,7 @@ def test_strategy_persistence_callback_rejects_immediately_and_cleans_owned_file
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="8" * 32, artifact_identity=identity)
     engine = AlphaEngine(
-        None, use_lord_regularization=False,
+        None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
         target_symbol="EURUSD", run_identity=run,
     )
     engine.best_formula = [0]
@@ -777,7 +823,7 @@ def test_strategy_revalidates_exact_identity_after_formula_decode(
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="f" * 32, artifact_identity=identity)
     engine = AlphaEngine(
-        None, use_lord_regularization=False,
+        None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
         target_symbol="EURUSD", run_identity=run,
     )
     engine.best_formula = [0]
@@ -897,7 +943,7 @@ def test_train_revalidates_identity_immediately_after_data_callback(
 ) -> None:
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="a" * 32, artifact_identity=identity)
-    current = AlphaEngine(None, use_lord_regularization=False,
+    current = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                           target_symbol="EURUSD", run_identity=run)
 
     class TamperingManager:

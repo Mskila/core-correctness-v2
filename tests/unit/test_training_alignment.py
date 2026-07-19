@@ -37,7 +37,10 @@ from model_core.semantics import (
 )
 from model_core.vm import StackVM
 from model_core.walk_forward import WalkForwardFold
-from tests.unit.test_artifacts import artifact_identity
+from tests.unit.test_artifacts import (
+    artifact_identity,
+    artifact_identity_with_config,
+)
 
 
 engine_module._test_strategy_file_for_symbol = lambda symbol: str(
@@ -54,6 +57,10 @@ def _install_formal_training_identity(engine: AlphaEngine) -> AlphaEngine:
         run_id=_TEST_TRAINING_RUN_ID,
         artifact_identity=_TEST_ARTIFACT_IDENTITY,
     )
+    lord = engine.run_identity.artifact_identity.training_config["lord"]
+    engine.use_lord_regularization = lord["use_lord_regularization"]
+    engine.lord_decay_rate = lord["lord_decay_rate"]
+    engine.lord_num_iterations = lord["lord_num_iterations"]
     for field, value in (
         ("best_metrics", None),
         ("factor_pool_scores", []),
@@ -939,6 +946,166 @@ def _failure_training_engine(
         ),
     }
     return engine, factor, calls, before
+
+
+class _TestLordOptimizer:
+    def __init__(self) -> None:
+        self.decay_rate = 1.0e-3
+        self.num_iterations = 5
+        self.steps = 0
+
+    def step(self) -> None:
+        self.steps += 1
+
+
+def _enable_lord_runtime(engine: AlphaEngine) -> None:
+    config = _TEST_ARTIFACT_IDENTITY.to_dict()["training_config"]
+    config["lord"] = {
+        "use_lord_regularization": True,
+        "lord_decay_rate": 1.0e-3,
+        "lord_num_iterations": 5,
+    }
+    engine.run_identity = TrainingRunIdentity(
+        run_id=_TEST_TRAINING_RUN_ID,
+        artifact_identity=artifact_identity_with_config(config),
+    )
+    engine.use_lord_regularization = True
+    engine.lord_decay_rate = 1.0e-3
+    engine.lord_num_iterations = 5
+    engine.use_lord = True
+    engine.lord_opt = _TestLordOptimizer()
+    engine.rank_monitor = SimpleNamespace(compute=lambda: 1.0, history=[])
+
+
+def test_mutating_legacy_use_lord_alias_does_not_disable_canonical_lord(
+    monkeypatch, tmp_path
+) -> None:
+    engine, factor, _calls, _before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    _enable_lord_runtime(engine)
+    engine.use_lord = False
+
+    engine.train(end_step=1, verbose_header=False)
+
+    assert engine.lord_opt.steps == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "mutant"),
+    [("decay_rate", 0.5), ("num_iterations", 1)],
+)
+def test_callback_lord_divergence_rejects_before_step_and_rolls_back_exactly(
+    monkeypatch, tmp_path, field: str, mutant: object
+) -> None:
+    engine, factor, _calls, before_state = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    _enable_lord_runtime(engine)
+    _seed_all(8123)
+    before_rng = _repair100_rng_snapshot()
+    real_optimizer_step = engine.opt.step
+
+    def diverge_after_optimizer(*args, **kwargs):
+        result = real_optimizer_step(*args, **kwargs)
+        setattr(engine.lord_opt, field, mutant)
+        random.random()
+        np.random.random()
+        torch.rand(1)
+        return result
+
+    engine.opt.step = diverge_after_optimizer
+
+    with pytest.raises(
+        ArtifactCompatibilityError,
+        match=rf"training_config\.lord\.lord_{field}",
+    ):
+        engine.train(end_step=1, verbose_header=False)
+
+    assert engine.lord_opt.steps == 0
+    expected = engine.lord_decay_rate if field == "decay_rate" else engine.lord_num_iterations
+    assert getattr(engine.lord_opt, field) == expected
+    _assert_transaction_value_equal(engine.model.state_dict(), before_state["model"])
+    _assert_transaction_value_equal(engine.opt.state_dict(), before_state["optimizer"])
+    _assert_transaction_value_equal(engine.training_history, before_state["history"])
+    _assert_transaction_value_equal(engine.factor_pool, before_state["factor_pool"])
+    _assert_transaction_value_equal(engine._elite_pool, before_state["elite_pool"])
+    assert (engine.best_score, engine.best_formula, engine._best_snapshot) == before_state["best"]
+    assert (engine._reward_ema, engine._reward_ema_step) == before_state["reward_ema"]
+    assert (
+        engine._factor_pool_counter,
+        engine._elite_counter,
+        engine._best_update_step,
+        engine._stagnation_steps,
+        engine._restart_count,
+        engine._low_entropy_streak,
+    ) == before_state["counters"]
+    _assert_repair100_rng_equal(_repair100_rng_snapshot(), before_rng)
+
+
+@pytest.mark.parametrize(
+    ("field", "mutant"),
+    [("decay_rate", 0.5), ("num_iterations", 1)],
+)
+def test_history_publication_callback_lord_divergence_rolls_back_old_bytes(
+    monkeypatch, tmp_path, field: str, mutant: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    engine, factor, _calls, _before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    _enable_lord_runtime(engine)
+    engine.target_symbol = "EURUSD"
+    history_path = pathlib.Path(engine.run_identity.history_filename())
+    history_path.write_bytes(b"PREEXISTING-HISTORY")
+    old_bytes = history_path.read_bytes()
+    real_history = AlphaEngine._save_training_history_live.__get__(engine, AlphaEngine)
+    transaction = engine._begin_batch_transaction(1, engine.run_identity)
+
+    def diverge_then_publish():
+        setattr(engine.lord_opt, field, mutant)
+        return real_history()
+
+    with pytest.raises(
+        ArtifactCompatibilityError,
+        match=rf"training_config\.lord\.lord_{field}",
+    ):
+        transaction.run_artifact(
+            diverge_then_publish,
+            [
+                history_path,
+                history_path.with_name(f".{history_path.name}.tmp"),
+            ],
+        )
+
+    expected = engine.lord_decay_rate if field == "decay_rate" else engine.lord_num_iterations
+    assert getattr(engine.lord_opt, field) == expected
+    assert history_path.read_bytes() == old_bytes
+    assert not history_path.with_name(f".{history_path.name}.tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "mutant"),
+    [("decay_rate", 0.5), ("num_iterations", 1)],
+)
+def test_strategy_publication_rejects_lord_optimizer_divergence_without_writes(
+    monkeypatch, tmp_path, field: str, mutant: object
+) -> None:
+    engine, factor, _calls, _before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    _enable_lord_runtime(engine)
+    strategy_path = tmp_path / "strategy.json"
+    strategy_path.write_bytes(b"PREEXISTING-STRATEGY")
+    setattr(engine.lord_opt, field, mutant)
+
+    with pytest.raises(
+        ArtifactCompatibilityError,
+        match=rf"training_config\.lord\.lord_{field}",
+    ):
+        AlphaEngine._save_strategy_live(engine)
+
+    assert strategy_path.read_bytes() == b"PREEXISTING-STRATEGY"
 
 
 def _install_legacy_final_strategy_oracle(
@@ -2117,8 +2284,17 @@ def _inject_late_training_failure(engine, calls, artifacts, stage, failure):
 
         engine.opt.step = fail_optimizer_after
     elif stage == "lord":
-        engine.use_lord = True
-        engine.lord_opt = SimpleNamespace(step=raise_failure)
+        _enable_lord_runtime(engine)
+
+        class FailingLordOptimizer:
+            def __init__(self):
+                self.decay_rate = 1.0e-3
+                self.num_iterations = 5
+
+            def step(self):
+                raise_failure()
+
+        engine.lord_opt = FailingLordOptimizer()
     elif stage == "distribution":
         engine._distribution_stats = raise_failure
     elif stage == "strategy":
@@ -2311,14 +2487,19 @@ def test_failed_batch_retry_restores_all_rng_and_sampler_state_before_sampling(
         engine._elite_pool = [(0.25, 0, [0], 0), (0.5, 1, [1], 0)]
         engine._elite_counter = 2
         engine.best_score = 100.0
-        engine.use_lord = True
+        _enable_lord_runtime(engine)
 
-        def lord_step():
-            with torch.no_grad():
-                for parameter in engine.model.parameters():
-                    parameter.add_(torch.randn_like(parameter) * 0.001)
+        class RandomLordOptimizer:
+            def __init__(self):
+                self.decay_rate = 1.0e-3
+                self.num_iterations = 5
 
-        engine.lord_opt = SimpleNamespace(step=lord_step)
+            def step(self):
+                with torch.no_grad():
+                    for parameter in engine.model.parameters():
+                        parameter.add_(torch.randn_like(parameter) * 0.001)
+
+        engine.lord_opt = RandomLordOptimizer()
         engine.rank_monitor = SimpleNamespace(compute=lambda: 1.0)
 
         def distribution_stats(_previous):

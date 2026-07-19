@@ -12,6 +12,9 @@ from .vocab import FORMULA_VOCAB
 
 class ModelConfig:
     RANDOM_SEED = 42
+    USE_LORD_REGULARIZATION: bool = True
+    LORD_DECAY_RATE: float = 1.0e-3
+    LORD_NUM_ITERATIONS: int = 5
     # ── 训练设备 ─────────────────────────────────────────────────────────
     # 注意：本任务 CPU 训练速度反而比 GPU 快（实测约 2.3 倍），故强制用 CPU。
     # 原因：
