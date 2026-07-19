@@ -342,6 +342,11 @@ def training_config() -> dict[str, object]:
             "max": 0.60,
             "boost_factor": 2.0,
         },
+        "lord": {
+            "use_lord_regularization": ModelConfig.USE_LORD_REGULARIZATION,
+            "lord_decay_rate": ModelConfig.LORD_DECAY_RATE,
+            "lord_num_iterations": ModelConfig.LORD_NUM_ITERATIONS,
+        },
         "walk_forward": {
             "blocks": 5,
             "gap": LABEL_LOOKAHEAD_BARS,
