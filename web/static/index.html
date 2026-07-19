@@ -82,7 +82,7 @@
         </div>
         <div class="launch-actions" role="group" aria-label="训练操作">
           <button class="btn btn-primary" id="startBtn" disabled>开始训练</button>
-          <button class="btn btn-secondary" id="retrainBtn" disabled title="清除检查点，从头重新搜索（保留已有更优策略）">重新训练</button>
+          <button class="btn btn-secondary" id="retrainBtn" disabled title="创建新 run；旧 checkpoint、策略和分数保持不变">重新训练</button>
           <button class="btn btn-danger" id="stopBtn" disabled>停止</button>
           <span class="action-sep" aria-hidden="true"></span>
           <button class="btn btn-secondary" id="exportBtn" disabled title="下载当前品种的最优策略 JSON">导出策略</button>
@@ -173,9 +173,8 @@
             <p>绿色的最优分数只记「历史最好的那一次」，所以不会跟着掉下去，只会阶梯往上抬。锯齿本身多半是在重新探索，不等于训练坏了。</p>
           </li>
           <li>
-            <strong>重新训练有机会找出更好的量化因子</strong>
-            <p>「开始训练」会接着上次的检查点继续挖；「重新训练」会清掉检查点，从零换一条随机路径再搜一遍。因为搜索带随机性，有时能挖到比现在更高的分数。</p>
-            <p>已有的最优策略会当作分数下限留着——只有找到更好的才会覆盖，不会一开局就被弱公式冲掉。代价是要再花一整轮算力，适合本轮训完或最优分数长期不动时再用。</p>
+            <strong>重新训练会创建独立的新运行</strong>
+            <p id="fromScratchHelp">重新训练会创建全新的 run；所有既有 checkpoint、策略、history 和分数均原样保留；新 run 不从旧产物播种，也不受旧分数约束。</p>
           </li>
         </ol>
       </details>
@@ -264,6 +263,14 @@
             <div class="data-file-card" id="btStrategyCard">
               <div class="data-file-empty">尚未选择策略文件</div>
             </div>
+            <label>模式
+              <select id="btModeSelect">
+                <option value="in_sample_replay">样本内复盘</option>
+                <option value="out_of_sample_backtest">独立样本外回测</option>
+              </select>
+            </label>
+            <button type="button" class="btn btn-secondary btn-browse" id="btBrowseDataBtn">选择回测数据</button>
+            <div class="data-file-card" id="btDataCard"><div class="data-file-empty">尚未选择回测数据</div></div>
             <div class="launch-actions">
               <button class="btn btn-primary" id="btStartBtn" disabled>开始回测</button>
               <button class="btn btn-danger" id="btStopBtn" disabled>停止</button>
@@ -280,7 +287,7 @@
             </label>
             <span class="bt-cost-sum" id="btCostSumHint">合计单边成本 0.03%</span>
           </div>
-          <small class="field-hint">训练/回测均强制使用本地 Parquet，不连接 MT5。回测优先读策略内 <code>data_file</code>；没有则回退训练页同品种文件。单边手续费/滑点开平仓各扣一次。</small>
+          <small class="field-hint">样本内复盘必须选择训练数据；独立样本外回测必须选择训练结束后的独立 Parquet。单边手续费/滑点开平仓各扣一次。</small>
         </div>
       </section>
 

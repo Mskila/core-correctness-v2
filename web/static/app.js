@@ -2,6 +2,7 @@ const API = "";
 let selectedDataFile = null;
 let selectedSymbol = null;
 let selectedStrategyFile = null;
+let selectedBacktestDataFile = null;
 let selectedStrategySymbol = null;
 let chart = null;
 let chartSymbol = null;
@@ -21,6 +22,44 @@ let btLastAlertKey = "";
 let lastErrorPopupText = "";
 let lastErrorPopupAt = 0;
 
+const BACKTEST_MODES = new Set(["in_sample_replay", "out_of_sample_backtest"]);
+
+function createBacktestController() {
+  let strategyFile = null;
+  let dataFile = null;
+  let mode = null;
+  const state = () => ({ strategyFile, dataFile, mode });
+  return {
+    selectStrategy(value) {
+      strategyFile = value || null;
+      return state();
+    },
+    selectData(value) {
+      dataFile = value || null;
+      return state();
+    },
+    selectMode(value) {
+      if (!BACKTEST_MODES.has(value)) throw new Error("invalid backtest mode");
+      mode = value;
+      return state();
+    },
+    state,
+    payload(costs = {}) {
+      if (!strategyFile) throw new Error("strategy_file is required");
+      if (!dataFile) throw new Error("data_file is required");
+      if (!mode) throw new Error("mode is required");
+      return {
+        strategy_file: strategyFile,
+        data_file: dataFile,
+        mode,
+        commission_pct: costs.commission_pct,
+        slippage_pct: costs.slippage_pct,
+      };
+    },
+  };
+}
+
+const backtestController = createBacktestController();
 const $ = (id) => document.getElementById(id);
 
 const CPU_TRAINING_NOTE = `暂无报错
@@ -271,7 +310,7 @@ function renderDataFileCard(info) {
 function updateBtStartBtn() {
   const startBtn = $("btStartBtn");
   if (!startBtn) return;
-  startBtn.disabled = btActive || !selectedStrategyFile;
+  startBtn.disabled = btActive || !selectedStrategyFile || !selectedBacktestDataFile;
   ["btCommissionInput", "btSlippageInput"].forEach((id) => {
     const el = $(id);
     if (el) el.disabled = btActive;
@@ -286,6 +325,7 @@ function renderStrategyFileCard(info) {
     card.className = "data-file-card";
     card.innerHTML = '<div class="data-file-empty">尚未选择策略文件</div>';
     selectedStrategyFile = null;
+    backtestController.selectStrategy(null);
     selectedStrategySymbol = null;
     updateBtStartBtn();
     return;
@@ -298,12 +338,14 @@ function renderStrategyFileCard(info) {
       <div class="data-file-path">${info.strategy_file}</div>
     `;
     selectedStrategyFile = null;
+    backtestController.selectStrategy(null);
     selectedStrategySymbol = null;
     updateBtStartBtn();
     return;
   }
 
   selectedStrategyFile = info.strategy_file;
+  backtestController.selectStrategy(info.strategy_file);
   selectedStrategySymbol = info.symbol || null;
   card.className = "data-file-card valid";
   const timeframeItem = info.timeframe
@@ -944,9 +986,10 @@ async function retrainFromScratch() {
     return;
   }
   const ok = window.confirm(
-    "重新训练会清除该品种的检查点，从第 0 步重新搜索。\n" +
-      "已有的更优策略会保留，只有挖到更高分才会覆盖。\n\n" +
-      "确定要重新训练吗？"
+    "重新训练会创建一个全新的独立 run。\n" +
+      "所有已有 checkpoint、history、strategy、score、report 和 package 文件都会原样保留。\n" +
+      "新 run 不从旧产物播种，也不受旧分数下限约束。\n\n" +
+      "确定要开始新的训练 run 吗？"
   );
   if (!ok) return;
   try {
@@ -1750,28 +1793,42 @@ function renderEquity(resp) {
 }
 
 async function startBacktest() {
-  if (!selectedStrategyFile) {
-    await logClientError("请先选择策略文件");
+  const mode = $("btModeSelect")?.value;
+  try {
+    backtestController.selectMode(mode);
+  } catch (error) {
+    await logClientError(error.message);
     return;
   }
   const startBtn = $("btStartBtn");
   if (startBtn) startBtn.disabled = true;
   try {
     const costs = readBacktestCosts();
+    const payload = backtestController.payload(costs);
     const res = await fetchJSON("/api/backtest/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        strategy_file: selectedStrategyFile,
-        commission_pct: costs.commission_pct,
-        slippage_pct: costs.slippage_pct,
-      }),
+      body: JSON.stringify(payload),
     });
     if (res.strategy_file) renderStrategyFileCard(res.strategy_file);
     await refreshBacktest();
   } catch (e) {
     if ($("btLogHint")) $("btLogHint").textContent = e.message;
     updateBtStartBtn();
+  }
+}
+
+async function browseBacktestDataFile() {
+  try {
+    const res = await fetchJSON("/api/data-file/browse", { method: "POST" });
+    if (res.cancelled) return;
+    selectedBacktestDataFile = res.data_file;
+    backtestController.selectData(res.data_file);
+    const card = $("btDataCard");
+    if (card) card.textContent = res.data_file;
+    updateBtStartBtn();
+  } catch (e) {
+    if ($("btLogHint")) $("btLogHint").textContent = e.message;
   }
 }
 
@@ -2373,7 +2430,14 @@ async function init() {
 
   // 回测控制
   if ($("btBrowseStrategyBtn")) $("btBrowseStrategyBtn").addEventListener("click", browseStrategyFile);
+  if ($("btBrowseDataBtn")) $("btBrowseDataBtn").addEventListener("click", browseBacktestDataFile);
   if ($("btStartBtn")) $("btStartBtn").addEventListener("click", startBacktest);
+  if ($("btModeSelect")) {
+    backtestController.selectMode($("btModeSelect").value);
+    $("btModeSelect").addEventListener("change", (event) => {
+      backtestController.selectMode(event.target.value);
+    });
+  }
   if ($("btStopBtn")) $("btStopBtn").addEventListener("click", stopBacktest);
   ["btCommissionInput", "btSlippageInput"].forEach((id) => {
     const el = $(id);
@@ -2403,4 +2467,8 @@ async function init() {
   startPolling();
 }
 
-init();
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { createBacktestController };
+} else {
+  init();
+}

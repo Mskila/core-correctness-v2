@@ -7,6 +7,7 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any
+from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,11 +23,11 @@ from data_pipeline.parquet_manager import inspect_parquet_file
 from model_core.config import ModelConfig
 from web.file_dialog import pick_parquet_file, pick_strategy_file
 from web.progress import (
+    generated_at_utc,
     get_symbol_progress,
     get_strategy_for_export,
     invalidate_checkpoint_cache,
     list_strategies,
-    build_strategy_export_filename,
 )
 from web.server_log import (
     debug_snapshot,
@@ -95,6 +96,8 @@ class AnalyzeTrainingRequest(BaseModel):
 
 class StartBacktestRequest(BaseModel):
     strategy_file: str
+    data_file: str
+    mode: Literal["in_sample_replay", "out_of_sample_backtest"]
     commission_pct: float | None = None
     slippage_pct: float | None = None
 
@@ -593,22 +596,12 @@ def api_strategies() -> dict[str, Any]:
 
 @app.get("/api/strategies/{symbol}/export")
 def api_export_strategy(symbol: str):
-    import json
-
     from fastapi.responses import Response
 
     try:
-        payload = get_strategy_for_export(symbol)
+        body, filename = get_strategy_for_export(symbol)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    progress = get_symbol_progress(symbol)
-    step = progress.current_step
-    score = payload.get("best_score")
-    if score is None:
-        score = progress.strategy_score if progress.strategy_score is not None else progress.best_score
-    filename = build_strategy_export_filename(symbol, step, score)
-    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     return Response(
         content=body,
         media_type="application/json; charset=utf-8",
@@ -823,50 +816,21 @@ def api_backtest_start(req: StartBacktestRequest) -> dict[str, Any]:
         "bt_slippage_pct": slippage,
     })
 
-    data_file: str | None = None
-    # 1) 优先用策略 JSON 里记录的训练数据路径
-    strat_data = (info.get("data_file") or "").strip()
-    if strat_data:
-        try:
-            pf = inspect_parquet_file(strat_data)
-            if pf.get("valid") is False:
-                raise HTTPException(
-                    400,
-                    f"策略记录的数据文件无效: {pf.get('message') or strat_data}",
-                )
-            data_file = pf["data_file"]
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(
-                400,
-                f"策略记录的数据文件无法加载: {strat_data}\n{e}",
-            ) from e
-    else:
-        # 2) 回退：训练页最近选择的、同品种 Parquet
-        last_data = settings.get("last_data_file") or ""
-        if last_data:
-            try:
-                pf = inspect_parquet_file(last_data)
-                if pf.get("symbol") == info.get("symbol") and pf.get("valid") is not False:
-                    data_file = pf["data_file"]
-            except Exception:
-                pass
-
-    if not data_file:
-        raise HTTPException(
-            400,
-            "该策略未记录数据文件路径（data_file），且当前也没有同品种的 Parquet。"
-            "请先在「模型训练」页选择对应品种的 Parquet 再回测；"
-            "或使用本软件训练/导出、且包含 data_file 字段的策略文件。",
-        )
-
-    save_settings({"last_data_file": data_file})
+    try:
+        pf = inspect_parquet_file(req.data_file)
+        if pf.get("valid") is False:
+            raise HTTPException(400, pf.get("message") or "回测数据文件无效")
+        data_file = pf["data_file"]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"回测数据文件无法加载: {exc}") from exc
 
     try:
         job = backtest_manager.start(
             strategy_file=info["strategy_file"],
             data_file=data_file,
+            mode=req.mode,
             commission_pct=commission,
             slippage_pct=slippage,
         )
@@ -955,24 +919,37 @@ def api_realtime_sources() -> dict[str, Any]:
 
 @app.get("/api/realtime/strategies")
 def api_realtime_strategies() -> dict[str, Any]:
-    """已保存的 best_*.json 策略，供因子来源下拉。"""
-    rows = []
+    """已保存的 identity-valid immutable V2 策略，供因子来源下拉。"""
+    selected: dict[tuple[str, str], dict[str, Any]] = {}
     for s in list_strategies():
         sym = s.get("symbol")
-        if not sym:
+        timeframe = s.get("timeframe")
+        filename = s.get("file")
+        if not sym or not timeframe or not filename:
             continue
-        path = strategy_path_for_symbol(sym)
-        if not path.exists():
+        try:
+            path = strategy_path_for_symbol(
+                sym, timeframe, filename=filename
+            )
+            inspected = inspect_strategy_file(str(path))
+        except Exception:
             continue
-        rows.append(
-            {
-                "symbol": sym,
-                "timeframe": s.get("timeframe"),
-                "best_score": s.get("best_score"),
-                "formula_decoded": s.get("formula_decoded"),
-                "strategy_file": str(path.resolve()),
-            }
-        )
+        row = {
+            "symbol": inspected["symbol"],
+            "timeframe": inspected["timeframe"],
+            "best_score": inspected["best_score"],
+            "formula_decoded": inspected["formula_decoded"],
+            "strategy_file": inspected["strategy_file"],
+            "generated_at": inspected["generated_at"],
+            "filename": inspected["filename"],
+        }
+        key = (row["symbol"], row["timeframe"])
+        previous = selected.get(key)
+        if previous is None or (
+            generated_at_utc(row["generated_at"]), row["filename"]
+        ) > (generated_at_utc(previous["generated_at"]), previous["filename"]):
+            selected[key] = row
+    rows = [selected[key] for key in sorted(selected)]
     return {"strategies": rows}
 
 

@@ -96,12 +96,6 @@ class TrainingManager:
             safe_sym = symbol.replace(".", "_")
             log_path = LOG_DIR / f"train_{safe_sym}_{ts}.log"
 
-            hist_path = PROJECT_ROOT / f"training_history_{symbol}.json"
-            try:
-                hist_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
             cmd = [
                 sys.executable,
                 "-u",

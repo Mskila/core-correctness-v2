@@ -1,8 +1,11 @@
 import json
+import hashlib
 from dataclasses import replace
 
 import pytest
+from fastapi.testclient import TestClient
 
+import web.app as web_app
 import web.progress as progress
 import web.strategy_file as strategy_file
 from model_core.artifacts import ArtifactIdentity, StrategyArtifact, TrainingRunIdentity
@@ -55,6 +58,92 @@ def _write_artifact(directory, artifact):
     path = directory / artifact.run_identity.strategy_filename()
     path.write_text(json.dumps(artifact.to_dict()), encoding="utf-8")
     return path
+
+
+def _strategy_export_response(monkeypatch, tmp_path):
+    strategies = tmp_path / "strategies"
+    checkpoints = tmp_path / "checkpoints"
+    strategies.mkdir()
+    checkpoints.mkdir()
+    earlier = _timeframe_artifact(
+        "H1", "2026-07-16T00:00:00.0000001Z", 0, "f" * 32
+    )
+    selected = _timeframe_artifact(
+        "H1", "2026-07-16T00:00:00.0000002Z", 1, "0" * 32
+    )
+    _write_artifact(strategies, earlier)
+    selected_path = _write_artifact(strategies, selected)
+
+    legacy = strategies / "best_EURUSD.json"
+    legacy.write_bytes(b"LEGACY-USER-BYTES")
+    noncanonical = strategies / "best_v2_EURUSD_H1_user-copy.json"
+    noncanonical.write_bytes(selected_path.read_bytes())
+    tampered_artifact = _timeframe_artifact(
+        "H1", "2026-07-15T00:00:00Z", 0, "1" * 32
+    )
+    tampered_payload = tampered_artifact.to_dict()
+    tampered_payload["formula_tokens"] = [1]
+    tampered = strategies / tampered_artifact.run_identity.strategy_filename()
+    tampered.write_text(json.dumps(tampered_payload), encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in strategies.iterdir()}
+
+    monkeypatch.setattr(progress, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(progress, "CHECKPOINT_DIR", checkpoints)
+    monkeypatch.setattr(progress, "STRATEGIES_DIR", strategies)
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    progress.invalidate_checkpoint_cache()
+    response = TestClient(web_app.app).get("/api/strategies/EURUSD/export")
+    return response, selected_path, selected, before, strategies
+
+
+def test_strategy_export_route_returns_exact_selected_artifact_bytes(
+    monkeypatch, tmp_path
+) -> None:
+    response, selected_path, _, before, strategies = _strategy_export_response(
+        monkeypatch, tmp_path
+    )
+    source = selected_path.read_bytes()
+    assert response.status_code == 200
+    assert response.content == source, (
+        f"source_sha={hashlib.sha256(source).hexdigest()} "
+        f"export_sha={hashlib.sha256(response.content).hexdigest()}"
+    )
+    assert {path.name: path.read_bytes() for path in strategies.iterdir()} == before
+
+
+def test_strategy_export_route_uses_canonical_content_disposition(
+    monkeypatch, tmp_path
+) -> None:
+    response, selected_path, _, _, _ = _strategy_export_response(monkeypatch, tmp_path)
+    assert response.headers["content-disposition"] == (
+        f'attachment; filename="{selected_path.name}"'
+    )
+    assert not response.headers["content-disposition"].startswith(
+        'attachment; filename="strategy_EURUSD_step'
+    )
+
+
+def test_strategy_export_route_preserves_full_artifact_fields(monkeypatch, tmp_path) -> None:
+    response, selected_path, _, _, _ = _strategy_export_response(monkeypatch, tmp_path)
+    exported = json.loads(response.content)
+    source = json.loads(selected_path.read_bytes())
+    assert set(exported) == set(source)
+    assert set(exported) != {
+        "artifact_fingerprint", "best_score", "formula", "formula_decoded",
+        "run_identity", "strategy_fingerprint",
+    }
+
+
+def test_strategy_export_route_round_trips_strict_strategy_artifact(
+    monkeypatch, tmp_path
+) -> None:
+    response, _, selected, _, _ = _strategy_export_response(monkeypatch, tmp_path)
+    loaded = StrategyArtifact.from_dict(json.loads(response.content))
+    assert loaded == selected
+    assert loaded.run_identity == selected.run_identity
+    assert loaded.fingerprint == selected.fingerprint
+    assert loaded.formula_tokens == selected.formula_tokens
+    assert loaded.generated_at == selected.generated_at
 
 
 def test_strategy_resolution_is_exact_per_symbol_and_timeframe(monkeypatch, tmp_path) -> None:

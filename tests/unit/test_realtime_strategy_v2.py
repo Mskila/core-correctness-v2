@@ -3,8 +3,12 @@ import json
 import pytest
 
 import web.realtime_manager as realtime
+import web.app as web_app
+import web.progress as progress
+import web.strategy_file as strategy_file
 from web.data_sources.base import Bar
 from tests.unit.test_artifacts import strategy_artifact
+from tests.unit.test_web_strategy_v2 import _timeframe_artifact, _write_artifact
 
 
 class _Source:
@@ -72,6 +76,70 @@ def test_realtime_loader_requires_canonical_immutable_basename(tmp_path) -> None
     assert sorted(path.name for path in tmp_path.iterdir()) == sorted(
         [canonical.name, renamed.name]
     )
+
+
+def test_realtime_strategy_rows_keep_h1_and_h4_exact_paths(monkeypatch, tmp_path) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    h1_old = _write_artifact(
+        strategies, _timeframe_artifact("H1", "2026-07-15T00:00:00Z")
+    )
+    h1_new = _write_artifact(
+        strategies, _timeframe_artifact("H1", "2026-07-16T00:00:00Z")
+    )
+    h4 = _write_artifact(
+        strategies, _timeframe_artifact("H4", "2026-07-17T00:00:00Z")
+    )
+    monkeypatch.setattr(progress, "STRATEGIES_DIR", strategies)
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    rows = web_app.api_realtime_strategies()["strategies"]
+    by_timeframe = {row["timeframe"]: row for row in rows}
+    assert set(by_timeframe) == {"H1", "H4"}
+    assert by_timeframe["H1"]["strategy_file"] == str(h1_new.resolve())
+    assert by_timeframe["H4"]["strategy_file"] == str(h4.resolve())
+    assert by_timeframe["H1"]["strategy_file"] != str(h1_old.resolve())
+    assert len({row["strategy_file"] for row in rows}) == 2
+
+
+def test_realtime_rows_order_generated_at_as_utc_instant(monkeypatch, tmp_path) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    earlier = _write_artifact(
+        strategies, _timeframe_artifact("H1", "2026-07-16T00:00:00Z", 0)
+    )
+    later = _write_artifact(
+        strategies, _timeframe_artifact("H1", "2026-07-16T00:00:00.500000Z", 1)
+    )
+    monkeypatch.setattr(progress, "STRATEGIES_DIR", strategies)
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    rows = web_app.api_realtime_strategies()["strategies"]
+    assert len(rows) == 1
+    assert rows[0]["strategy_file"] == str(later.resolve())
+    assert rows[0]["strategy_file"] != str(earlier.resolve())
+    assert rows[0]["generated_at"] == "2026-07-16T00:00:00.500000Z"
+
+
+def test_realtime_rows_preserve_submicrosecond_order(monkeypatch, tmp_path) -> None:
+    strategies = tmp_path / "strategies"
+    strategies.mkdir()
+    earlier = _write_artifact(
+        strategies,
+        _timeframe_artifact(
+            "H1", "2026-07-16T00:00:00.0000001Z", 0, "f" * 32
+        ),
+    )
+    later = _write_artifact(
+        strategies,
+        _timeframe_artifact(
+            "H1", "2026-07-16T00:00:00.0000002Z", 1, "0" * 32
+        ),
+    )
+    monkeypatch.setattr(progress, "STRATEGIES_DIR", strategies)
+    monkeypatch.setattr(strategy_file, "STRATEGIES_DIR", strategies)
+    rows = web_app.api_realtime_strategies()["strategies"]
+    assert len(rows) == 1
+    assert rows[0]["strategy_file"] == str(later.resolve())
+    assert rows[0]["strategy_file"] != str(earlier.resolve())
 
 
 class _DemandSource(_Source):
