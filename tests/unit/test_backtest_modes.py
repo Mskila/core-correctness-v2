@@ -1241,7 +1241,7 @@ def test_backtest_revalidation_rejects_metric_str_subclass_key_without_protocol_
 
 
 @pytest.mark.parametrize("blocks", [2, 4, 6])
-def test_backtest_revalidation_rejects_unapproved_walk_forward_domain(blocks: int) -> None:
+def test_backtest_revalidation_rejects_walk_forward_fold_count_mismatch(blocks: int) -> None:
     artifact = strategy()
     identity = artifact.run_identity.artifact_identity
     config = training_config()
@@ -1250,7 +1250,7 @@ def test_backtest_revalidation_rejects_unapproved_walk_forward_domain(blocks: in
     object.__setattr__(identity, "training_config_hash", sha256_json(config))
     with pytest.raises(
         BacktestModeError,
-        match=rf"walk_forward\.blocks.*expected=5.*actual={blocks}",
+        match=rf"fold_evidence count.*expected={blocks - 1}.*actual=4",
     ):
         validate_backtest_dataset(artifact, dataset(), BacktestMode.IN_SAMPLE_REPLAY)
 
