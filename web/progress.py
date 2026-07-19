@@ -1,6 +1,7 @@
 """Identity-isolated V2 training progress for Web entrypoints."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -150,7 +151,7 @@ def _load_checkpoint_meta(path: Path) -> dict[str, Any]:
     content_hash = hashlib.sha256(checkpoint_bytes).hexdigest()
     cached = _ckpt_cache.get(key)
     if cached and cached[0] == mtime_ns and cached[1] == content_hash:
-        return cached[2]
+        return copy.deepcopy(cached[2])
     meta = {
         "run": run, "step": step, "best_score": payload.get("best_score"),
         "best_formula": payload.get("best_formula"),
@@ -158,7 +159,7 @@ def _load_checkpoint_meta(path: Path) -> dict[str, Any]:
         "mtime": mtime, "mtime_ns": mtime_ns, "path": path,
     }
     _ckpt_cache[key] = (mtime_ns, content_hash, meta)
-    return meta
+    return copy.deepcopy(meta)
 
 
 def _decode_formula(tokens: list[int] | None) -> str | None:

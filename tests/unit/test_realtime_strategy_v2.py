@@ -6,6 +6,7 @@ import web.realtime_manager as realtime
 import web.app as web_app
 import web.progress as progress
 import web.strategy_file as strategy_file
+from model_core.semantics import ArtifactCompatibilityError
 from web.data_sources.base import Bar
 from tests.unit.test_artifacts import strategy_artifact
 from tests.unit.test_web_strategy_v2 import _timeframe_artifact, _write_artifact
@@ -52,7 +53,7 @@ def test_realtime_loader_rejects_non_v2(tmp_path, payload) -> None:
     path = tmp_path / "legacy.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     before = path.read_bytes()
-    with pytest.raises(Exception):
+    with pytest.raises(ArtifactCompatibilityError, match="strategy artifact"):
         realtime._load_strategy_meta(str(path))
     assert path.read_bytes() == before
 

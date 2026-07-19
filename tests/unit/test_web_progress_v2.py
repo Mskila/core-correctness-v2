@@ -193,6 +193,31 @@ def test_checkpoint_cache_reloads_changed_bytes_with_identical_mtime_ns(
     assert second["best_formula"] == [1]
 
 
+def test_public_progress_mutation_cannot_poison_cached_checkpoint_metadata(
+    monkeypatch, tmp_path
+) -> None:
+    checkpoints, _ = _layout(monkeypatch, tmp_path)
+    artifact = _artifact(token=0, run_id="2" * 32)
+    path = checkpoints / artifact.run_identity.checkpoint_filename(7)
+    _checkpoint(path, artifact, step=7)
+    disk_bytes = path.read_bytes()
+
+    first = progress.get_symbol_progress("EURUSD")
+    assert first.history is not None
+    assert first.best_formula == [0]
+    first.history["best_score"][0] = 999.0
+    first.best_formula[0] = 1
+
+    second = progress.get_symbol_progress("EURUSD")
+    assert path.read_bytes() == disk_bytes
+    assert second.history is not None
+    assert second.history["best_score"][0] == 1.0
+    assert second.best_formula == [0]
+    assert second.history is not first.history
+    assert second.history["best_score"] is not first.history["best_score"]
+    assert second.best_formula is not first.best_formula
+
+
 def test_history_only_anchor_uses_exact_mtime_ns(monkeypatch, tmp_path) -> None:
     _layout(monkeypatch, tmp_path)
     older = _artifact(run_id="f" * 32)

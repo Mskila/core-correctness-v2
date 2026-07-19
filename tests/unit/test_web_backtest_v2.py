@@ -49,10 +49,16 @@ def test_manager_forwards_explicit_mode_data_and_costs(monkeypatch, tmp_path) ->
         assert job.data_file == str(data)
         assert job.mode == "out_of_sample_backtest"
         command = captured["command"]
-        assert command[command.index("--data-file") + 1] == str(data)
-        assert command[command.index("--mode") + 1] == "out_of_sample_backtest"
-        assert command[command.index("--commission") + 1] == "0.12"
-        assert command[command.index("--slippage") + 1] == "0.34"
+        expected_options = {
+            "--strategy-file": str(strategy),
+            "--data-file": str(data),
+            "--mode": "out_of_sample_backtest",
+            "--commission": "0.12",
+            "--slippage": "0.34",
+        }
+        for flag, expected_value in expected_options.items():
+            assert command.count(flag) == 1
+            assert command[command.index(flag) + 1] == expected_value
     finally:
         manager._log_fp.close()
 

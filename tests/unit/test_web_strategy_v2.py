@@ -18,7 +18,7 @@ from web.strategy_file import inspect_strategy_file
 def test_strategy_inspection_rejects_legacy_or_identityless(tmp_path, payload) -> None:
     path = tmp_path / "best_EURUSD.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(Exception, match="strategy|artifact|schema|identity|V2|v2"):
+    with pytest.raises(ValueError, match="不兼容的 V2 strategy artifact"):
         inspect_strategy_file(str(path))
 
 
