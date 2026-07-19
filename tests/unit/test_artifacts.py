@@ -5,7 +5,6 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 import math
-from time import perf_counter
 from types import MappingProxyType
 
 import pytest
@@ -520,11 +519,12 @@ def construct_strategy_with_folds(
     )
 
 
-def construct_fixed_five_block_strategy(
+def construct_strategy_for_blocks(
     boundary: str,
+    blocks: int,
     fold_count: int,
 ) -> StrategyArtifact:
-    run = TrainingRunIdentity.create(artifact_identity(blocks=5))
+    run = TrainingRunIdentity.create(artifact_identity(blocks=blocks))
     folds = tuple(fold_evidence_with_index(index) for index in range(fold_count))
     if boundary == "create":
         return StrategyArtifact.create(
@@ -562,7 +562,38 @@ def test_five_block_strategy_rejects_wrong_fold_cardinality_at_every_boundary(
         ArtifactCompatibilityError,
         match=rf"fold_evidence count.*expected=4.*actual={fold_count}",
     ):
-        construct_fixed_five_block_strategy(boundary, fold_count)
+        construct_strategy_for_blocks(boundary, 5, fold_count)
+
+
+@pytest.mark.parametrize("boundary", ["create", "direct", "from_dict", "load"])
+def test_three_block_strategy_accepts_two_ordered_folds_and_round_trips(
+    boundary: str,
+) -> None:
+    strategy = construct_strategy_for_blocks(boundary, 3, 2)
+
+    assert [fold.fold_index for fold in strategy.fold_evidence] == [0, 1]
+    assert StrategyArtifact.from_dict(strategy.to_dict()) == strategy
+
+
+@pytest.mark.parametrize("boundary", ["create", "direct", "from_dict", "load"])
+@pytest.mark.parametrize("fold_count", [0, 1, 3, 4])
+def test_three_block_strategy_rejects_non_two_fold_cardinality(
+    boundary: str,
+    fold_count: int,
+) -> None:
+    with pytest.raises(
+        ArtifactCompatibilityError,
+        match=rf"fold_evidence count.*expected=2.*actual={fold_count}",
+    ):
+        construct_strategy_for_blocks(boundary, 3, fold_count)
+
+
+@pytest.mark.parametrize("boundary", ["create", "direct", "from_dict", "load"])
+def test_default_five_block_strategy_still_requires_four_folds(boundary: str) -> None:
+    strategy = construct_strategy_for_blocks(boundary, 5, 4)
+
+    assert len(strategy.fold_evidence) == 4
+    assert StrategyArtifact.from_dict(strategy.to_dict()) == strategy
 
 
 STRATEGY_PUBLIC_MUTATIONS = (
@@ -877,23 +908,27 @@ def test_entropy_identity_is_deeply_immutable_after_construction() -> None:
         identity.training_config["entropy"]["floor_enabled"] = False  # type: ignore[index]
 
 
-def test_one_block_training_identity_is_outside_the_approved_t05_domain() -> None:
-    config = training_config()
-    config["walk_forward"]["blocks"] = 1  # type: ignore[index]
+def test_three_block_artifact_identity_succeeds_at_all_serialization_boundaries() -> None:
+    direct = artifact_identity(blocks=3)
+    from_dict = ArtifactIdentity.from_dict(direct.to_dict())
+    round_tripped = ArtifactIdentity.from_dict(from_dict.to_dict())
+
+    assert direct.training_config["walk_forward"]["blocks"] == 3  # type: ignore[index]
+    assert from_dict == direct
+    assert round_tripped == direct
+
+
+def test_walk_forward_block_count_remains_part_of_exact_artifact_identity() -> None:
+    three_blocks = artifact_identity(blocks=3)
+    five_blocks = artifact_identity(blocks=5)
+
+    assert three_blocks.training_config_hash != five_blocks.training_config_hash
+    assert three_blocks.fingerprint != five_blocks.fingerprint
     with pytest.raises(
         ArtifactCompatibilityError,
-        match=r"training_config\.walk_forward\.blocks.*expected=5.*actual=1",
+        match=r"training_config|training_config_hash",
     ):
-        artifact_identity_with_config(config)
-
-
-def test_oversized_unapproved_fold_domain_is_rejected_efficiently() -> None:
-    config = training_config()
-    config["walk_forward"]["blocks"] = 1_001  # type: ignore[index]
-    started = perf_counter()
-    with pytest.raises(ArtifactCompatibilityError, match="blocks.*expected=5.*actual=1001"):
-        artifact_identity_with_config(config)
-    assert perf_counter() - started < 0.5
+        verify_artifact_identity(three_blocks, five_blocks)
 
 
 @pytest.mark.parametrize("boundary", ["direct", "from_dict"])
@@ -3364,17 +3399,30 @@ def test_public_mapping_boundaries_reject_duplicate_raw_items(
         action()
 
 
-@pytest.mark.parametrize("blocks", [0, 1, 2, 3, 4, 6, 1_001])
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        pytest.param(0, id="zero"),
+        pytest.param(1, id="one"),
+        pytest.param(True, id="bool"),
+        pytest.param(3.0, id="float"),
+        pytest.param("3", id="string"),
+        pytest.param(10**1000, id="non-operational-huge-int"),
+    ],
+)
 @pytest.mark.parametrize("boundary", ["direct", "from_dict", "round_trip"])
-def test_artifact_identity_requires_exactly_five_walk_forward_blocks(
-    blocks: int,
+def test_artifact_identity_rejects_invalid_walk_forward_block_domain(
+    blocks: object,
     boundary: str,
 ) -> None:
     config = training_config()
     config["walk_forward"]["blocks"] = blocks  # type: ignore[index]
     with pytest.raises(
         ArtifactCompatibilityError,
-        match=rf"training_config\.walk_forward\.blocks.*expected=5.*actual={blocks}",
+        match=(
+            r"training_config\.walk_forward\.blocks.*expected=integer >= 2"
+            r"|operational finite-real range.*walk_forward\.blocks"
+        ),
     ):
         if boundary == "direct":
             artifact_identity_with_config(config)

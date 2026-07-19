@@ -167,7 +167,7 @@ _TRAINING_CONFIG_CONTAINER_SCHEMA = {
         "lord_num_iterations": "positive_int",
     },
     "walk_forward": {
-        "blocks": "exact_five_int",
+        "blocks": "at_least_two_int",
         "gap": "nonnegative_int",
         "min_fold_bars": "positive_int",
         "warmup_bars": "nonnegative_int",
@@ -184,8 +184,6 @@ _MAX_DIAGNOSTIC_VALUE_CHARS = 160
 _MAX_DIAGNOSTIC_CAUSE_CHARS = 640
 _MAX_PUBLIC_ERROR_CHARS = 1_024
 _MAX_OPERATIONAL_INTEGER = int(float.fromhex("0x1.fffffffffffffp+1023"))
-_APPROVED_WF_N_BLOCKS = 5
-_APPROVED_WF_VALIDATION_FOLDS = _APPROVED_WF_N_BLOCKS - 1
 
 
 def _bounded_text(value: str, *, quoted: bool) -> str:
@@ -747,14 +745,6 @@ def _validate_config_value(value: object, *, rule: str, path: str) -> None:
         if type(value) is not bool:
             _config_value_error(path, expected="boolean", actual=value)
         return
-    if rule == "exact_five_int":
-        if type(value) is not int or value != _APPROVED_WF_N_BLOCKS:
-            _config_value_error(
-                path,
-                expected=str(_APPROVED_WF_N_BLOCKS),
-                actual=value,
-            )
-        return
     if rule in {"positive_int", "nonnegative_int", "at_least_two_int"}:
         minimum = {
             "nonnegative_int": 0,
@@ -880,12 +870,6 @@ def _validate_training_config_fields(value: Mapping[str, object]) -> None:
         )
     walk_forward = value["walk_forward"]
     assert isinstance(walk_forward, Mapping)
-    if walk_forward["blocks"] != _APPROVED_WF_N_BLOCKS:
-        _config_value_error(
-            "training_config.walk_forward.blocks",
-            expected=str(_APPROVED_WF_N_BLOCKS),
-            actual=walk_forward["blocks"],
-        )
     if walk_forward["label_lookahead"] != LABEL_LOOKAHEAD_BARS:
         _config_value_error(
             "training_config.walk_forward.label_lookahead",
@@ -1659,7 +1643,9 @@ def _validated_strategy_lineage(
     dataset = artifact_identity.training_dataset
     walk_forward = artifact_identity.training_config["walk_forward"]
     assert isinstance(walk_forward, Mapping)
-    expected_fold_count = _APPROVED_WF_VALIDATION_FOLDS
+    blocks = walk_forward["blocks"]
+    assert type(blocks) is int
+    expected_fold_count = blocks - 1
     actual_fold_count = len(validated_folds)
     if actual_fold_count != expected_fold_count:
         raise ArtifactCompatibilityError(
