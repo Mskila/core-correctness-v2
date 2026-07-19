@@ -1106,6 +1106,69 @@ def test_strategy_publication_rejects_lord_optimizer_divergence_without_writes(
         AlphaEngine._save_strategy_live(engine)
 
     assert strategy_path.read_bytes() == b"PREEXISTING-STRATEGY"
+def test_ordinary_nonpublication_batch_does_not_snapshot_artifacts_or_write_history(
+    monkeypatch, tmp_path
+) -> None:
+    vm_calls = 0
+
+    def execute(_formula, _features):
+        nonlocal vm_calls
+        vm_calls += 1
+        if vm_calls > 3:
+            raise _TrainingAbort("stop before chunk boundary")
+        return factor.clone()
+
+    engine, factor, calls, _before = _failure_training_engine(
+        monkeypatch, tmp_path, execute
+    )
+    history_path = tmp_path / "training_history.json"
+    original = b"H" * (2 * 1024 * 1024)
+    history_path.write_bytes(original)
+    monkeypatch.setattr(
+        TrainingRunIdentity, "history_filename", lambda _identity: str(history_path)
+    )
+    backup_calls = []
+    real_snapshot = engine_module._snapshot_artifact_to_owned_backup
+
+    def record_snapshot(path):
+        backup_calls.append(pathlib.Path(path))
+        return real_snapshot(path)
+
+    monkeypatch.setattr(
+        engine_module, "_snapshot_artifact_to_owned_backup", record_snapshot
+    )
+
+    with pytest.raises(_TrainingAbort, match="before chunk boundary"):
+        engine.train(end_step=2, verbose_header=False)
+
+    assert calls["history"] == 0
+    assert backup_calls == []
+    assert history_path.read_bytes() == original
+
+
+def test_chunk_boundary_publishes_full_canonical_history(monkeypatch, tmp_path) -> None:
+    engine, factor, calls, _before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    history_path = tmp_path / "training_history.json"
+    engine.target_symbol = "EURUSD"
+    monkeypatch.setattr(
+        TrainingRunIdentity, "history_filename", lambda _identity: str(history_path)
+    )
+    engine._save_training_history_live = (
+        AlphaEngine._save_training_history_live.__get__(engine, AlphaEngine)
+    )
+
+    engine.train(end_step=1, verbose_header=False)
+
+    payload = json.loads(history_path.read_text(encoding="utf-8"))
+    assert payload == {
+        key: value
+        for key, value in engine.training_history.items()
+        if key != "_low_entropy_streak"
+    }
+    assert payload["step"] == [0]
+    assert calls["checkpoint"] == 1
 
 
 def _install_legacy_final_strategy_oracle(
@@ -3204,10 +3267,11 @@ def test_real_one_step_training_artifact_probes_are_bounded_by_publications(
     )
     engine.train(end_step=1, verbose_header=False)
 
-    # Six construction probes plus two paths before/after history and checkpoint.
-    assert len(construction_attempts) == 6
+    # Only the four paths actually published at this durable boundary are
+    # snapshotted, plus their before/after publication observations.
+    assert len(construction_attempts) == 4
     assert len(attempts) == 8
-    assert len(construction_attempts) + len(attempts) == 14
+    assert len(construction_attempts) + len(attempts) == 12
     counts = {path: attempts.count(path) for path in set(attempts)}
     assert set(counts.values()) == {2}
 
@@ -4944,7 +5008,7 @@ def _replace_training_identity(engine, entry, variant: str) -> None:
 @pytest.mark.parametrize(
     "variant", ["deleted", "none", "different", "equal-distinct", "hostile"]
 )
-def test_batch_setup_filename_callback_restores_exact_entry_before_next_boundary(
+def test_lazy_filename_callback_restores_exact_entry_before_next_boundary(
     monkeypatch, tmp_path, variant
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -4969,8 +5033,12 @@ def test_batch_setup_filename_callback_restores_exact_entry_before_next_boundary
         TrainingRunIdentity, "history_filename", forbidden_history_filename
     )
 
+    transaction = engine._begin_batch_transaction(1, entry)
+    assert engine.run_identity is entry
+    assert next_boundary_calls == []
+
     with pytest.raises(ArtifactCompatibilityError):
-        engine._begin_batch_transaction(1, entry)
+        transaction.run(entry.strategy_filename)
 
     assert engine.run_identity is entry
     assert next_boundary_calls == []

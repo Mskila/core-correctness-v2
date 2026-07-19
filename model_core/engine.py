@@ -1998,10 +1998,7 @@ class _BatchTransaction:
         paths = tuple(dict.fromkeys(pathlib.Path(path) for path in affected_paths))
         undeclared = [path for path in paths if path not in self.artifacts]
         if undeclared:
-            raise ValueError(
-                "artifact publication contains undeclared transaction paths: "
-                + ", ".join(str(path) for path in undeclared)
-            )
+            self.run(self.observe_artifacts, undeclared)
         before = self._current_artifacts(paths)
         before_identities = dict(self._last_observed_identities)
         self._publication_identities.clear()
@@ -2979,29 +2976,7 @@ class AlphaEngine:
         run_identity = _revalidate_run_identity(
             self, run_identity, "training batch before artifact observation"
         )
-        transaction = _BatchTransaction(self, [], run_identity)
-        strategy_name = transaction.run(run_identity.strategy_filename)
-        strategy_path = transaction.run(
-            lambda: pathlib.Path("strategies") / strategy_name
-        )
-        history_name = transaction.run(run_identity.history_filename)
-        history_path = transaction.run(pathlib.Path, history_name)
-        checkpoint_name = transaction.run(
-            run_identity.checkpoint_filename, max(0, next_step - 1)
-        )
-        checkpoint_path = transaction.run(
-            lambda: _CHECKPOINT_DIR / checkpoint_name
-        )
-        published_paths = [strategy_path, history_path, checkpoint_path]
-        temporary_paths = transaction.run(
-            lambda: [
-                path.with_name(f".{path.name}.tmp") for path in published_paths
-            ]
-        )
-        transaction.run(
-            transaction.observe_artifacts, published_paths + temporary_paths
-        )
-        return transaction
+        return _BatchTransaction(self, [], run_identity)
 
     def _commit_pending_actions(
         self,
@@ -3869,19 +3844,6 @@ class AlphaEngine:
             self.training_history.setdefault('batch_uniq_fmls', []).append(uniq_fmls)
             self.training_history.setdefault('batch_fml_div', []).append(fml_div)
 
-            current_identity = transaction.run(
-                _revalidate_run_identity,
-                self, run_identity, "training history boundary",
-            )
-            history_path = pathlib.Path(current_identity.history_filename())
-            transaction.run_artifact(
-                self._save_training_history_live,
-                [
-                    history_path,
-                    history_path.with_name(f".{history_path.name}.tmp"),
-                ],
-            )
-
             # ── Part F: Entropy collapse detection & restart ─────────
             transaction.run(self._apply_adaptive_restart, step, ent_val)
 
@@ -3891,6 +3853,14 @@ class AlphaEngine:
                 current_identity = transaction.run(
                     _revalidate_run_identity,
                     self, run_identity, "training checkpoint boundary",
+                )
+                history_path = pathlib.Path(current_identity.history_filename())
+                transaction.run_artifact(
+                    self._save_training_history_live,
+                    [
+                        history_path,
+                        history_path.with_name(f".{history_path.name}.tmp"),
+                    ],
                 )
                 checkpoint_path = (
                     _CHECKPOINT_DIR / current_identity.checkpoint_filename(step)
@@ -3934,9 +3904,6 @@ class AlphaEngine:
             hist_path = history_transaction.run(pathlib.Path, hist_name)
             hist_temp = history_transaction.run(
                 lambda: hist_path.with_name(f".{hist_path.name}.tmp")
-            )
-            history_transaction.run(
-                history_transaction.observe_artifacts, [hist_path, hist_temp]
             )
             self.training_history.pop('_low_entropy_streak', None)
             history_transaction.run_artifact(
@@ -4102,9 +4069,6 @@ class AlphaEngine:
             )
             transaction.commit()
             return result
-        transaction.run(
-            transaction.observe_artifacts, [target, temporary]
-        )
         result = transaction.run_artifact(
             self._save_checkpoint_transaction_body,
             [target, temporary],
