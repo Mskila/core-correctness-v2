@@ -16,6 +16,12 @@ if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.train_logging import strip_ansi
+from model_core.error_telemetry import ErrorTelemetry
+from web.process_lifecycle import (
+    ProcessLifecycleError,
+    popen_group_options,
+    stop_process_tree,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -68,6 +74,7 @@ class TrainingManager:
         self._log_fp = None
         self._stopped_by_user = False
         self._recorded_log_paths: set[str] = set()
+        self._errors = ErrorTelemetry()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -75,6 +82,7 @@ class TrainingManager:
             return {
                 "active": self._job is not None and self._job.state == JobState.RUNNING,
                 "job": self._job.to_dict() if self._job else None,
+                "errors": self._errors.snapshot(),
             }
 
     def start(
@@ -113,10 +121,6 @@ class TrainingManager:
             env["PYTHONUTF8"] = "1"
             env["LOGURU_COLORIZE"] = "0"
 
-            creationflags = 0
-            if sys.platform == "win32":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
             self._stopped_by_user = False
             self._proc = subprocess.Popen(
                 cmd,
@@ -124,7 +128,7 @@ class TrainingManager:
                 stdout=self._log_fp,
                 stderr=subprocess.STDOUT,
                 env=env,
-                creationflags=creationflags,
+                **popen_group_options(),
             )
             self._job = TrainingJob(
                 data_file=data_file,
@@ -137,15 +141,22 @@ class TrainingManager:
             )
             return self._job
 
-    def stop(self) -> bool:
+    def stop(self, *, timeout: float = 5.0) -> bool:
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 return False
             self._stopped_by_user = True
             try:
-                self._proc.terminate()
-            except Exception:
-                self._proc.kill()
+                stop_process_tree(
+                    self._proc,
+                    timeout=timeout,
+                    telemetry=self._errors,
+                )
+            except ProcessLifecycleError as failure:
+                if self._job is not None:
+                    self._job.error = str(failure)
+                raise
+            self._refresh_state()
             return True
 
     def parse_step_from_log(self) -> int | None:
@@ -168,6 +179,7 @@ class TrainingManager:
             try:
                 content = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
+                self._errors.record("log.read", "training log read failed")
                 return []
             return [strip_ansi(line) for line in content.splitlines()[-lines:]]
 
@@ -198,15 +210,21 @@ class TrainingManager:
                     with path.open("a", encoding="utf-8") as fp:
                         fp.write(f"\n[Web] 训练进程已结束，退出码: {code}\n")
             except OSError:
-                pass
+                self._errors.record("log.append_exit", "training exit log append failed")
         if self._log_fp:
             try:
                 self._log_fp.flush()
+            except Exception as failure:
+                self._errors.record("log.flush", failure)
+            try:
                 self._log_fp.close()
-            except Exception:
-                pass
+            except Exception as failure:
+                self._errors.record("log.close", failure)
             self._log_fp = None
-        self._record_session_time()
+        try:
+            self._record_session_time()
+        except Exception as failure:
+            self._errors.record("session.record", failure)
         self._proc = None
 
     def _record_session_time(self) -> None:

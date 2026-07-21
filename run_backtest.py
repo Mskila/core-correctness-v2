@@ -25,6 +25,7 @@ except ImportError:  # POSIX core backtest path
     msvcrt = None  # type: ignore[assignment]
 
 from backtest_viz import BacktestEngine
+from backtest_viz.output_publication import publish_output_set
 from data_pipeline.parquet_manager import ParquetDataManager
 from model_core.artifacts import (
     BacktestMode,
@@ -1544,7 +1545,8 @@ def run_backtest(
         f"backtest_v2_{selected_mode.value}_{identity.symbol}_"
         f"{test_identity.data_fingerprint[:12]}_{strategy.fingerprint[:12]}"
     )
-    report_path = _publish_output_set(
+    report_path = publish_output_set(
+        _publish_output_set,
         report=report,
         result=result,
         output_dir=output_dir,
