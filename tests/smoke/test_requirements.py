@@ -1,12 +1,9 @@
-"""
-Smoke test: verify requirements.txt contains MetaTrader5 and does NOT
-contain removed Solana / dashboard / async-DB dependencies.
-Requirements: 1.3, 12.1–12.6
-"""
+"""Smoke tests for the cross-platform core and Windows-only adapter extra."""
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REQUIREMENTS_FILE = PROJECT_ROOT / "requirements.txt"
+MT5_REQUIREMENTS_FILE = PROJECT_ROOT / "requirements-mt5.txt"
 
 # Read once at module level so every test shares the same content
 _requirements_text = REQUIREMENTS_FILE.read_text(encoding="utf-8").lower()
@@ -20,11 +17,11 @@ def _pkg_present(name: str) -> bool:
 # ── Required packages ───────────────────────────────────────────────────────
 
 def test_metatrader5_present():
-    """MetaTrader5 must be listed (Requirement 12.6)."""
-    assert _pkg_present("metatrader5"), (
-        "MetaTrader5 is missing from requirements.txt. "
-        "Add 'MetaTrader5>=5.0.45'."
-    )
+    """The Windows adapter must be pinned outside the portable core."""
+    assert not _pkg_present("metatrader5")
+    extra = MT5_REQUIREMENTS_FILE.read_text(encoding="utf-8").lower()
+    assert "metatrader5==" in extra
+    assert "-r requirements.txt" in extra
 
 
 # ── Removed dashboard packages ───────────────────────────────────────────────

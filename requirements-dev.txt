@@ -1,0 +1,9 @@
+-r requirements.txt
+-c constraints-core.txt
+pytest==8.3.5
+pytest-cov==6.0.0
+pytest-timeout==2.3.1
+hypothesis==6.131.9
+PyYAML==6.0.2
+ruff==0.11.0
+mypy==1.15.0

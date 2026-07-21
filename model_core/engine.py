@@ -3613,6 +3613,7 @@ class AlphaEngine:
             shadow_elite_counter = self._elite_counter
             pending_actions: list[tuple] = []
             buffered_factor = snapshot = pos_check = None
+            selection_factor = res = None
 
             try:
                 for i, fml in enumerate(all_fmls):
@@ -3785,7 +3786,7 @@ class AlphaEngine:
                 pending_actions.clear()
                 shadow_factor_pool.clear()
                 shadow_elite_pool.clear()
-                del selection_factor, res
+                selection_factor = res = None
                 del buffered_factor, snapshot, pos_check
                 traceback.clear_frames(failure.__traceback__)
                 raise

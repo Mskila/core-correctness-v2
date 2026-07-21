@@ -1,0 +1,10 @@
+# CORE-07 tested direct-dependency lock for Python 3.10-3.12.
+torch==2.5.1
+numpy==2.1.3
+pandas==2.2.3
+pyarrow==25.0.0
+python-dotenv==1.0.1
+loguru==0.7.3
+tqdm==4.67.1
+fastapi==0.115.8
+uvicorn==0.34.0

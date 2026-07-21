@@ -1,0 +1,4 @@
+# Windows-only MT5 adapter extra. Core training/backtest does not require it.
+-r requirements.txt
+-c constraints-core.txt
+MetaTrader5==5.0.5430
