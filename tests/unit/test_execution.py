@@ -192,7 +192,9 @@ def test_execution_preserves_adjacent_float32_cost_in_promoted_monetary_ledger()
     assert result.turnover[0, 1].item() == 2.9802322387695312e-08
     assert result.cost[0, 1].item() > 0.0
     assert result.net_pnl[0, 1] != result.gross_pnl[0, 1]
-    assert result.net_pnl[0, 1] == result.gross_pnl[0, 1] - result.cost[0, 1]
+    assert torch.expm1(result.net_pnl[0, 1]) == (
+        result.gross_pnl[0, 1] - result.cost[0, 1]
+    )
 
 
 def test_execution_computes_gross_by_multiplying_in_promoted_dtype() -> None:
@@ -213,8 +215,12 @@ def test_execution_computes_gross_by_multiplying_in_promoted_dtype() -> None:
         cost_rate=0.0,
         min_exposure=0.0,
     )
-    expected = result.position.to(torch.float64) * target_ret.to(torch.float64)
-    narrowed_then_promoted = (result.position * target_ret).to(torch.float64)
+    expected = result.position.to(torch.float64) * torch.expm1(
+        target_ret.to(torch.float64)
+    )
+    narrowed_then_promoted = (
+        result.position * torch.expm1(target_ret)
+    ).to(torch.float64)
 
     assert result.gross_pnl.dtype is torch.float64
     assert result.gross_pnl[0, 0] == expected[0, 0]
@@ -254,7 +260,10 @@ def test_execution_publishes_promotable_monetary_fields_coherently(
         result.net_pnl.dtype,
         result.final_liquidation_cost.dtype,
     } == {monetary_dtype}
-    torch.testing.assert_close(result.gross_pnl - result.cost, result.net_pnl)
+    torch.testing.assert_close(
+        result.gross_pnl - result.cost,
+        torch.expm1(result.net_pnl),
+    )
     result.net_pnl.sum().backward()
     assert factors.grad is not None
     assert torch.isfinite(factors.grad).all()
@@ -262,10 +271,10 @@ def test_execution_publishes_promotable_monetary_fields_coherently(
 
 
 def test_execution_still_rejects_genuine_float64_net_absorption() -> None:
-    with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
+    with pytest.raises(DataValidationError, match="simple return.*component.*preserv"):
         run_execution(
             factors=torch.tensor([[1_000.0, 0.0, 0.0]], dtype=torch.float64),
-            target_ret=torch.tensor([[1.0e16, 0.0, 0.0]], dtype=torch.float64),
+            target_ret=torch.tensor([[math.log1p(1.0e16), 0.0, 0.0]], dtype=torch.float64),
             target_valid=torch.tensor([[True, False, False]]),
             bar_time_ns=_hourly_times(3),
             cost_rate=0.25,
@@ -329,17 +338,17 @@ def test_execution_charges_entry_reversal_and_final_liquidation() -> None:
         result.turnover,
         torch.tensor([[0.5, 1.0, 0.0, 0.0]]),
     )
-    torch.testing.assert_close(
-        result.gross_pnl,
-        torch.tensor([[0.05, -0.1, 0.0, 0.0]], dtype=torch.float64),
+    expected_gross = result.position.to(torch.float64) * torch.expm1(
+        returns.to(torch.float64)
     )
+    torch.testing.assert_close(result.gross_pnl, expected_gross)
     torch.testing.assert_close(
         result.cost,
         torch.tensor([[0.05, 0.15, 0.0, 0.0]], dtype=torch.float64),
     )
     torch.testing.assert_close(
         result.net_pnl,
-        torch.tensor([[0.0, -0.25, 0.0, 0.0]], dtype=torch.float64),
+        torch.log1p(expected_gross - result.cost),
     )
     assert result.final_liquidation_cost.item() == pytest.approx(0.05)
 
@@ -484,17 +493,16 @@ def test_execution_rejects_non_prefix_valid_mask() -> None:
         )
 
 
-def test_execution_promotes_finite_float16_monetary_result() -> None:
-    result = run_execution(
-        factors=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float16),
-        target_ret=torch.zeros((1, 3), dtype=torch.float16),
-        target_valid=torch.tensor([[True, False, False]]),
-        bar_time_ns=_hourly_times(3),
-        cost_rate=40_000.0,
-        min_exposure=0.0,
-    )
-    assert result.cost.dtype is torch.float32
-    assert torch.isfinite(result.cost).all()
+def test_execution_rejects_finite_cost_that_causes_insolvency() -> None:
+    with pytest.raises(DataValidationError, match="insolvency"):
+        run_execution(
+            factors=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float16),
+            target_ret=torch.zeros((1, 3), dtype=torch.float16),
+            target_valid=torch.tensor([[True, False, False]]),
+            bar_time_ns=_hourly_times(3),
+            cost_rate=40_000.0,
+            min_exposure=0.0,
+        )
 
 
 def test_execution_preserves_nonzero_float16_cost_in_work_dtype() -> None:
@@ -610,7 +618,7 @@ def test_execution_accepts_float32_cost_rate_below_property_old_floor() -> None:
     ids=["float16", "bfloat16", "float32", "float64"],
 )
 @pytest.mark.parametrize("position_sign", [1.0, -1.0], ids=["long", "short"])
-def test_execution_rejects_absorbed_final_liquidation_component(
+def test_execution_rejects_final_liquidation_case_at_insolvency_boundary(
     dtype: torch.dtype,
     small_position: float,
     position_sign: float,
@@ -628,16 +636,8 @@ def test_execution_rejects_absorbed_final_liquidation_component(
         cost_rate=1.0,
         min_exposure=0.0,
     )
-    if dtype is torch.float64:
-        with pytest.raises(DataValidationError, match="cost component.*preserv"):
-            run_execution(**inputs)
-    else:
-        result = run_execution(**inputs)
-        assert result.cost.dtype is (
-            torch.float32
-            if dtype in {torch.float16, torch.bfloat16}
-            else torch.float64
-        )
+    with pytest.raises(DataValidationError, match="insolvency|preserv"):
+        run_execution(**inputs)
 
 
 def test_execution_promotes_component_at_later_final_index() -> None:
@@ -679,7 +679,7 @@ def test_execution_preserves_cost_in_promoted_net_pnl() -> None:
 
     result = run_execution(
         factors=factors,
-        target_ret=torch.tensor([[1e8, 0.0, 0.0]], dtype=torch.float32),
+        target_ret=torch.tensor([[math.log1p(1e8), 0.0, 0.0]], dtype=torch.float32),
         target_valid=torch.tensor([[True, False, False]]),
         bar_time_ns=_hourly_times(3),
         cost_rate=1e-8,
@@ -716,7 +716,9 @@ def test_execution_rejects_absorbed_net_component_across_domain(
     factors = torch.zeros((1, time_length), dtype=dtype)
     factors[0, final_index] = position_sign * 1_000.0
     target_ret = torch.zeros_like(factors)
-    target_ret[0, final_index] = gross_sign * position_sign
+    target_ret[0, final_index] = math.log1p(
+        gross_sign * position_sign * 0.5
+    )
     target_valid = torch.arange(time_length).unsqueeze(0) <= final_index
 
     inputs = dict(
@@ -728,7 +730,7 @@ def test_execution_rejects_absorbed_net_component_across_domain(
         min_exposure=0.0,
     )
     if dtype is torch.float64:
-        with pytest.raises(DataValidationError, match="net PnL.*component.*preserv"):
+        with pytest.raises(DataValidationError, match="simple return.*component.*preserv"):
             run_execution(**inputs)
     else:
         result = run_execution(**inputs)
@@ -781,8 +783,8 @@ def test_execution_promotes_net_for_each_cost_composition(
 
 def test_execution_allows_exact_gross_cost_cancellation() -> None:
     result = run_execution(
-        factors=torch.atanh(torch.tensor([[0.5, 0.0, 0.0]])),
-        target_ret=torch.tensor([[0.5, 0.0, 0.0]]),
+        factors=torch.atanh(torch.tensor([[0.5, 0.0, 0.0]], dtype=torch.float64)),
+        target_ret=torch.tensor([[math.log1p(0.5), 0.0, 0.0]], dtype=torch.float64),
         target_valid=torch.tensor([[True, False, False]]),
         bar_time_ns=_hourly_times(3),
         cost_rate=0.25,
@@ -794,30 +796,30 @@ def test_execution_allows_exact_gross_cost_cancellation() -> None:
 
 
 @pytest.mark.parametrize(
-    ("target_return", "cost_rate", "expected_net"),
+    ("target_simple_return", "cost_rate", "expected_net_log"),
     [
-        (2.0, 0.1, 0.9),
-        (-2.0, 0.1, -1.1),
-        (2.0, 0.0, 1.0),
-        (0.0, 0.1, -0.1),
+        (2.0, 0.1, math.log1p(0.9)),
+        (-0.8, 0.1, math.log1p(-0.5)),
+        (2.0, 0.0, math.log(2.0)),
+        (0.0, 0.1, math.log(0.9)),
     ],
     ids=["opposite-sign", "same-sign", "zero-cost", "zero-gross"],
 )
 def test_execution_preserves_normal_net_addition_cases(
-    target_return: float,
+    target_simple_return: float,
     cost_rate: float,
-    expected_net: float,
+    expected_net_log: float,
 ) -> None:
     result = run_execution(
         factors=torch.atanh(torch.tensor([[0.5, 0.0, 0.0]])),
-        target_ret=torch.tensor([[target_return, 0.0, 0.0]]),
+        target_ret=torch.tensor([[math.log1p(target_simple_return), 0.0, 0.0]]),
         target_valid=torch.tensor([[True, False, False]]),
         bar_time_ns=_hourly_times(3),
         cost_rate=cost_rate,
         min_exposure=0.0,
     )
 
-    assert result.net_pnl[0, 0].item() == pytest.approx(expected_net)
+    assert result.net_pnl[0, 0].item() == pytest.approx(expected_net_log)
 
 
 @pytest.mark.parametrize("cost_ulps", [4.0, 5.0], ids=["four-ulp", "five-ulp"])
@@ -834,7 +836,7 @@ def test_execution_accepts_representable_net_cost_ulps(cost_ulps: float) -> None
     )
 
     assert result.net_pnl[0, 0] != result.gross_pnl[0, 0]
-    assert result.gross_pnl[0, 0] - result.net_pnl[0, 0] == pytest.approx(
+    assert result.gross_pnl[0, 0] - torch.expm1(result.net_pnl[0, 0]) == pytest.approx(
         float(one_ulp * cost_ulps)
     )
 
@@ -1309,7 +1311,7 @@ def test_mixed_cadence_is_a_metrics_boundary_not_a_ledger_boundary() -> None:
     assert [row.symbol for row in ledger] == ["H1", "H1", "H4", "H4"]
     with pytest.raises(DataValidationError, match="cadence"):
         derive_periods_per_year(result.bar_time_ns, result.target_valid)
-    with pytest.raises(DataValidationError, match="cadence"):
+    with pytest.raises(DataValidationError, match="cadence|synchronized"):
         performance_metrics(result)
 
 
@@ -1379,8 +1381,8 @@ def test_performance_metrics_is_invariant_to_symbol_row_permutation() -> None:
     )
     net_pnl = torch.tensor(
         [
-            [-0.10, 0.12, 0.0, 0.0],
-            [0.10, -0.08, 0.0, 0.0],
+            [-0.20, 0.20, 0.0, 0.0],
+            [0.10, -0.10, 0.0, 0.0],
         ],
         dtype=torch.float64,
     )
@@ -1388,7 +1390,7 @@ def test_performance_metrics_is_invariant_to_symbol_row_permutation() -> None:
     result = ExecutionResult(
         position=zeros,
         turnover=zeros,
-        gross_pnl=net_pnl,
+        gross_pnl=torch.expm1(net_pnl),
         cost=zeros,
         net_pnl=net_pnl,
         target_valid=valid,
@@ -1461,18 +1463,15 @@ def test_performance_metrics_includes_initial_equity_in_drawdown(
 
 
 def test_performance_metrics_rejects_non_finite_derived_values() -> None:
-    result = run_execution(
-        factors=torch.atanh(torch.tensor([[0.5, 0.5, 0.0, 0.0]])),
-        target_ret=torch.tensor([[1000.0, 1000.0, 0.0, 0.0]]),
-        target_valid=torch.tensor([[True, True, False, False]]),
-        bar_time_ns=_hourly_times(4),
-        cost_rate=0.0,
-        min_exposure=0.05,
-    )
-    assert bool(torch.isfinite(result.net_pnl).all())
-
-    with pytest.raises(DataValidationError, match="finite performance metrics"):
-        performance_metrics(result)
+    with pytest.raises(DataValidationError, match="simple return.*finite"):
+        run_execution(
+            factors=torch.atanh(torch.tensor([[0.5, 0.5, 0.0, 0.0]])),
+            target_ret=torch.tensor([[1000.0, 1000.0, 0.0, 0.0]]),
+            target_valid=torch.tensor([[True, True, False, False]]),
+            bar_time_ns=_hourly_times(4),
+            cost_rate=0.0,
+            min_exposure=0.05,
+        )
 
 
 def _metric_result(
@@ -1613,7 +1612,7 @@ def test_execution_ledger_has_fixed_fields_and_copies_shared_result() -> None:
         entry_time_ns=3_600_000_000_000,
         exit_time_ns=7_200_000_000_000,
         position=pytest.approx(0.5),
-        gross_pnl=pytest.approx(0.05),
+        gross_pnl=pytest.approx(result.gross_pnl[0, 0].item()),
         cost=pytest.approx(0.05),
         net_pnl=pytest.approx(result.net_pnl[0, 0].item()),
         is_final_liquidation=False,
@@ -1622,9 +1621,9 @@ def test_execution_ledger_has_fixed_fields_and_copies_shared_result() -> None:
     assert ledger[1].entry_time_ns == 7_200_000_000_000
     assert ledger[1].exit_time_ns == 10_800_000_000_000
     assert ledger[1].position == pytest.approx(-0.5)
-    assert ledger[1].gross_pnl == pytest.approx(-0.1)
+    assert ledger[1].gross_pnl == pytest.approx(result.gross_pnl[0, 1].item())
     assert ledger[1].cost == pytest.approx(0.15)
-    assert ledger[1].net_pnl == pytest.approx(-0.25)
+    assert ledger[1].net_pnl == pytest.approx(result.net_pnl[0, 1].item())
     assert ledger[1].is_final_liquidation is True
     assert sum(row.net_pnl for row in ledger) == pytest.approx(
         result.net_pnl.sum().item(),
@@ -1681,7 +1680,7 @@ def test_execution_ledger_rejects_inconsistent_pnl_fields(
 ) -> None:
     result = _consumer_result()
     inconsistent_value = getattr(result, field_name).clone()
-    inconsistent_value[0, 0] += 1.0
+    inconsistent_value[0, 0] += 0.1
     result = replace(result, **{field_name: inconsistent_value})
 
     with pytest.raises(
@@ -1763,8 +1762,14 @@ def test_execution_ledger_uses_consistent_four_ulp_boundary(
         gross_pnl = torch.zeros((1, 5), dtype=dtype)
         gross_pnl[0, :2] = reference
         cost = torch.zeros_like(gross_pnl)
-        accepted_net = gross_pnl.clone()
-        accepted_net[0, :2] = four_ulp
+        expected_net = torch.log1p(gross_pnl)
+        accepted_net = expected_net.clone()
+        accepted_net[0, :2] = expected_net[0, :2]
+        for _ in range(4):
+            accepted_net[0, :2] = torch.nextafter(
+                accepted_net[0, :2],
+                torch.full_like(accepted_net[0, :2], float("inf")),
+            )
         accepted = replace(
             _consumer_result(),
             position=torch.zeros_like(gross_pnl),
@@ -1776,7 +1781,10 @@ def test_execution_ledger_uses_consistent_four_ulp_boundary(
         assert len(build_execution_ledger(accepted, ["EURUSD"])) == 2
 
         rejected_net = accepted_net.clone()
-        rejected_net[0, :2] = five_ulp
+        rejected_net[0, :2] = torch.nextafter(
+            accepted_net[0, :2],
+            torch.full_like(accepted_net[0, :2], float("inf")),
+        )
         rejected = replace(accepted, net_pnl=rejected_net)
         with pytest.raises(
             DataValidationError,
@@ -1787,14 +1795,14 @@ def test_execution_ledger_uses_consistent_four_ulp_boundary(
 
 def test_execution_ledger_uses_net_ulp_for_cancellation_tolerance() -> None:
     gross_pnl = torch.tensor(
-        [[100_000_008.0, 100_000_000.0, 0.0, 0.0, 0.0]],
+        [[1.5, 0.5, 0.0, 0.0, 0.0]],
         dtype=torch.float32,
     )
     cost = torch.tensor(
-        [[100_000_000.0, 100_000_008.0, 0.0, 0.0, 0.0]],
+        [[1.0, 1.0, 0.0, 0.0, 0.0]],
         dtype=torch.float32,
     )
-    expected_net = gross_pnl - cost
+    expected_net = torch.log1p(gross_pnl - cost)
     one_ulp_net = expected_net.clone()
     one_ulp_net[0, :2] = torch.nextafter(
         expected_net[0, :2],
@@ -1810,7 +1818,7 @@ def test_execution_ledger_uses_net_ulp_for_cancellation_tolerance() -> None:
     assert len(build_execution_ledger(near_result, ["EURUSD"])) == 2
 
     invalid_net = expected_net.clone()
-    invalid_net[0, :2] = torch.tensor([8.5, -8.5])
+    invalid_net[0, :2] += torch.tensor([0.1, -0.1])
     invalid_result = replace(near_result, net_pnl=invalid_net)
     with pytest.raises(
         DataValidationError,
@@ -1935,23 +1943,15 @@ def test_execution_ledger_reconciles_multisymbol_reduction_in_any_order(
         ]
 
 
-def test_execution_ledger_fails_closed_when_shared_reduction_cannot_reconcile(
-) -> None:
-    result = _cancelling_execution_result(
-        torch.tensor(
-            [[1e16, -1.0, -1e-6, -1e16, 0.0, 0.0]],
-            dtype=torch.float64,
-        ),
-        torch.tensor([[True, True, True, True, False, False]]),
-    )
-    row_total = sum(result.net_pnl[0, :4].tolist())
-    shared_tensor_total = (
-        result.net_pnl[result.target_valid].to(torch.float64).sum().item()
-    )
-    assert abs(row_total - shared_tensor_total) > 1e-8
-
-    with pytest.raises(DataValidationError, match="ledger.*aggregate"):
-        build_execution_ledger(result, ["EURUSD"])
+def test_execution_rejects_log_return_whose_simple_return_overflows() -> None:
+    with pytest.raises(DataValidationError, match="simple return.*finite"):
+        _cancelling_execution_result(
+            torch.tensor(
+                [[1e16, -1.0, -1e-6, -1e16, 0.0, 0.0]],
+                dtype=torch.float64,
+            ),
+            torch.tensor([[True, True, True, True, False, False]]),
+        )
 
 
 @pytest.mark.parametrize(
@@ -2201,7 +2201,7 @@ def test_performance_metrics_rejects_unrepresentable_equity_path() -> None:
         ),
     )
 
-    with pytest.raises(DataValidationError, match="representable equity"):
+    with pytest.raises(DataValidationError, match="representable equity|insolvency"):
         performance_metrics(result)
 
 
@@ -2303,7 +2303,7 @@ def test_multi_symbol_prefixes_reconcile_ledger_and_metrics() -> None:
         result.net_pnl[target_valid].sum().item(),
         abs=1e-8,
     )
-    assert metrics.observations == 5
+    assert metrics.observations == 3
 
 
 def _ledger_scale_result(valid_count: int) -> ExecutionResult:
@@ -2405,7 +2405,7 @@ def test_performance_metrics_snapshots_fields_once_and_scales_linearly() -> None
         with clone_stats:
             metrics = performance_metrics(result)
 
-        assert metrics.observations == 2 * symbol_count
+        assert metrics.observations == 2
         stats.append((symbol_count, clone_stats.calls, clone_stats.elements))
 
     assert stats[0][1] <= 4, stats
@@ -2421,11 +2421,11 @@ def test_performance_metrics_local_scalar_syncs_are_constant_per_call() -> None:
         with stats:
             metrics = performance_metrics(_performance_scale_result(symbol_count))
 
-        assert metrics.observations == 2 * symbol_count
+        assert metrics.observations == 2
         local_scalar_counts.append(stats.local_scalar_calls)
 
     assert len(set(local_scalar_counts)) == 1, local_scalar_counts
-    assert local_scalar_counts[0] <= 32, local_scalar_counts
+    assert local_scalar_counts[0] <= 36, local_scalar_counts
 
 
 def test_execution_ledger_inner_loop_uses_bulk_materialized_values() -> None:
@@ -2436,21 +2436,7 @@ def test_execution_ledger_inner_loop_uses_bulk_materialized_values() -> None:
     assert ".cpu()" not in inner_loop
 
 
-def test_performance_metrics_symbol_loop_reuses_snapshots() -> None:
+def test_performance_metrics_uses_explicit_time_portfolio_not_flat_pooling() -> None:
     source = inspect.getsource(performance_metrics)
-    syntax_tree = ast.parse(source)
-    symbol_loop_node = next(
-        node
-        for node in ast.walk(syntax_tree)
-        if isinstance(node, ast.For)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "symbol_index"
-    )
-    symbol_loop = ast.get_source_segment(source, symbol_loop_node)
-    assert symbol_loop is not None
-
-    assert "result." not in symbol_loop
-    assert "bool(" not in symbol_loop
-    assert ".item(" not in symbol_loop
-    assert ".cpu(" not in symbol_loop
-    assert "_local_scalar_dense" not in symbol_loop
+    assert "_equal_weight_portfolio_log_returns" in source
+    assert "[target_valid]" not in source

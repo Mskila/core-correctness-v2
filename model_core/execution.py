@@ -75,6 +75,24 @@ class LedgerEntry:
     is_final_liquidation: bool
 
 
+@dataclass(frozen=True)
+class ReturnAccounting:
+    asset_simple_return: Tensor
+    gross_simple_return: Tensor
+    portfolio_simple_return: Tensor
+    net_log_return: Tensor
+
+
+@dataclass(frozen=True)
+class PositionEventCounts:
+    turnover_events: int
+    entries: int
+    exits: int
+    reversals: int
+    liquidation_events: int
+    display_trades: int
+
+
 _SECONDS_PER_YEAR = 365.2425 * 24 * 3_600
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _MIN_LOG_FLOAT64 = math.log(math.ulp(0.0))
@@ -158,6 +176,101 @@ def factor_to_position(factors: Tensor, *, min_exposure: float) -> Tensor:
         raw_position.abs() < min_exposure,
         torch.zeros_like(raw_position),
         raw_position,
+    )
+
+
+def net_log_return_from_position(
+    position: Tensor,
+    target_log_return: Tensor,
+    cost: Tensor,
+) -> ReturnAccounting:
+    """Account for one position path in simple-return equity units."""
+    if (
+        position.shape != target_log_return.shape
+        or position.shape != cost.shape
+        or position.device != target_log_return.device
+        or position.device != cost.device
+    ):
+        raise DataValidationError(
+            "position, target_log_return, and cost must share shape and device"
+        )
+    for name, value in (
+        ("position", position),
+        ("target_log_return", target_log_return),
+        ("cost", cost),
+    ):
+        _validate_supported_float_tensor(value, name=name)
+        if not bool(torch.isfinite(value).all()):
+            raise DataValidationError(f"{name} must contain only finite values")
+    if bool((cost < 0).any()):
+        raise DataValidationError("cost must be a non-negative equity fraction")
+
+    work_dtype = _cost_work_dtype(position.dtype)
+    work_position = position.to(work_dtype)
+    asset_simple = torch.expm1(target_log_return.to(work_dtype))
+    if not bool(torch.isfinite(asset_simple).all()):
+        raise DataValidationError(
+            "net PnL additive component preservation failed because the "
+            "asset simple return is non-finite"
+        )
+    gross_simple = work_position * asset_simple
+    negative_cost = -cost.to(work_dtype)
+    portfolio_simple = gross_simple + negative_cost
+    _validate_additive_component_preservation(
+        gross_simple,
+        negative_cost,
+        portfolio_simple,
+        context="portfolio simple return",
+    )
+    if bool((portfolio_simple <= -1.0).any()):
+        raise DataValidationError(
+            "portfolio simple return reached the insolvency boundary"
+        )
+    net_log = torch.log1p(portfolio_simple)
+    if bool(((portfolio_simple != 0.0) & (net_log == 0.0)).any()):
+        raise DataValidationError(
+            "non-zero portfolio simple return underflowed in log1p"
+        )
+    if not all(
+        bool(torch.isfinite(value).all())
+        for value in (gross_simple, portfolio_simple, net_log)
+    ):
+        raise DataValidationError("execution return accounting must remain finite")
+    return ReturnAccounting(
+        asset_simple_return=asset_simple,
+        gross_simple_return=gross_simple,
+        portfolio_simple_return=portfolio_simple,
+        net_log_return=net_log,
+    )
+
+
+def classify_position_events(position: Tensor) -> PositionEventCounts:
+    """Count economic position changes separately from display trades."""
+    if position.ndim != 1 or position.numel() == 0 or not position.is_floating_point():
+        raise DataValidationError("position event input must be one floating vector")
+    if not bool(torch.isfinite(position).all()):
+        raise DataValidationError("position event input must be finite")
+    previous = torch.cat([torch.zeros_like(position[:1]), position[:-1]])
+    changed = position != previous
+    previous_sign = torch.sign(previous)
+    current_sign = torch.sign(position)
+    entries = int(((previous_sign == 0) & (current_sign != 0)).sum().item())
+    exits = int(((previous_sign != 0) & (current_sign == 0)).sum().item())
+    reversals = int(
+        (
+            (previous_sign != 0)
+            & (current_sign != 0)
+            & (previous_sign != current_sign)
+        ).sum().item()
+    )
+    liquidation_events = int(current_sign[-1].item() != 0)
+    return PositionEventCounts(
+        turnover_events=int(changed.sum().item()),
+        entries=entries,
+        exits=exits + liquidation_events,
+        reversals=reversals,
+        liquidation_events=liquidation_events,
+        display_trades=entries + reversals,
     )
 
 
@@ -284,27 +397,25 @@ def run_execution(
     )
     final_liquidation_cost = final_liquidation_cost_work
     cost = cost_work
-    valid_target_ret = torch.where(
+    valid_target_log_return = torch.where(
         target_valid,
         target_ret.to(cost_work_dtype),
         torch.zeros_like(position_for_cost),
     )
+    accounting = net_log_return_from_position(
+        position,
+        valid_target_log_return,
+        cost,
+    )
     gross_pnl = torch.where(
         target_valid,
-        position_for_cost * valid_target_ret,
+        accounting.gross_simple_return,
         torch.zeros_like(position_for_cost),
     )
-    negative_cost_work = -cost
     net_pnl = torch.where(
         target_valid,
-        gross_pnl + negative_cost_work,
+        accounting.net_log_return,
         torch.zeros_like(gross_pnl),
-    )
-    _validate_additive_component_preservation(
-        gross_pnl,
-        negative_cost_work,
-        net_pnl,
-        context="net PnL cost",
     )
     floating_fields = (
         position,
@@ -533,7 +644,12 @@ def _validate_ledger_result(
     valid_gross = read_fields["gross_pnl"][target_valid]
     valid_cost = read_fields["cost"][target_valid]
     valid_net = read_fields["net_pnl"][target_valid]
-    expected_net = valid_gross - valid_cost
+    portfolio_simple = valid_gross - valid_cost
+    if bool((portfolio_simple <= -1.0).any()):
+        raise DataValidationError(
+            "ledger portfolio simple return reached the insolvency boundary"
+        )
+    expected_net = torch.log1p(portfolio_simple)
     lower_bound = expected_net
     upper_bound = expected_net
     negative_infinity = torch.full_like(expected_net, -float("inf"))
@@ -548,21 +664,15 @@ def _validate_ledger_result(
     )
     if not bool(consistent.all()):
         raise DataValidationError(
-            "valid net_pnl must equal gross_pnl - cost within dtype tolerance"
+            "valid net_pnl must equal log1p(gross_pnl - cost) within dtype tolerance"
         )
     return valid_counts
 
 
-def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
-    """Compute timestamp-derived metrics from valid shared net log returns.
-
-    Total, annualized, mean, standard-deviation, and downside statistics pool
-    every symbol's valid returns.  Equity paths and drawdowns instead use each
-    symbol's valid prefix independently, with the worst per-symbol drawdown
-    used by aggregate-annualized-return Calmar.  This avoids cross-symbol path
-    concatenation, is invariant to symbol row order, and preserves one-symbol
-    behavior.
-    """
+def _equal_weight_portfolio_log_returns(
+    result: ExecutionResult,
+) -> tuple[Tensor, float, float]:
+    """Aggregate simultaneous symbols by time with explicit equal weights."""
     net_pnl_by_symbol = result.net_pnl
     target_valid = result.target_valid
     bar_time_ns = result.bar_time_ns
@@ -571,16 +681,56 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
         target_valid=target_valid,
         bar_time_ns=bar_time_ns,
     )
-    net_pnl = net_pnl_by_symbol[target_valid]
-    if not bool(torch.isfinite(net_pnl).all()):
+    if not bool(torch.isfinite(net_pnl_by_symbol[target_valid]).all()):
         raise DataValidationError("valid net_pnl values must be finite")
-    net_pnl = net_pnl.to(torch.float64)
-    periods_per_year = derive_periods_per_year(
-        bar_time_ns,
-        target_valid,
+    valid_counts = target_valid.sum(dim=1)
+    max_count = int(valid_counts.max().detach().cpu())
+    first_entries = bar_time_ns[:, 1]
+    if not bool((first_entries == first_entries[0]).all()):
+        raise DataValidationError(
+            "multi-symbol portfolio requires one synchronized entry timeline"
+        )
+
+    portfolio_returns: list[Tensor] = []
+    exit_times: list[int] = []
+    for time_index in range(max_count):
+        active = valid_counts > time_index
+        active_exit_times = bar_time_ns[active, time_index + 2]
+        if not bool((active_exit_times == active_exit_times[0]).all()):
+            raise DataValidationError(
+                "multi-symbol portfolio requires synchronized exit timestamps"
+            )
+        symbol_simple_returns = torch.expm1(
+            net_pnl_by_symbol[active, time_index].to(torch.float64)
+        )
+        portfolio_simple_return = symbol_simple_returns.mean()
+        if bool(portfolio_simple_return <= -1.0):
+            raise DataValidationError(
+                "equal-weight portfolio reached the insolvency boundary"
+            )
+        portfolio_returns.append(torch.log1p(portfolio_simple_return))
+        exit_times.append(int(active_exit_times[0].detach().cpu()))
+    if any(current <= previous for previous, current in zip(exit_times, exit_times[1:])):
+        raise DataValidationError("portfolio exit timestamps must be strictly increasing")
+
+    net_pnl = torch.stack(portfolio_returns)
+    first_entry_ns = int(first_entries[0].detach().cpu())
+    elapsed_seconds = (
+        exit_times[-1] - first_entry_ns
+    ) / _NANOSECONDS_PER_SECOND
+    elapsed_years = elapsed_seconds / _SECONDS_PER_YEAR
+    periods_per_year = len(portfolio_returns) / elapsed_years
+    if not math.isfinite(periods_per_year) or periods_per_year <= 0.0:
+        raise DataValidationError("portfolio periods_per_year must be finite and positive")
+    return net_pnl, elapsed_years, periods_per_year
+
+
+def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
+    """Compute metrics from one timestamp-aligned equal-weight portfolio path."""
+    net_pnl, elapsed_years, periods_per_year = (
+        _equal_weight_portfolio_log_returns(result)
     )
     observations = net_pnl.numel()
-    elapsed_years = observations / periods_per_year
 
     total_log_return = net_pnl.sum()
     annualized_log_return = total_log_return / elapsed_years
@@ -598,33 +748,23 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
             "unrepresentable equity path"
         )
 
-    symbol_max_drawdowns: list[Tensor] = []
-    symbol_validation_flags: list[Tensor] = []
-    for symbol_index in range(net_pnl_by_symbol.shape[0]):
-        symbol_net_pnl = net_pnl_by_symbol[
-            symbol_index,
-            target_valid[symbol_index],
-        ].to(torch.float64)
-        cumulative_log_return = torch.cumsum(symbol_net_pnl, dim=0)
-        cumulative_invalid = ~torch.isfinite(cumulative_log_return).all()
-        log_equity = torch.cat(
-            [torch.zeros_like(cumulative_log_return[:1]), cumulative_log_return],
-            dim=0,
-        )
-        equity_path_invalid = (
-            (log_equity < _MIN_LOG_FLOAT64)
-            | (log_equity > _MAX_LOG_FLOAT64)
-        ).any()
-        running_peak_log = torch.cummax(log_equity, dim=0).values
-        drawdown_log = log_equity - running_peak_log
-        drawdown_invalid = (drawdown_log < _MIN_LOG_FLOAT64).any()
-        symbol_validation_flags.append(
-            torch.stack(
-                [cumulative_invalid, equity_path_invalid, drawdown_invalid]
-            )
-        )
-        symbol_max_drawdowns.append((-torch.expm1(drawdown_log)).max())
-    validation_flags = torch.stack(symbol_validation_flags).reshape(-1)
+    cumulative_log_return = torch.cumsum(net_pnl, dim=0)
+    log_equity = torch.cat(
+        [torch.zeros_like(cumulative_log_return[:1]), cumulative_log_return],
+        dim=0,
+    )
+    running_peak_log = torch.cummax(log_equity, dim=0).values
+    drawdown_log = log_equity - running_peak_log
+    validation_flags = torch.stack(
+        [
+            ~torch.isfinite(cumulative_log_return).all(),
+            (
+                (log_equity < _MIN_LOG_FLOAT64)
+                | (log_equity > _MAX_LOG_FLOAT64)
+            ).any(),
+            (drawdown_log < _MIN_LOG_FLOAT64).any(),
+        ]
+    )
     invalid_indices = torch.nonzero(validation_flags, as_tuple=False)
     if invalid_indices.numel() != 0:
         error_kind = int(invalid_indices[0, 0].detach().cpu()) % 3
@@ -636,7 +776,7 @@ def performance_metrics(result: ExecutionResult) -> PerformanceMetrics:
             "unrepresentable equity drawdown",
         )
         raise DataValidationError(error_messages[error_kind])
-    max_drawdown_tensor = torch.stack(symbol_max_drawdowns).max()
+    max_drawdown_tensor = (-torch.expm1(drawdown_log)).max()
 
     total_return_tensor = torch.expm1(total_log_return)
     annualized_return_tensor = torch.expm1(annualized_log_return)

@@ -113,7 +113,7 @@ def _assert_final_liquidation(report: dict[str, object]) -> None:
         expected_cost, rel=0.0, abs=1e-12
     )
     assert float(final["net_pnl"]) == pytest.approx(
-        float(final["gross_pnl"]) - float(final["cost"]),
+        math.log1p(float(final["gross_pnl"]) - float(final["cost"])),
         rel=0.0,
         abs=1e-12,
     )
@@ -149,6 +149,7 @@ def _assert_ledger_matches_inputs(
         "slippage_pct": _SLIPPAGE_PCT,
         "cost_rate": _COST_RATE,
         "total_cost_rate": _COST_RATE,
+        "unit": "equity_fraction_simple_return",
     }
     assert target_valid.shape == factors.shape == positions.shape
     assert raw["time"].shape == factors.shape
@@ -164,9 +165,10 @@ def _assert_ledger_matches_inputs(
         turnover = float(turnovers[0, index].item())
         is_final = index == valid_count - 1
         liquidation = abs(position) if is_final else 0.0
-        gross_pnl = position * float(target_ret[0, index].item())
+        asset_simple_return = math.expm1(float(target_ret[0, index].item()))
+        gross_pnl = position * asset_simple_return
         cost = (turnover + liquidation) * _COST_RATE
-        net_pnl = gross_pnl - cost
+        net_pnl = math.log1p(gross_pnl - cost)
 
         assert row["symbol"] == symbol
         assert row["signal_time_ns"] == int(times[index].item())
