@@ -6,7 +6,7 @@
 
 ![Web 控制台总览](docs/images/00_hero.png)
 
-仓库地址：[github.com/rosemarycox5334-debug/AlphaMaster](https://github.com/rosemarycox5334-debug/AlphaMaster)
+仓库地址：[github.com/Mskila/core-correctness-v2](https://github.com/Mskila/core-correctness-v2)
 
 ---
 
@@ -86,6 +86,7 @@ AlphaMaster/
 ├── execution/           # MT5 下单接口
 ├── backtest_viz/        # 回测引擎与图表
 ├── strategies/          # 不可变、带身份的 best_v2_* 策略文件
+├── extras/              # 非核心实验脚本与历史记录（不属于 V2 正式入口）
 ├── checkpoints/         # 训练检查点
 ├── run_web.py           # 启动 Web 控制台
 ├── train_file.py        # CLI：从单个 Parquet 训练
@@ -121,6 +122,10 @@ python train_file.py --data-file D:\K线数据\BTCUSDT_H1.parquet --from-scratch
 
 策略输出为 `strategies/best_v2_<symbol>_<timeframe>_<identity>.json` 形式的不可变 V2 文件。
 
+正式入口只有本节和 V2 使用指南列出的命令。根目录不再放置旧 group、V1
+回测或临时 checkpoint 分析入口；这些历史快照保留在 `extras/`，不参与 V2
+训练、回测、发布门禁或依赖安装。
+
 ---
 
 ## 信号口径（训练 / 回测 / 实时一致）
@@ -153,4 +158,4 @@ python scripts/capture_readme_shots.py
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=rosemarycox5334-debug/AlphaMaster&type=date&legend=top-left)](https://www.star-history.com/#rosemarycox5334-debug/AlphaMaster&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=Mskila/core-correctness-v2&type=date&legend=top-left)](https://www.star-history.com/#Mskila/core-correctness-v2&type=date&legend=top-left)

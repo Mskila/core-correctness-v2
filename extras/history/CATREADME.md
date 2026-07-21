@@ -1,3 +1,8 @@
+# 历史仓库速读（V1，非当前能力说明）
+
+> 本文已归档。下述 group 策略、`best_*.json`、固定实盘流程和自动下单描述仅用于
+> 追溯旧版本；Core Correctness V2 会拒绝这些无身份产物，且正式入口不依赖本文。
+
 AlphaGPT MT5 仓库速读
 
 **开源协议**：GNU Affero General Public License v3.0 (AGPL-3.0)。修改、分发或通过网络提供服务时，须按相同协议公开源代码。详见根目录 `LICENSE`。
