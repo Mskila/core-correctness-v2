@@ -16,6 +16,7 @@ import torch
 
 from model_core.artifacts import StrategyArtifact, TrainingRunIdentity
 from model_core.config import ModelConfig
+from model_core.semantics import CHECKPOINT_SCHEMA_VERSION
 from model_core.vocab import FORMULA_VOCAB
 from web.progress import SymbolProgress, _safe_symbol_tag, _validate_history
 
@@ -34,7 +35,7 @@ def invalidate_checkpoint_cache() -> None:
 def _checkpoint_paths(symbol: str) -> list[Path]:
     return sorted(
         CHECKPOINT_DIR.glob(
-            f"ckpt_v2_{_safe_symbol_tag(symbol)}_*_run_*_step_*.pt"
+            f"ckpt_v3_{_safe_symbol_tag(symbol)}_*_run_*_step_*.pt"
         ),
         key=lambda path: (path.stat().st_mtime_ns, path.name),
     )
@@ -77,7 +78,7 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
     payload = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
     if type(payload) is not dict:
         raise ValueError("checkpoint payload must be an object")
-    if payload.get("checkpoint_schema_version") != "checkpoint-v2":
+    if payload.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError("incompatible checkpoint schema")
 
     run = TrainingRunIdentity.from_dict(payload["run_identity"])
@@ -116,7 +117,7 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
 def _strategy_rows(symbol: str) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    prefix = f"best_v2_{_safe_symbol_tag(symbol)}_"
+    prefix = f"best_v3_{_safe_symbol_tag(symbol)}_"
     for path in STRATEGIES_DIR.glob(f"{prefix}*.json"):
         try:
             artifact = StrategyArtifact.from_dict(

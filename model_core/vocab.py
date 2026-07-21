@@ -32,7 +32,7 @@ from .ops import OPERATOR_REGISTRY
 from .semantics import CORE_SEMANTICS_VERSION
 
 # 人类可读 schema 标签，同时参与稳定 V2 身份哈希。
-VOCAB_SCHEMA_TAG = "5.1-core04-postfix-vm"
+VOCAB_SCHEMA_TAG = "6.0-core06-version-boundary"
 
 
 # ── 版本层异常（R3.7）───────────────────────────────────────────────────

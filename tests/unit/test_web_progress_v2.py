@@ -9,8 +9,8 @@ from model_core.artifacts import StrategyArtifact, TrainingRunIdentity
 from model_core.vocab import FORMULA_VOCAB
 from tests.unit.test_artifacts import (
     artifact_identity_with_config,
+    current_strategy_artifact as strategy_artifact,
     fold_evidence_with_index,
-    strategy_artifact,
     training_config,
 )
 
@@ -46,6 +46,7 @@ def _artifact(
         best_score=1.25,
         fold_evidence=[fold_evidence_with_index(index) for index in range(4)],
         generated_at=generated_at,
+        candidate_evaluation_count=1,
     )
 
 
@@ -76,7 +77,7 @@ def _history_value(artifact, steps, *, stable_rank=None, include_identity=True):
 def _checkpoint(path, artifact, *, step=10, history=None, rank_monitor=None):
     embedded = _history_value(artifact, range(step), include_identity=False) if history is None else history
     torch.save({
-        "checkpoint_schema_version": "checkpoint-v2",
+        "checkpoint_schema_version": "checkpoint-v3",
         "run_identity": artifact.run_identity.to_dict(),
         "step": step,
         "best_score": artifact.best_score,
@@ -148,6 +149,7 @@ def test_checkpoint_cache_reloads_on_subfloat_mtime_ns_change(
         best_score=earlier.best_score,
         fold_evidence=earlier.fold_evidence,
         generated_at=earlier.generated_at,
+        candidate_evaluation_count=1,
     )
     path = checkpoints / earlier.run_identity.checkpoint_filename(7)
     _checkpoint(path, earlier, step=7)
@@ -175,6 +177,7 @@ def test_checkpoint_cache_reloads_changed_bytes_with_identical_mtime_ns(
         best_score=first_artifact.best_score,
         fold_evidence=first_artifact.fold_evidence,
         generated_at=first_artifact.generated_at,
+        candidate_evaluation_count=1,
     )
     path = checkpoints / first_artifact.run_identity.checkpoint_filename(7)
     fixed_ns = 1_700_020_050_000_000_000
@@ -456,7 +459,7 @@ def test_old_identity_without_lord_is_incompatible(monkeypatch, tmp_path) -> Non
     path = checkpoints / artifact.run_identity.checkpoint_filename(2)
     embedded = _history_value(artifact, [0, 1], include_identity=False)
     torch.save({
-        "checkpoint_schema_version": "checkpoint-v2", "run_identity": run,
+        "checkpoint_schema_version": "checkpoint-v3", "run_identity": run,
         "step": 2, "training_history": embedded,
         "rank_monitor_history": embedded["stable_rank"],
     }, path)
@@ -475,7 +478,7 @@ def test_unrelated_symbol_corruption_does_not_contaminate_valid_progress(
     _checkpoint(checkpoints / artifact.run_identity.checkpoint_filename(10), artifact)
     _history(tmp_path / artifact.run_identity.history_filename(), artifact, steps=range(10))
     _strategy(strategies, artifact)
-    unrelated = strategies / "best_v2_GBPUSD_H1_badbadbadbad_run_deadbeef.json"
+    unrelated = strategies / "best_v3_GBPUSD_H1_badbadbadbad_run_deadbeef.json"
     unrelated.write_bytes(b"{malformed")
     before = unrelated.read_bytes()
     result = progress.get_symbol_progress("EURUSD")
@@ -491,7 +494,7 @@ def test_same_symbol_corruption_fails_progress_closed(monkeypatch, tmp_path) -> 
     _checkpoint(checkpoints / artifact.run_identity.checkpoint_filename(10), artifact)
     _history(tmp_path / artifact.run_identity.history_filename(), artifact, steps=range(10))
     _strategy(strategies, artifact)
-    damaged = strategies / "best_v2_EURUSD_H1_badbadbadbad_run_deadbeef.json"
+    damaged = strategies / "best_v3_EURUSD_H1_badbadbadbad_run_deadbeef.json"
     damaged.write_bytes(b"{malformed")
     result = progress.get_symbol_progress("EURUSD")
     assert result.status == "incompatible"

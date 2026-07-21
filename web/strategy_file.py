@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from model_core.artifacts import StrategyArtifact
+from model_core.semantics import STRATEGY_SCHEMA_VERSION
 from data_pipeline.validation import normalize_timeframe_name
 from web.progress import STRATEGIES_DIR, generated_at_utc
 
@@ -16,7 +17,13 @@ def _load(path: Path) -> StrategyArtifact:
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"无法解析 V2 strategy artifact: {exc}") from exc
     try:
-        return StrategyArtifact.from_dict(value)
+        artifact = StrategyArtifact.from_dict(value)
+        if artifact.schema_version != STRATEGY_SCHEMA_VERSION:
+            raise ValueError(
+                "pre-core-fix/incompatible strategy artifact: "
+                f"expected={STRATEGY_SCHEMA_VERSION!r} actual={artifact.schema_version!r}"
+            )
+        return artifact
     except Exception as exc:
         raise ValueError(f"不兼容的 V2 strategy artifact: {exc}") from exc
 
@@ -73,7 +80,7 @@ def strategy_path_for_symbol(
             raise ValueError("strategy row identity mismatch")
         return path
     candidates = [
-        path for path in STRATEGIES_DIR.glob("best_v2_*.json")
+        path for path in STRATEGIES_DIR.glob("best_v3_*.json")
         if _candidate(path, symbol, expected_timeframe)
     ]
     if not candidates:
@@ -100,7 +107,7 @@ def _sort_key(path: Path) -> tuple[object, str]:
 
 def sync_best_strategy_for_symbol(symbol: str) -> dict[str, Any] | None:
     """Return the deterministic latest valid immutable V2 artifact; never write."""
-    candidates = [p for p in STRATEGIES_DIR.glob("best_v2_*.json") if _candidate(p, symbol)]
+    candidates = [p for p in STRATEGIES_DIR.glob("best_v3_*.json") if _candidate(p, symbol)]
     if not candidates:
         return None
     return inspect_strategy_file(str(max(candidates, key=_sort_key)))

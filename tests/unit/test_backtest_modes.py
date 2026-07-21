@@ -414,6 +414,7 @@ def strategy() -> StrategyArtifact:
             for index in range(4)
         ],
         generated_at="2026-07-15T00:00:00Z",
+        candidate_evaluation_count=1,
     )
 
 

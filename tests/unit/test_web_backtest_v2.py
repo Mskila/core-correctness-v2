@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 import web.app as web_app
 import web.backtest_manager as manager_module
-from tests.unit.test_artifacts import strategy_artifact
+from tests.unit.test_artifacts import current_strategy_artifact as strategy_artifact
 
 
 def test_request_requires_explicit_data_and_exact_mode() -> None:

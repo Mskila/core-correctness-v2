@@ -16,6 +16,7 @@ import torch
 
 from model_core.artifacts import StrategyArtifact, TrainingRunIdentity
 from model_core.config import ModelConfig
+from model_core.semantics import CHECKPOINT_SCHEMA_VERSION, STRATEGY_SCHEMA_VERSION
 from web.progress import (
     CHECKPOINT_DIR,
     PROJECT_ROOT,
@@ -41,7 +42,7 @@ def _checkpoint_identity(
     payload = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
     if type(payload) is not dict:
         raise ValueError("V2 checkpoint payload must be an object")
-    if payload.get("checkpoint_schema_version") != "checkpoint-v2":
+    if payload.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError("incompatible V2 checkpoint schema")
     run = TrainingRunIdentity.from_dict(payload["run_identity"])
     step = payload["step"]
@@ -60,6 +61,11 @@ def _checkpoint_identity(
 
 def _strategy_identity(data: bytes) -> tuple[StrategyArtifact, TrainingRunIdentity]:
     artifact = StrategyArtifact.from_dict(json.loads(data.decode("utf-8")))
+    if artifact.schema_version != STRATEGY_SCHEMA_VERSION:
+        raise ValueError(
+            "pre-core-fix/incompatible strategy artifact: "
+            f"expected={STRATEGY_SCHEMA_VERSION!r} actual={artifact.schema_version!r}"
+        )
     return artifact, artifact.run_identity
 
 
@@ -123,7 +129,7 @@ def build_training_export_zip(symbol: str) -> tuple[bytes, str]:
     step = checkpoint_payload["step"]
 
     strategies: list[tuple[Path, StrategyArtifact, bytes]] = []
-    for path in STRATEGIES_DIR.glob("best_v2_*.json"):
+    for path in STRATEGIES_DIR.glob("best_v3_*.json"):
         try:
             raw = path.read_bytes()
             artifact, strategy_run = _strategy_identity(raw)
@@ -165,7 +171,7 @@ def build_training_export_zip(symbol: str) -> tuple[bytes, str]:
         for name, data in files.items():
             zf.writestr(name, data)
         zf.writestr("manifest.json", json.dumps(manifest, sort_keys=True))
-    return buf.getvalue(), f"training_v2_{symbol}_run_{run.run_id[:8]}_step_{step}.zip"
+    return buf.getvalue(), f"training_v3_{symbol}_run_{run.run_id[:8]}_step_{step}.zip"
 
 
 @dataclass(frozen=True)
@@ -354,7 +360,7 @@ def import_training_package(content: bytes, filename: str, expected_symbol: str 
             raise ValueError(f"V2 package hash mismatch: {name}")
     ckpt_name = next((n for n in extracted if n.startswith("checkpoints/")), None)
     strategy_name = next((n for n in extracted if n.startswith("strategies/")), None)
-    history_name = next((n for n in extracted if n.startswith("training_history_v2_")), None)
+    history_name = next((n for n in extracted if n.startswith("training_history_v3_")), None)
     if not ckpt_name or not strategy_name or not history_name:
         raise ValueError("V2 package filenames are incomplete or noncanonical")
     run, step, checkpoint_payload = _checkpoint_identity(extracted[ckpt_name])

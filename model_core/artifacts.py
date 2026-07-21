@@ -17,12 +17,15 @@ import uuid
 from data_pipeline.validation import DatasetIdentity, normalize_timeframe_name
 
 from .semantics import (
+    CHECKPOINT_SCHEMA_VERSION,
     CORE_SEMANTICS_VERSION,
     DATA_CANONICALIZATION_VERSION,
     DATA_SCHEMA_VERSION,
     EXECUTION_SEMANTICS_VERSION,
+    HISTORY_SCHEMA_VERSION,
     LABEL_LOOKAHEAD_BARS,
     LABEL_SEMANTICS_VERSION,
+    STRATEGY_SCHEMA_VERSION,
     ArtifactCompatibilityError,
     BacktestModeError,
     DataValidationError,
@@ -1456,13 +1459,16 @@ class TrainingRunIdentity:
                 "checkpoint step must be a non-negative integer; "
                 f"actual={_safe_diagnostic(step)}"
             )
-        return f"ckpt_v2_{self._filename_prefix()}_step_{step}.pt"
+        version = CHECKPOINT_SCHEMA_VERSION.removeprefix("checkpoint-")
+        return f"ckpt_{version}_{self._filename_prefix()}_step_{step}.pt"
 
     def strategy_filename(self) -> str:
-        return f"best_v2_{self._filename_prefix()}.json"
+        version = STRATEGY_SCHEMA_VERSION.removeprefix("strategy-")
+        return f"best_{version}_{self._filename_prefix()}.json"
 
     def history_filename(self) -> str:
-        return f"training_history_v2_{self._filename_prefix()}.json"
+        version = HISTORY_SCHEMA_VERSION.removeprefix("training-history-")
+        return f"training_history_{version}_{self._filename_prefix()}.json"
 
 
 @dataclass(frozen=True)

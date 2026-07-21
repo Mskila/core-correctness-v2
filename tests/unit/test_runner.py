@@ -29,6 +29,7 @@ def _artifact(
         best_score=1.0,
         fold_evidence=template.fold_evidence,
         generated_at=generated_at,
+        candidate_evaluation_count=1,
     )
 
 

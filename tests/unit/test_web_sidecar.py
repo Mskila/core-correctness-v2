@@ -14,7 +14,7 @@ def _checkpoint(path, artifact: StrategyArtifact, *, step: int, history_steps) -
     stream = io.BytesIO()
     torch.save(
         {
-            "checkpoint_schema_version": "checkpoint-v2",
+            "checkpoint_schema_version": "checkpoint-v3",
             "run_identity": artifact.run_identity.to_dict(),
             "step": step,
             "best_score": artifact.best_score,

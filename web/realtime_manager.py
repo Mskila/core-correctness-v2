@@ -18,6 +18,7 @@ from typing import Any
 
 from data_pipeline.validation import normalize_timeframe_name
 from model_core.artifacts import StrategyArtifact
+from model_core.semantics import STRATEGY_SCHEMA_VERSION
 from model_core.walk_forward import formula_warmup_bars
 from strategy_manager.live_signal import evaluate_signal, min_exposure
 from web.data_sources.base import bars_to_raw_dict
@@ -101,6 +102,11 @@ def _load_strategy_meta(path: str) -> dict[str, Any]:
     strategy_path = Path(path)
     data = json.loads(strategy_path.read_text(encoding="utf-8"))
     artifact = StrategyArtifact.from_dict(data)
+    if artifact.schema_version != STRATEGY_SCHEMA_VERSION:
+        raise ValueError(
+            "pre-core-fix/incompatible strategy artifact: "
+            f"expected={STRATEGY_SCHEMA_VERSION!r} actual={artifact.schema_version!r}"
+        )
     expected_name = artifact.run_identity.strategy_filename()
     if strategy_path.name != expected_name:
         raise ValueError(

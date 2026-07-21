@@ -63,6 +63,7 @@ def _timeframe_artifact(
         best_score=template.best_score,
         fold_evidence=template.fold_evidence,
         generated_at=generated_at,
+        candidate_evaluation_count=1,
     )
 
 

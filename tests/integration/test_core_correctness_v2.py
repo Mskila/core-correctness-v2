@@ -275,7 +275,7 @@ def lifecycle(tmp_path_factory, request: pytest.FixtureRequest):
         random_seed=123,
     )
     partial_run_identity = partial.run_identity
-    first_checkpoints = sorted(checkpoint_dir.glob("ckpt_v2_*.pt"))
+    first_checkpoints = sorted(checkpoint_dir.glob("ckpt_v3_*.pt"))
     assert len(first_checkpoints) == 1
     first_checkpoint = first_checkpoints[0]
     checkpoint_payload = torch.load(
@@ -292,7 +292,7 @@ def lifecycle(tmp_path_factory, request: pytest.FixtureRequest):
         from_scratch=False,
         random_seed=123,
     )
-    strategy_paths = sorted(strategy_dir.glob("best_v2_EURUSD_H1_*.json"))
+    strategy_paths = sorted(strategy_dir.glob("best_v3_EURUSD_H1_*.json"))
     assert len(strategy_paths) == 1
     strategy_path = strategy_paths[0]
     strategy = load_strategy(strategy_path)
@@ -330,7 +330,7 @@ def lifecycle(tmp_path_factory, request: pytest.FixtureRequest):
         "partial_run_identity": partial_run_identity,
         "checkpoint_payload": checkpoint_payload,
         "checkpoint_run_identity": checkpoint_run_identity,
-        "checkpoint_paths": sorted(checkpoint_dir.glob("ckpt_v2_*.pt")),
+        "checkpoint_paths": sorted(checkpoint_dir.glob("ckpt_v3_*.pt")),
         "strategy_path": strategy_path,
         "strategy": strategy,
         "replay_path": replay_path,
@@ -358,7 +358,7 @@ def test_full_v2_lifecycle_resumes_identity_and_reconciles_reports(lifecycle) ->
     assert partial is not resumed
     assert partial.training_history["step"] == [0, 1]
     assert resumed.training_history["step"] == [0, 1, 2, 3]
-    assert checkpoint["checkpoint_schema_version"] == "checkpoint-v2"
+    assert checkpoint["checkpoint_schema_version"] == "checkpoint-v3"
     assert checkpoint["step"] == 1
     assert checkpoint_identity == lifecycle["partial_run_identity"]
     assert resumed.run_identity == checkpoint_identity == strategy.run_identity
@@ -375,10 +375,10 @@ def test_full_v2_lifecycle_resumes_identity_and_reconciles_reports(lifecycle) ->
 
     replay = lifecycle["replay"]
     oos_report = lifecycle["oos_report"]
-    assert replay["report_schema"] == "backtest-report-v2"
+    assert replay["report_schema"] == "backtest-report-v3"
     assert replay["mode"] == "in_sample_replay"
     assert replay["mode_label"] == "样本内复盘"
-    assert oos_report["report_schema"] == "backtest-report-v2"
+    assert oos_report["report_schema"] == "backtest-report-v3"
     assert oos_report["mode"] == "out_of_sample_backtest"
     assert oos_report["mode_label"] == "独立样本外回测"
     training_identity = artifact_identity.training_dataset
@@ -464,11 +464,11 @@ def test_illegal_oos_is_fail_closed_and_preserves_all_bytes(lifecycle) -> None:
         lifecycle["strategy_path"],
         lifecycle["replay_path"],
         lifecycle["oos_report_path"],
-        *lifecycle["root"].glob("training_history_v2_*.json"),
+        *lifecycle["root"].glob("training_history_v3_*.json"),
     }
     assert set(lifecycle["preserved"]).isdisjoint(discovered_v2)
-    assert all(path.name.startswith("ckpt_v2_") for path in lifecycle["checkpoint_paths"])
-    assert lifecycle["strategy_path"].name.startswith("best_v2_")
+    assert all(path.name.startswith("ckpt_v3_") for path in lifecycle["checkpoint_paths"])
+    assert lifecycle["strategy_path"].name.startswith("best_v3_")
 
     for label, data_path in (
         ("training", lifecycle["train_path"]),

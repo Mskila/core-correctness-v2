@@ -35,7 +35,7 @@ def test_record_and_summarize_session(isolated_training_time: Path) -> None:
 
     job = {
         "symbol": "XAUUSD",
-        "started_at": (end + timedelta(minutes=5)).isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None,
     }
     live = tt.get_training_time_summary("XAUUSD", job=job, active=True)

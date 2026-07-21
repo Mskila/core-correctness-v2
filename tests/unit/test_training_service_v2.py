@@ -174,7 +174,7 @@ def test_from_scratch_never_scans_or_changes_old_artifacts(monkeypatch, tmp_path
     strategy_dir = tmp_path / "strategies"
     checkpoint_dir.mkdir(); strategy_dir.mkdir()
     old = [
-        checkpoint_dir / "ckpt_v2_EURUSD_old.pt",
+        checkpoint_dir / "ckpt_v3_EURUSD_old.pt",
         strategy_dir / "best_EURUSD.json",
         tmp_path / "training_history_EURUSD.json",
     ]
@@ -202,7 +202,7 @@ def test_resume_uses_internal_identity_not_filename(monkeypatch, tmp_path) -> No
     run = TrainingRunIdentity(run_id="3" * 32, artifact_identity=identity)
     source = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
-    lying_name = tmp_path / "ckpt_v2_EURUSD_H1_wrong_filename_step_999.pt"
+    lying_name = tmp_path / "ckpt_v3_EURUSD_H1_wrong_filename_step_999.pt"
     source.save_checkpoint(7, str(lying_name))
     selected = training_service._select_resume(identity)
     assert selected is not None
@@ -216,7 +216,7 @@ def test_incompatible_candidate_fails_explicitly(monkeypatch, tmp_path) -> None:
     run = TrainingRunIdentity(run_id="4" * 32, artifact_identity=other)
     source = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
-    source.save_checkpoint(2, str(tmp_path / "ckpt_v2_EURUSD_candidate.pt"))
+    source.save_checkpoint(2, str(tmp_path / "ckpt_v3_EURUSD_candidate.pt"))
     with pytest.raises(ArtifactCompatibilityError, match="none has exact internal identity.*from-scratch"):
         training_service._select_resume(wanted)
 
@@ -258,7 +258,7 @@ def test_strategy_publication_is_idempotent_and_immutable(monkeypatch, tmp_path)
 
 def test_corrupt_only_candidate_is_bounded_and_preserved(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(training_service, "CHECKPOINT_DIR", tmp_path)
-    path = tmp_path / "ckpt_v2_EURUSD_corrupt.pt"
+    path = tmp_path / "ckpt_v3_EURUSD_corrupt.pt"
     path.write_bytes(b"not-a-checkpoint")
     before = path.read_bytes()
     identity = training_service._artifact_identity(OneManager(), 42)
@@ -274,13 +274,13 @@ def test_corrupt_candidate_does_not_block_valid_internal_latest(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.setattr(training_service, "CHECKPOINT_DIR", tmp_path)
-    corrupt = tmp_path / "ckpt_v2_EURUSD_aaa_step_999.pt"
+    corrupt = tmp_path / "ckpt_v3_EURUSD_aaa_step_999.pt"
     corrupt.write_bytes(b"corrupt")
     identity = training_service._artifact_identity(OneManager(), 42)
     run = TrainingRunIdentity(run_id="6" * 32, artifact_identity=identity)
     source = AlphaEngine(None, use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
                          target_symbol="EURUSD", run_identity=run)
-    valid = tmp_path / "ckpt_v2_EURUSD_zzz_step_0.pt"
+    valid = tmp_path / "ckpt_v3_EURUSD_zzz_step_0.pt"
     source.save_checkpoint(17, str(valid))
     selected = training_service._select_resume(identity)
     assert selected is not None
@@ -354,7 +354,7 @@ def test_unrelated_symbol_candidate_is_never_loaded_or_blocks_new_run(
     monkeypatch.setattr(training_service, "CHECKPOINT_DIR", tmp_path)
     wanted = _identity_for_symbol("EURUSD", "a")
     unrelated_identity = _identity_for_symbol("GBPUSD", "b")
-    unrelated = tmp_path / "ckpt_v2_GBPUSD_H1_foreign_step_999.pt"
+    unrelated = tmp_path / "ckpt_v3_GBPUSD_H1_foreign_step_999.pt"
     if kind == "valid":
         _write_checkpoint(unrelated, unrelated_identity, 999, "a" * 32)
     elif kind == "legacy":
@@ -388,8 +388,8 @@ def test_unrelated_newer_candidate_is_not_loaded_before_same_symbol_exact(
     monkeypatch.setattr(training_service, "CHECKPOINT_DIR", tmp_path)
     wanted = _identity_for_symbol("EURUSD", "a")
     unrelated_identity = _identity_for_symbol("GBPUSD", "b")
-    unrelated = tmp_path / "ckpt_v2_GBPUSD_newer_step_999.pt"
-    exact = tmp_path / "ckpt_v2_EURUSD_older_step_1.pt"
+    unrelated = tmp_path / "ckpt_v3_GBPUSD_newer_step_999.pt"
+    exact = tmp_path / "ckpt_v3_EURUSD_older_step_1.pt"
     _write_checkpoint(unrelated, unrelated_identity, 999, "b" * 32)
     exact_run = _write_checkpoint(exact, wanted, 7, "c" * 32)
     unrelated_before = unrelated.read_bytes()
@@ -414,7 +414,7 @@ def test_resume_symbol_namespace_has_exact_component_boundary(
     monkeypatch.setattr(training_service, "CHECKPOINT_DIR", tmp_path)
     wanted = _identity_for_symbol("EURUSD", "a")
     unrelated_identity = _identity_for_symbol(unrelated_symbol, "b")
-    unrelated = tmp_path / f"ckpt_v2_{unrelated_symbol}_foreign_step_8.pt"
+    unrelated = tmp_path / f"ckpt_v3_{unrelated_symbol}_foreign_step_8.pt"
     _write_checkpoint(unrelated, unrelated_identity, 8, "d" * 32)
     real_load = training_service.torch.load
     loaded = []

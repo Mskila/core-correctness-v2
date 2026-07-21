@@ -447,6 +447,19 @@ def strategy_artifact() -> StrategyArtifact:
     )
 
 
+def current_strategy_artifact() -> StrategyArtifact:
+    legacy = strategy_artifact()
+    return StrategyArtifact.create(
+        run_identity=legacy.run_identity,
+        formula_tokens=legacy.formula_tokens,
+        decoded_formula=legacy.decoded_formula,
+        best_score=legacy.best_score,
+        fold_evidence=legacy.fold_evidence,
+        generated_at=legacy.generated_at,
+        candidate_evaluation_count=1,
+    )
+
+
 def direct_strategy_artifact(
     *,
     run_identity: TrainingRunIdentity,
@@ -1779,18 +1792,18 @@ def test_training_run_snapshots_source_identity_before_later_bypass_mutation(
     mutate_artifact_identity(source, mutation)
     assert run.artifact_identity is not source
     assert run.to_dict() == before
-    assert run.checkpoint_filename(1).startswith("ckpt_v2_")
-    assert run.strategy_filename().startswith("best_v2_")
-    assert run.history_filename().startswith("training_history_v2_")
+    assert run.checkpoint_filename(1).startswith("ckpt_v3_")
+    assert run.strategy_filename().startswith("best_v3_")
+    assert run.history_filename().startswith("training_history_v3_")
 
 
 def test_training_run_uuid_and_immutable_filenames_include_identity() -> None:
     run = TrainingRunIdentity.create(artifact_identity())
     assert len(run.run_id) == 32
     int(run.run_id, 16)
-    assert run.checkpoint_filename(17) == f"ckpt_v2_EURUSD_H1_{'a' * 12}_run_{run.run_id[:8]}_step_17.pt"
-    assert run.strategy_filename() == f"best_v2_EURUSD_H1_{'a' * 12}_run_{run.run_id[:8]}.json"
-    assert run.history_filename() == f"training_history_v2_EURUSD_H1_{'a' * 12}_run_{run.run_id[:8]}.json"
+    assert run.checkpoint_filename(17) == f"ckpt_v3_EURUSD_H1_{'a' * 12}_run_{run.run_id[:8]}_step_17.pt"
+    assert run.strategy_filename() == f"best_v3_EURUSD_H1_{'a' * 12}_run_{run.run_id[:8]}.json"
+    assert run.history_filename() == f"training_history_v3_EURUSD_H1_{'a' * 12}_run_{run.run_id[:8]}.json"
 
 
 @pytest.mark.parametrize("run_id", ["", "not-a-uuid", "a" * 31, "g" * 32])
@@ -4184,7 +4197,7 @@ def test_raw_json_load_rejects_same_and_conflicting_root_duplicates(
     ("key", "value", "earlier_value"),
     [
         ("run_id", None, "0" * 32),
-        ("core_semantics_version", "4", "3"),
+        ("core_semantics_version", "5", "4"),
         ("schema_version", "ohlcv-v4", "legacy-dataset"),
         ("batch_size", 192, 1),
         ("coeff_max", ModelConfig.ENTROPY_COEFF_MAX, -1.0),
