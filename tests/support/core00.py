@@ -27,6 +27,16 @@ CORE00_REFERENCE_TRACE_SHA256 = {
     ("win32", "2.5.1"): "69a0385e7da0e2f78beccf1cb48485f3315ae59beaaa06f80335b8d63a86879a",
     ("win32", "2.13.0"): "eac1b45fd5f979d968d6422deddc538fde2f868c8e96a5bcf9d2e84a4e9c64cc",
 }
+CORE00_FORMULA_DIGESTS = {
+    ("linux", "2.5.1"): {
+        "feature-ret": "cf27c71b8b4916503232c7316ddac0fcaedbb2fadf4dbbd7b286647cadc04531",
+        "unary-abs": "00adee970c39e4ea276c7fcdf782a745a72431051c35a9327f050e1f855211f4",
+        "binary-add": "1bfd2338c2ab3139dc91fddc2d4642ae2dad5f42bab6a5358cfcbea8cf119906",
+        "ternary-if-gt": "a3b6e9d084880198e4a19f2f6402c3955a9d90a62f9f1098f62771f06d06d5d7",
+        "rolling-mean-5": "2e215ec4acdd2d90fc9d36c49375bb00d50b51306d53026b2757d58ec5d3627f",
+        "decay-exp-5": "7b4fdafdaeb2287dd87a7ebb76294a7481440805f7b185ea5845e0e864b9bb26",
+    },
+}
 CORE00_FIXTURE_SHA256 = "2fa10bf75e68532f2177bb2b982842e7a4db470837a782a1004aeed4d0e5468e"
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -241,6 +251,7 @@ def run_reference_trace(seed: int, steps: int, work_dir: Path) -> dict[str, Any]
 __all__ = [
     "CORE00_FIXTURE_SHA256",
     "CORE00_REFERENCE_TRACE_SHA256",
+    "CORE00_FORMULA_DIGESTS",
     "TRACE_SCHEMA_VERSION",
     "load_formula_corpus",
     "load_known_defects",

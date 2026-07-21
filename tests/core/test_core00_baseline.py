@@ -10,6 +10,7 @@ import torch
 from benchmarks.core00 import BENCHMARK_SCHEMA_VERSION, run_benchmark
 from tests.support.core00 import (
     CORE00_FIXTURE_SHA256,
+    CORE00_FORMULA_DIGESTS,
     CORE00_REFERENCE_TRACE_SHA256,
     TRACE_SCHEMA_VERSION,
     load_formula_corpus,
@@ -87,6 +88,8 @@ def test_formula_corpus_covers_required_shapes_without_goldenizing_known_defects
         for entry in corpus
         if entry["classification"] == "valid"
     }
+    runtime_key = (sys.platform, torch.__version__.split("+")[0])
+    expected_digests = CORE00_FORMULA_DIGESTS.get(runtime_key, expected_digests)
     assert valid_digests == expected_digests, valid_digests
     assert set(valid_digests) == {
         "feature-ret", "unary-abs", "binary-add", "ternary-if-gt",

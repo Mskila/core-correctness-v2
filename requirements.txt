@@ -6,6 +6,7 @@ torch
 numpy
 pandas
 pyarrow
+matplotlib
 python-dotenv
 loguru
 tqdm
