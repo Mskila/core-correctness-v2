@@ -161,6 +161,7 @@ def test_service_passes_exact_identity_lord_controls_to_engine(
         "use_lord_regularization": ModelConfig.USE_LORD_REGULARIZATION,
         "lord_decay_rate": ModelConfig.LORD_DECAY_RATE,
         "lord_num_iterations": ModelConfig.LORD_NUM_ITERATIONS,
+        "evaluation_workers": ModelConfig.EVALUATION_WORKERS,
     }
     assert dict(engine.run_identity.artifact_identity.training_config["lord"]) == {
         "use_lord_regularization": ModelConfig.USE_LORD_REGULARIZATION,

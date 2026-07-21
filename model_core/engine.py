@@ -30,6 +30,7 @@ from .artifact_publication import publish_training_history as _publish_training_
 from .batch_transaction import begin_batch_transaction as _begin_transaction_boundary
 from .checkpoint_codec import save_checkpoint as _save_checkpoint
 from .formula_evaluation import evaluate_training_formula as _evaluate_training_formula
+from .formula_evaluation import RawEvaluationContext, ReferenceCpuEvaluator
 from .reward import apply_ic_gate
 from .sampling import ConstrainedSampler
 from .serial_decision import commit_pending_actions as _commit_serial_decisions
@@ -2445,6 +2446,7 @@ class _BatchTransaction:
             for receipt in tuple(self._publication_receipts.values()):
                 attempt(lambda receipt=receipt: (receipt / "displaced").unlink(missing_ok=True))
                 attempt(lambda receipt=receipt: receipt.rmdir())
+            attempt(self.engine._close_active_formula_evaluator)
             if conflicts:
                 failures.append(
                     RuntimeError(
@@ -2667,7 +2669,8 @@ class AlphaEngine:
                  lord_decay_rate=1e-3, lord_num_iterations=5,
                  n_folds: object = _CONFIGURED_N_FOLDS,
                  target_symbol: str | None = None,
-                 run_identity: TrainingRunIdentity | None = None):
+                 run_identity: TrainingRunIdentity | None = None,
+                 evaluation_workers: int | None = None):
         self.data_manager  = data_manager
         self.run_identity = run_identity
         configured_n_folds = (
@@ -2677,6 +2680,15 @@ class AlphaEngine:
         )
         self.n_folds       = self._validate_n_folds(configured_n_folds)
         self.target_symbol = target_symbol   # None = 多品种模式，str = 单品种模式
+        if evaluation_workers is not None and (
+            type(evaluation_workers) is not int or evaluation_workers < 1
+        ):
+            raise ArtifactCompatibilityError(
+                "evaluation_workers mismatch: expected=None-or-positive-int "
+                f"actual={type(evaluation_workers).__name__}"
+            )
+        self.evaluation_workers = evaluation_workers
+        self._active_formula_evaluator = None
         self.model   = AlphaGPT().to(ModelConfig.DEVICE)
         self.opt     = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
 
@@ -2776,6 +2788,12 @@ class AlphaEngine:
                 tuple[int, int, int],
             ],
         ] = {}
+
+    def _close_active_formula_evaluator(self) -> None:
+        evaluator = getattr(self, "_active_formula_evaluator", None)
+        self._active_formula_evaluator = None
+        if evaluator is not None:
+            evaluator.close()
 
     # ── IC computation ────────────────────────────────────────────────────────
 
@@ -3271,6 +3289,42 @@ class AlphaEngine:
                 )
                 for fold in folds
             ]
+        raw_evaluator = None
+        evaluation_workers = getattr(self, "evaluation_workers", None)
+        if evaluation_workers is not None:
+            if prepared_folds is None:
+                raise RuntimeError(
+                    "raw CPU evaluation requires prepared-fold backtest support"
+                )
+            raw_context = RawEvaluationContext(
+                features=feat,
+                target_ret=t_ret,
+                target_valid=t_valid,
+                bar_time_ns=bar_time_ns,
+                folds=tuple(folds),
+                selection_index=selection_index,
+                cost_rate=self.bt.cost_rate,
+                timeframe=self.bt.timeframe,
+                target_trades_per_day=self.bt.target_trades_per_day,
+                oos_gate_scale=self.bt.oos_gate_scale,
+            )
+            if evaluation_workers == 1:
+                raw_evaluator = ReferenceCpuEvaluator(
+                    raw_context,
+                    vm=self.vm,
+                    backtest=self.bt,
+                    prepared_folds=tuple(prepared_folds),
+                )
+            else:
+                from .parallel_evaluator import ParallelCpuEvaluator
+
+                raw_evaluator = ParallelCpuEvaluator(
+                    raw_context,
+                    workers=evaluation_workers,
+                    timeout_seconds=ModelConfig.EVALUATION_TIMEOUT_SECONDS,
+                    torch_threads=ModelConfig.EVALUATION_TORCH_THREADS,
+                )
+            self._active_formula_evaluator = raw_evaluator
         bs      = ModelConfig.BATCH_SIZE
         n_elite = max(1, int(bs * ModelConfig.ELITE_REPLAY_FRAC))
         n_new   = bs - n_elite
@@ -3440,32 +3494,64 @@ class AlphaEngine:
             formula_error_samples: list[str] = []
             formula_valid = [True] * tot
             evaluated_factors: list[torch.Tensor | None] = [None] * tot
+            raw_evaluations = None
             step_max_val = -float('inf');  step_best_f = None
             bic, bis, bsor = [], [], []
 
-            for i, fml in enumerate(all_fmls):
-                try:
-                    with torch.no_grad():
-                        res = transaction.run_formula(
-                            _evaluate_training_formula,
-                            self.vm,
-                            fml,
-                            feat,
-                            step=step,
-                            index=i,
+            if raw_evaluator is None:
+                for i, fml in enumerate(all_fmls):
+                    try:
+                        with torch.no_grad():
+                            res = transaction.run_formula(
+                                _evaluate_training_formula,
+                                self.vm,
+                                fml,
+                                feat,
+                                step=step,
+                                index=i,
+                            )
+                            evaluated_factors[i] = res
+                    except FormulaEvaluationError as failure:
+                        formula_valid[i] = False
+                        none_cnt += 1
+                        formula_error_counts[failure.error_kind.value] += 1
+                        if len(formula_error_samples) < 5:
+                            formula_error_samples.append(str(failure)[:500])
+                        continue
+                    except BaseException as failure:
+                        traceback.clear_frames(failure.__traceback__)
+                        raise
+                    res = None
+            else:
+                raw_evaluations = transaction.run(
+                    raw_evaluator.evaluate_batch,
+                    all_fmls,
+                    step=step,
+                )
+                if len(raw_evaluations) != tot:
+                    raise RuntimeError("raw evaluator returned an incomplete batch")
+                for i, raw in enumerate(raw_evaluations):
+                    if raw.formula_index != i or raw.formula != tuple(all_fmls[i]):
+                        raise RuntimeError(
+                            "raw evaluator result order/formula mismatch: "
+                            f"expected_index={i} actual_index={raw.formula_index}"
                         )
-                        evaluated_factors[i] = res
-                except FormulaEvaluationError as failure:
-                    formula_valid[i] = False
-                    none_cnt += 1
-                    formula_error_counts[failure.error_kind.value] += 1
-                    if len(formula_error_samples) < 5:
-                        formula_error_samples.append(str(failure)[:500])
-                    continue
-                except BaseException as failure:
-                    traceback.clear_frames(failure.__traceback__)
-                    raise
-                res = None
+                    if raw.error is not None:
+                        formula_valid[i] = False
+                        none_cnt += 1
+                        formula_error_counts[raw.error.kind] += 1
+                        if len(formula_error_samples) < 5:
+                            error_sample = (
+                                "formula evaluation failed: "
+                                f"kind={raw.error.kind} "
+                                f"token_index={raw.error.token_index} "
+                                f"operator={raw.error.operator!r} "
+                                f"formula={raw.formula!r} "
+                                f"detail={raw.error.detail}"
+                            )
+                            formula_error_samples.append(error_sample[:500])
+                    else:
+                        evaluated_factors[i] = raw.factor
 
             shadow_best_score = self.best_score
             shadow_factor_pool = list(self.factor_pool)
@@ -3478,6 +3564,7 @@ class AlphaEngine:
 
             try:
                 for i, fml in enumerate(all_fmls):
+                    raw = None if raw_evaluations is None else raw_evaluations[i]
                     res = evaluated_factors[i]
                     evaluated_factors[i] = None
                     selection_factor = None
@@ -3490,7 +3577,10 @@ class AlphaEngine:
                             f"step={step} formula_index={i}"
                         )
                     selection_factor = self._select_fold_bars(res, selection_index)
-                    if not _has_exact_variation(selection_factor):
+                    if (
+                        (raw is not None and raw.constant)
+                        or not _has_exact_variation(selection_factor)
+                    ):
                         rewards[i] = val_scores[i] = -2.0
                         const_cnt += 1
                     else:
@@ -3499,29 +3589,34 @@ class AlphaEngine:
                         with torch.no_grad():
                             fold_tr, fold_vl, fold_ic = [], [], []
                             for fold_index, fold in enumerate(folds):
-                                if prepared_folds is None:
-                                    tr_sc, vl_sc = transaction.run(
-                                        self.bt.evaluate_fold,
-                                        factors=res,
-                                        target_ret=t_ret,
-                                        target_valid=t_valid,
-                                        bar_time_ns=bar_time_ns,
-                                        train_start=fold.train_start,
-                                        train_end=fold.train_end,
-                                        val_start=fold.val_start,
-                                        val_end=fold.val_end,
-                                    )
+                                if raw is not None:
+                                    tr_sc = raw.fold_train_scores[fold_index]
+                                    vl_sc = raw.fold_val_scores[fold_index]
+                                    ic_m = raw.fold_ics[fold_index]
                                 else:
-                                    tr_sc, vl_sc = transaction.run(
-                                        evaluate_prepared_fold,
-                                        res,
-                                        prepared_folds[fold_index],
+                                    if prepared_folds is None:
+                                        tr_sc, vl_sc = transaction.run(
+                                            self.bt.evaluate_fold,
+                                            factors=res,
+                                            target_ret=t_ret,
+                                            target_valid=t_valid,
+                                            bar_time_ns=bar_time_ns,
+                                            train_start=fold.train_start,
+                                            train_end=fold.train_end,
+                                            val_start=fold.val_start,
+                                            val_end=fold.val_end,
+                                        )
+                                    else:
+                                        tr_sc, vl_sc = transaction.run(
+                                            evaluate_prepared_fold,
+                                            res,
+                                            prepared_folds[fold_index],
+                                        )
+                                    ic_m = AlphaEngine._compute_ic(
+                                        res[:, fold.train_start:fold.train_end],
+                                        t_ret[:, fold.train_start:fold.train_end],
+                                        t_valid[:, fold.train_start:fold.train_end],
                                     )
-                                ic_m = AlphaEngine._compute_ic(
-                                    res[:, fold.train_start:fold.train_end],
-                                    t_ret[:, fold.train_start:fold.train_end],
-                                    t_valid[:, fold.train_start:fold.train_end],
-                                )
                                 tr_adj = AlphaEngine._apply_ic_gate(
                                     tr_sc,
                                     ic_m,
@@ -3533,12 +3628,23 @@ class AlphaEngine:
                             train_score = torch.stack(fold_tr).mean()
                             val_score = torch.stack(fold_vl).mean()
                             ic_i = sum(fold_ic) / len(fold_ic)
-                            ic_selection = AlphaEngine._compute_ic(
-                                selection_factor, selection_target, selection_valid
-                            )
-                            ic_stab_selection = AlphaEngine._compute_ic_stability(
-                                selection_factor, selection_target, selection_valid
-                            )
+                            if raw is None:
+                                ic_selection = AlphaEngine._compute_ic(
+                                    selection_factor, selection_target, selection_valid
+                                )
+                                ic_stab_selection = AlphaEngine._compute_ic_stability(
+                                    selection_factor, selection_target, selection_valid
+                                )
+                            else:
+                                ic_selection = raw.selection_ic
+                                ic_stab_selection = raw.selection_ic_stability
+                                if (
+                                    ic_selection is None
+                                    or ic_stab_selection is None
+                                ):
+                                    raise RuntimeError(
+                                        "raw evaluator omitted selection metrics"
+                                    )
 
                         rewards[i]    = train_score
                         val_scores[i] = val_score
@@ -3572,8 +3678,17 @@ class AlphaEngine:
                                     f"训练={train_val:.3f} 比值={final_val/train_val:.2f} | 样本外表现过差"
                                 )
                             else:
-                                pos_check = compute_target_positions_stateless(selection_factor)
-                                exposure = pos_check.abs().mean().item()
+                                if raw is None:
+                                    pos_check = compute_target_positions_stateless(
+                                        selection_factor
+                                    )
+                                    exposure = pos_check.abs().mean().item()
+                                else:
+                                    if raw.exposure is None:
+                                        raise RuntimeError(
+                                            "raw evaluator omitted exposure"
+                                        )
+                                    exposure = raw.exposure
                                 if exposure < 0.05:
                                     tqdm.write(
                                         f"[稀疏跳过 @ 第{step}步] 验证={final_val:.3f} "
@@ -3643,11 +3758,15 @@ class AlphaEngine:
                 shadow_factor_pool.clear()
                 shadow_elite_pool.clear()
                 evaluated_factors.clear()
+                if raw_evaluations is not None:
+                    raw_evaluations.clear()
                 selection_factor = res = None
                 del buffered_factor, snapshot, pos_check
                 traceback.clear_frames(failure.__traceback__)
                 raise
             evaluated_factors.clear()
+            if raw_evaluations is not None:
+                raw_evaluations.clear()
 
             # ── Part D: REINFORCE gradient update ────────────────────
             # Fix 3: EMA baseline 替代 batch mean，避免全负 batch 的相对优选问题
@@ -3863,6 +3982,8 @@ class AlphaEngine:
             transaction.commit()
 
         # ── End of training ──────────────────────────────────────────
+        self._close_active_formula_evaluator()
+        raw_evaluator = None
         # 仅当跑满最终步时才保存最终 strategy 和历史
         if end_step == ModelConfig.TRAIN_STEPS:
             current_identity = _revalidate_run_identity(
