@@ -193,5 +193,5 @@ def test_feature_and_dataset_metadata_publish_volume_semantics(tmp_path) -> None
 
 @pytest.mark.core
 def test_core04_bumps_formula_semantics_versions() -> None:
-    assert CORE_SEMANTICS_VERSION == "4"
+    assert CORE_SEMANTICS_VERSION == "5"
     assert VOCAB_VERSION == FORMULA_VOCAB.version

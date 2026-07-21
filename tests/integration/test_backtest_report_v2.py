@@ -98,6 +98,7 @@ def _strategy_for(training_identity, path: Path) -> StrategyArtifact:
             for index in range(4)
         ],
         generated_at="2026-07-18T00:00:00Z",
+        candidate_evaluation_count=1,
     )
     path.write_text(json.dumps(artifact.to_dict()), encoding="utf-8")
     return artifact
@@ -174,7 +175,7 @@ def test_replay_report_has_complete_identity_cost_metrics_and_name(lifecycle) ->
         "ledger_reconciliation",
         "generated_at",
     }
-    assert report["report_schema"] == "backtest-report-v2"
+    assert report["report_schema"] == "backtest-report-v3"
     assert report["mode"] == "in_sample_replay"
     assert report["mode_label"] == "样本内复盘"
     assert report["evidence_scope"] == {

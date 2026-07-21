@@ -158,4 +158,4 @@ def test_irregular_real_month_lengths_drive_annualization() -> None:
 
 @pytest.mark.core
 def test_core03_bumps_execution_semantics_version() -> None:
-    assert EXECUTION_SEMANTICS_VERSION == "tanh-threshold-cost-liquidate-v3"
+    assert EXECUTION_SEMANTICS_VERSION == "tanh-threshold-cost-liquidate-v4"

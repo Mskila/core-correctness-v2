@@ -13,7 +13,10 @@ import web.training_package as packages
 from model_core.artifacts import StrategyArtifact, TrainingRunIdentity
 from model_core.semantics import ArtifactCompatibilityError
 from model_core.vocab import FORMULA_VOCAB
-from tests.unit.test_artifacts import artifact_identity, strategy_artifact
+from tests.unit.test_artifacts import (
+    artifact_identity,
+    current_strategy_artifact as strategy_artifact,
+)
 from tests.unit.test_web_progress_v2 import IntSubclass, _history_value
 
 
@@ -28,7 +31,7 @@ def _package(
                   if standalone is None else standalone)
     checkpoint = io.BytesIO()
     torch.save({
-        "checkpoint_schema_version": "checkpoint-v2",
+        "checkpoint_schema_version": "checkpoint-v3",
         "run_identity": artifact.run_identity.to_dict(),
         "step": payload_step,
         "training_history": embedded,
@@ -323,7 +326,7 @@ def test_export_validates_complete_history_before_returning_package(monkeypatch,
     checkpoint = checkpoints / artifact.run_identity.checkpoint_filename(7)
     stream = io.BytesIO()
     torch.save({
-        "checkpoint_schema_version": "checkpoint-v2",
+        "checkpoint_schema_version": "checkpoint-v3",
         "run_identity": artifact.run_identity.to_dict(), "step": 7,
         "training_history": embedded, "rank_monitor_history": [],
     }, stream)
@@ -345,7 +348,7 @@ def _write_export_run(checkpoints, strategies, root, artifact, *, step=7, payloa
     embedded = _history_value(artifact, range(step), include_identity=False)
     stream = io.BytesIO()
     torch.save({
-        "checkpoint_schema_version": "checkpoint-v2",
+        "checkpoint_schema_version": "checkpoint-v3",
         "run_identity": artifact.run_identity.to_dict(),
         "step": step if payload_step is None else payload_step,
         "training_history": embedded,
@@ -376,6 +379,7 @@ def _artifact_for_seed(seed: int, run_id: str | None = None) -> StrategyArtifact
         best_score=template.best_score,
         fold_evidence=template.fold_evidence,
         generated_at=template.generated_at,
+        candidate_evaluation_count=1,
     )
 
 
@@ -393,6 +397,7 @@ def test_export_strategy_competition_uses_chronological_generated_at(
             best_score=base.best_score,
             fold_evidence=base.fold_evidence,
             generated_at=generated_at,
+            candidate_evaluation_count=1,
         )
 
     earlier = same_run("2026-07-16T00:00:00Z", 0)
@@ -408,7 +413,7 @@ def test_export_strategy_competition_uses_chronological_generated_at(
 
     class _StrategySources:
         def glob(self, pattern):
-            assert pattern == "best_v2_*.json"
+            assert pattern == "best_v3_*.json"
             return list(source_paths)
 
     monkeypatch.setattr(packages, "STRATEGIES_DIR", _StrategySources())
@@ -436,6 +441,7 @@ def test_export_strategy_competition_preserves_submicrosecond_order(
             best_score=base.best_score,
             fold_evidence=base.fold_evidence,
             generated_at=generated_at,
+            candidate_evaluation_count=1,
         )
 
     earlier = same_run("2026-07-16T00:00:00.0000001Z", 0)
@@ -451,7 +457,7 @@ def test_export_strategy_competition_preserves_submicrosecond_order(
 
     class _StrategySources:
         def glob(self, pattern):
-            assert pattern == "best_v2_*.json"
+            assert pattern == "best_v3_*.json"
             return list(source_paths)
 
     monkeypatch.setattr(packages, "STRATEGIES_DIR", _StrategySources())

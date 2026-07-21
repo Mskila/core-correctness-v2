@@ -28,6 +28,7 @@ from .vm import FormulaErrorKind, FormulaEvaluationError, StackVM
 from .backtest import MT5Backtest, compute_ic_metrics
 from .reward import apply_ic_gate
 from .semantics import (
+    CHECKPOINT_SCHEMA_VERSION,
     LABEL_LOOKAHEAD_BARS,
     ArtifactCompatibilityError,
     DataValidationError,
@@ -4221,7 +4222,7 @@ class AlphaEngine:
             self, run_identity, "save_checkpoint identity serialization callback"
         )
         ckpt = {
-            "checkpoint_schema_version": "checkpoint-v2",
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "run_identity":          serialized_run_identity,
             "step":                 step,
             "model_state_dict":     model_state,
@@ -4679,9 +4680,10 @@ class AlphaEngine:
                 "checkpoint fields mismatch: "
                 f"expected={sorted(required)!r} actual={sorted(ckpt)!r}"
             )
-        if ckpt["checkpoint_schema_version"] != "checkpoint-v2":
+        if ckpt["checkpoint_schema_version"] != CHECKPOINT_SCHEMA_VERSION:
             raise ArtifactCompatibilityError(
-                "checkpoint_schema_version mismatch: expected='checkpoint-v2' "
+                "checkpoint_schema_version mismatch: "
+                f"expected={CHECKPOINT_SCHEMA_VERSION!r} "
                 f"actual={ckpt['checkpoint_schema_version']!r}"
             )
         raw_run_identity = ckpt["run_identity"]

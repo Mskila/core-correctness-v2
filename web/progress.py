@@ -17,6 +17,7 @@ import torch
 
 from model_core.artifacts import StrategyArtifact, TrainingRunIdentity
 from model_core.config import ModelConfig
+from model_core.semantics import CHECKPOINT_SCHEMA_VERSION, STRATEGY_SCHEMA_VERSION
 from model_core.vocab import FORMULA_VOCAB
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -57,7 +58,7 @@ def _safe_symbol_tag(symbol: str) -> str:
 
 def checkpoint_glob(symbol: str) -> list[Path]:
     return sorted(
-        CHECKPOINT_DIR.glob(f"ckpt_v2_{_safe_symbol_tag(symbol)}_*_run_*_step_*.pt"),
+        CHECKPOINT_DIR.glob(f"ckpt_v3_{_safe_symbol_tag(symbol)}_*_run_*_step_*.pt"),
         key=lambda path: (path.stat().st_mtime_ns, path.name),
     )
 
@@ -129,8 +130,8 @@ def _load_checkpoint_meta(path: Path) -> dict[str, Any]:
     mtime_ns = stat_after.st_mtime_ns
     if type(payload) is not dict:
         raise ValueError("checkpoint payload must be an object")
-    if payload.get("checkpoint_schema_version") != "checkpoint-v2":
-        raise ValueError("incompatible checkpoint schema")
+    if payload.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("pre-core-fix/incompatible checkpoint schema")
     run = TrainingRunIdentity.from_dict(payload["run_identity"])
     step = payload["step"]
     if type(step) is not int:
@@ -173,11 +174,16 @@ def _decode_formula(tokens: list[int] | None) -> str | None:
 
 def _strategy_rows(symbol: str) -> tuple[list[dict[str, Any]], list[str]]:
     rows, errors = [], []
-    prefix = f"best_v2_{_safe_symbol_tag(symbol)}_"
+    prefix = f"best_v3_{_safe_symbol_tag(symbol)}_"
     for path in STRATEGIES_DIR.glob(f"{prefix}*.json"):
         try:
             raw = path.read_bytes()
             artifact = StrategyArtifact.from_dict(json.loads(raw.decode("utf-8")))
+            if artifact.schema_version != STRATEGY_SCHEMA_VERSION:
+                raise ValueError(
+                    "pre-core-fix/incompatible strategy artifact: "
+                    f"expected={STRATEGY_SCHEMA_VERSION!r} actual={artifact.schema_version!r}"
+                )
             run = artifact.run_identity
             if run.artifact_identity.symbol != symbol:
                 continue
@@ -260,7 +266,7 @@ def _history_body(value: dict[str, Any]) -> dict[str, Any]:
 
 def _history_rows(symbol: str) -> tuple[list[dict[str, Any]], list[str]]:
     rows, errors = [], []
-    for path in PROJECT_ROOT.glob(f"training_history_v2_{_safe_symbol_tag(symbol)}_*.json"):
+    for path in PROJECT_ROOT.glob(f"training_history_v3_{_safe_symbol_tag(symbol)}_*.json"):
         try:
             stat_before = path.stat()
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -433,9 +439,11 @@ def list_strategies() -> list[dict[str, Any]]:
     if rows:
         return rows
     # Empty-symbol scan without weakening per-symbol validation.
-    for path in sorted(STRATEGIES_DIR.glob("best_v2_*.json")):
+    for path in sorted(STRATEGIES_DIR.glob("best_v3_*.json")):
         try:
             artifact = StrategyArtifact.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            if artifact.schema_version != STRATEGY_SCHEMA_VERSION:
+                continue
             if path.name != artifact.run_identity.strategy_filename():
                 continue
             identity = artifact.run_identity.artifact_identity

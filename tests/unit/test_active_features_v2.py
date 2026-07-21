@@ -10,6 +10,7 @@ from model_core.features import (
 )
 from model_core.ops import OPERATOR_REGISTRY
 from model_core.semantics import ArtifactCompatibilityError
+from model_core.semantics import CORE_SEMANTICS_VERSION
 from model_core.vocab import FORMULA_VOCAB, compute_vocab_version
 
 
@@ -38,8 +39,8 @@ def test_allowlist_stat_permission_error_fails_closed(tmp_path) -> None:
     [
         {"active_features": ["RET"]},
         {"core_semantics_version": "1", "active_features": ["RET"]},
-        {"core_semantics_version": "4", "active_features": ["UNKNOWN"]},
-        {"core_semantics_version": "4", "active_features": []},
+        {"core_semantics_version": CORE_SEMANTICS_VERSION, "active_features": ["UNKNOWN"]},
+        {"core_semantics_version": CORE_SEMANTICS_VERSION, "active_features": []},
     ],
 )
 def test_incompatible_allowlist_fails_closed(tmp_path, payload) -> None:
@@ -60,7 +61,7 @@ def test_duplicate_active_feature_names_fail_closed(tmp_path) -> None:
     path = tmp_path / "active_features.json"
     _write(
         path,
-        {"core_semantics_version": "4", "active_features": ["RET", "RET"]},
+        {"core_semantics_version": CORE_SEMANTICS_VERSION, "active_features": ["RET", "RET"]},
     )
     with pytest.raises(ArtifactCompatibilityError, match="duplicate"):
         _load_active_feature_allowlist(path)
@@ -70,7 +71,7 @@ def test_valid_allowlist_is_smaller_and_has_new_vocab_hash(tmp_path) -> None:
     path = tmp_path / "active_features.json"
     _write(
         path,
-        {"core_semantics_version": "4", "active_features": ["RET", "RET5"]},
+        {"core_semantics_version": CORE_SEMANTICS_VERSION, "active_features": ["RET", "RET5"]},
     )
     allowlist = _load_active_feature_allowlist(path)
     assert allowlist == {"RET", "RET5"}

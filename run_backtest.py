@@ -28,12 +28,16 @@ from model_core.artifacts import (
     validate_backtest_dataset,
 )
 from model_core.execution import classify_position_events
+from model_core.semantics import (
+    REPORT_SCHEMA_VERSION,
+    STRATEGY_SCHEMA_VERSION,
+    ArtifactCompatibilityError,
+)
 
 
 DEFAULT_COMMISSION_PCT = 0.02
 DEFAULT_SLIPPAGE_PCT = 0.01
 DEFAULT_OUTPUT_DIR = "backtest_output"
-REPORT_SCHEMA_VERSION = "backtest-report-v2"
 SIGNATURE_READ_CHUNK_SIZE = 1024 * 1024
 MODE_LABELS = {
     BacktestMode.IN_SAMPLE_REPLAY: "样本内复盘",
@@ -76,9 +80,14 @@ def load_strategy(path: str | Path) -> StrategyArtifact:
     try:
         payload = json.loads(strategy_path.read_text(encoding="utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
-        from model_core.semantics import ArtifactCompatibilityError
-
         raise ArtifactCompatibilityError(f"invalid strategy JSON: {strategy_path}") from exc
+    actual_schema = payload.get("schema_version") if type(payload) is dict else None
+    if actual_schema != STRATEGY_SCHEMA_VERSION:
+        raise ArtifactCompatibilityError(
+            "pre-core-fix/incompatible strategy schema: "
+            f"expected={STRATEGY_SCHEMA_VERSION!r} actual={actual_schema!r}; "
+            "use the read-only legacy audit tool or retrain from scratch"
+        )
     return StrategyArtifact.from_dict(payload)
 
 

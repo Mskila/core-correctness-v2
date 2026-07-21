@@ -25,6 +25,7 @@ from model_core.artifacts import (
 from model_core.config import ModelConfig
 from model_core.engine import AlphaEngine
 from model_core.semantics import (
+    CHECKPOINT_SCHEMA_VERSION,
     CORE_SEMANTICS_VERSION,
     EXECUTION_SEMANTICS_VERSION,
     LABEL_LOOKAHEAD_BARS,
@@ -96,11 +97,17 @@ def _load_candidate(path: pathlib.Path) -> tuple[TrainingRunIdentity, int]:
     except Exception as exc:
         raise ArtifactCompatibilityError(
             "checkpoint deserialize mismatch: "
-            "expected=readable checkpoint-v2 actual=corrupt"
+            f"expected=readable {CHECKPOINT_SCHEMA_VERSION} actual=corrupt"
         ) from exc
-    if type(payload) is not dict or payload.get("checkpoint_schema_version") != "checkpoint-v2":
+    actual_schema = (
+        payload.get("checkpoint_schema_version")
+        if type(payload) is dict
+        else "non-dict"
+    )
+    if actual_schema != CHECKPOINT_SCHEMA_VERSION:
         raise ArtifactCompatibilityError(
-            "checkpoint_schema_version mismatch: expected='checkpoint-v2' actual=legacy"
+            "pre-core-fix/incompatible checkpoint schema: "
+            f"expected={CHECKPOINT_SCHEMA_VERSION!r} actual={actual_schema!r}"
         )
     try:
         run = TrainingRunIdentity.from_dict(payload["run_identity"])
@@ -118,10 +125,11 @@ def _load_candidate(path: pathlib.Path) -> tuple[TrainingRunIdentity, int]:
 
 def _select_resume(identity: ArtifactIdentity) -> tuple[pathlib.Path, TrainingRunIdentity, int] | None:
     symbol_component = _safe_component(identity.symbol)
-    symbol_prefix = f"ckpt_v2_{symbol_component}_"
+    schema_tag = CHECKPOINT_SCHEMA_VERSION.removeprefix("checkpoint-")
+    symbol_prefix = f"ckpt_{schema_tag}_{symbol_component}_"
     candidates = sorted(
         path
-        for path in CHECKPOINT_DIR.glob("ckpt_v2_*.pt")
+        for path in CHECKPOINT_DIR.glob(f"ckpt_{schema_tag}_*.pt")
         if path.name.startswith(symbol_prefix)
     )
     if len(candidates) > 10_000:
@@ -139,7 +147,9 @@ def _select_resume(identity: ArtifactIdentity) -> tuple[pathlib.Path, TrainingRu
         except ArtifactCompatibilityError as exc:
             if first_failure is None:
                 first_failure = exc
-            failures.append(f"{path.name}: incompatible checkpoint-v2")
+            failures.append(
+                f"{path.name}: incompatible {CHECKPOINT_SCHEMA_VERSION}"
+            )
     if compatible:
         step, path, run = max(compatible, key=lambda item: (item[0], item[1].name))
         return path, run, step

@@ -8,7 +8,7 @@ import web.progress as progress
 import web.strategy_file as strategy_file
 from model_core.semantics import ArtifactCompatibilityError
 from web.data_sources.base import Bar
-from tests.unit.test_artifacts import strategy_artifact
+from tests.unit.test_artifacts import current_strategy_artifact as strategy_artifact
 from tests.unit.test_web_strategy_v2 import _timeframe_artifact, _write_artifact
 
 

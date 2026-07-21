@@ -141,6 +141,7 @@ class MT5StrategyRunner:
         from pathlib import Path as _V2Path
         from data_pipeline.validation import normalize_timeframe_name
         from model_core.artifacts import StrategyArtifact
+        from model_core.semantics import STRATEGY_SCHEMA_VERSION
 
         self.symbol_formulas: dict[str, list[int]] = {}
         self.strategy_fingerprints: dict[str, str] = {}
@@ -148,11 +149,17 @@ class MT5StrategyRunner:
         expected_timeframe = normalize_timeframe_name(Config.TIMEFRAME)
         for symbol in Config.SYMBOLS:
             candidates: list[tuple[tuple[datetime, Fraction], str, StrategyArtifact]] = []
-            for path in _V2Path("strategies").glob("best_v2_*.json"):
+            for path in _V2Path("strategies").glob("best_v3_*.json"):
                 try:
                     artifact = StrategyArtifact.from_dict(
                         json.loads(path.read_text(encoding="utf-8"))
                     )
+                    if artifact.schema_version != STRATEGY_SCHEMA_VERSION:
+                        raise ValueError(
+                            "pre-core-fix/incompatible strategy artifact: "
+                            f"expected={STRATEGY_SCHEMA_VERSION!r} "
+                            f"actual={artifact.schema_version!r}"
+                        )
                     identity = artifact.run_identity.artifact_identity
                     if (identity.symbol == symbol and identity.timeframe == expected_timeframe
                             and path.name == artifact.run_identity.strategy_filename()):

@@ -17,11 +17,11 @@ from model_core.semantics import (
 
 
 def test_v2_semantics_constants_are_explicit() -> None:
-    assert CORE_SEMANTICS_VERSION == "4"
+    assert CORE_SEMANTICS_VERSION == "5"
     assert DATA_SCHEMA_VERSION == "ohlcv-v4"
     assert DATA_CANONICALIZATION_VERSION == "float32-le-ns-gap-volume-v2"
     assert LABEL_SEMANTICS_VERSION == "close-t__open-t1-to-open-t2-v2"
-    assert EXECUTION_SEMANTICS_VERSION == "tanh-threshold-cost-liquidate-v3"
+    assert EXECUTION_SEMANTICS_VERSION == "tanh-threshold-cost-liquidate-v4"
     assert LABEL_LOOKAHEAD_BARS == 2
 
 

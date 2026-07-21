@@ -173,7 +173,7 @@ def test_checkpoint_install_rejects_non_cpu_cpu_rng_before_mutation(
 
 def test_checkpoint_identity_mismatch_is_rejected_before_mutation(tmp_path) -> None:
     source = engine(run_identity(42))
-    path = tmp_path / "ckpt_v2_EURUSD_H1_fake_step_0.pt"
+    path = tmp_path / "ckpt_v3_EURUSD_H1_fake_step_0.pt"
     source.save_checkpoint(0, str(path))
     target = engine(run_identity(43))
     before = copy.deepcopy(target.model.state_dict())
