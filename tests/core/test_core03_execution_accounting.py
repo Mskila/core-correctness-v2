@@ -66,7 +66,7 @@ def test_multisymbol_metrics_form_equal_weight_time_portfolio() -> None:
     log_returns = torch.tensor(
         [
             [math.log(1.1), math.log(0.95), math.log(1.01), 0.0, 0.0],
-            [math.log(0.9), math.log(1.05), math.log(1.01), 0.0, 0.0],
+            [math.log(0.89), math.log(1.04), math.log(1.01), 0.0, 0.0],
         ],
         dtype=torch.float64,
     )
@@ -92,7 +92,7 @@ def test_multisymbol_metrics_form_equal_weight_time_portfolio() -> None:
 
     metrics = performance_metrics(result)
     assert metrics.observations == 3
-    assert metrics.total_return == pytest.approx(0.01, abs=1e-12)
+    assert metrics.total_return == pytest.approx((0.995**2) * 1.01 - 1.0, abs=1e-12)
 
 
 @pytest.mark.core
