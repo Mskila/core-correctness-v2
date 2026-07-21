@@ -247,6 +247,8 @@ class ModelConfig:
                 "blocks": cls.WF_N_BLOCKS,
                 "gap": cls.WF_GAP,
                 "min_fold_bars": cls.WF_MIN_FOLD_BARS,
+                "min_trade_events": max(5, cls.WF_MIN_FOLD_BARS // 100),
+                "required_metrics": ["ic", "net_return", "sortino"],
                 "warmup_bars": formula_warmup_bars(cls.MAX_FORMULA_LEN),
                 "label_lookahead": LABEL_LOOKAHEAD_BARS,
             },

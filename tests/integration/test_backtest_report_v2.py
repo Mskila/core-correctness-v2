@@ -25,6 +25,11 @@ from model_core.semantics import (
     BacktestModeError,
 )
 from model_core.vocab import FORMULA_VOCAB, VOCAB_VERSION
+from model_core.validation_protocol import (
+    DatasetLayer,
+    ExperimentProtocol,
+    ProtocolConsumer,
+)
 from run_backtest import run_backtest
 from tests.unit.test_backtest_modes import training_config
 
@@ -150,6 +155,7 @@ def test_replay_report_has_complete_identity_cost_metrics_and_name(lifecycle) ->
         "report_schema",
         "mode",
         "mode_label",
+        "evidence_scope",
         "strategy_fingerprint",
         "artifact_fingerprint",
         "versions",
@@ -171,6 +177,12 @@ def test_replay_report_has_complete_identity_cost_metrics_and_name(lifecycle) ->
     assert report["report_schema"] == "backtest-report-v2"
     assert report["mode"] == "in_sample_replay"
     assert report["mode_label"] == "样本内复盘"
+    assert report["evidence_scope"] == {
+        "classification": "internal_selection_replay",
+        "participated_in_search": True,
+        "registered_final_holdout": False,
+        "selection_metrics_are_final_oos": False,
+    }
     assert report["strategy_fingerprint"] == lifecycle["artifact"].fingerprint
     assert report["training_dataset"] == lifecycle["train_identity"].to_dict()
     assert report["test_dataset"] == lifecycle["train_identity"].to_dict()
@@ -198,6 +210,55 @@ def test_strict_future_oos_report_succeeds_with_explicit_identity(lifecycle) -> 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["mode"] == "out_of_sample_backtest"
     assert report["mode_label"] == "独立样本外回测"
+    assert report["evidence_scope"]["classification"] == (
+        "independent_out_of_sample_evaluation"
+    )
+    assert report["evidence_scope"]["participated_in_search"] is False
+
+
+def test_registered_final_holdout_report_is_distinct_from_generic_oos(
+    lifecycle,
+) -> None:
+    legacy = lifecycle["artifact"]
+    selected = StrategyArtifact.create(
+        run_identity=legacy.run_identity,
+        formula_tokens=legacy.formula_tokens,
+        decoded_formula=legacy.decoded_formula,
+        best_score=legacy.best_score,
+        fold_evidence=legacy.fold_evidence,
+        generated_at=legacy.generated_at,
+        candidate_evaluation_count=11,
+    )
+    protocol = ExperimentProtocol.create(
+        experiment_id=selected.run_identity.run_id,
+        search_dataset=lifecycle["train_identity"],
+        final_holdout=lifecycle["oos_identity"],
+    )
+    protocol.record_candidate_evaluations(11).freeze_strategy(
+        selected.fingerprint
+    )
+    final_dataset = protocol.dataset_for(
+        ProtocolConsumer.FINAL_EVALUATOR,
+        DatasetLayer.FINAL_HOLDOUT,
+    )
+    protocol.record_final_evaluation(final_dataset, metrics={"net_return": 0.1})
+    assert protocol.final_oos_evidence is not None
+    final_strategy = selected.with_final_oos_evidence(protocol.final_oos_evidence)
+    strategy_path = lifecycle["tmp_path"] / "final-strategy.json"
+    strategy_path.write_text(json.dumps(final_strategy.to_dict()), encoding="utf-8")
+
+    report_path = run_backtest(
+        strategy_file=strategy_path,
+        data_file=lifecycle["oos_path"],
+        mode="out_of_sample_backtest",
+        output_dir=lifecycle["tmp_path"] / "final-report",
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report["evidence_scope"]["classification"] == (
+        "independent_final_oos"
+    )
+    assert report["evidence_scope"]["registered_final_holdout"] is True
     assert report["test_dataset"] == lifecycle["oos_identity"].to_dict()
     assert report["ledger_reconciliation"]["absolute_difference"] <= 1e-8
 

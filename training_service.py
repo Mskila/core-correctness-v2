@@ -32,6 +32,7 @@ from model_core.semantics import (
     ArtifactCompatibilityError,
 )
 from model_core.vocab import VOCAB_VERSION
+from model_core.validation_protocol import ProtocolConsumer, require_search_layer
 from model_core.walk_forward import formula_warmup_bars, required_training_bars
 
 
@@ -219,6 +220,12 @@ def _save_strategy(engine: AlphaEngine) -> pathlib.Path | None:
         return existing
 
     def candidate_with_timestamp(generated_at: str) -> StrategyArtifact:
+        history = getattr(engine, "training_history", {})
+        completed_steps = history.get("step", []) if isinstance(history, dict) else []
+        candidate_evaluation_count = max(
+            1,
+            len(completed_steps) * ModelConfig.BATCH_SIZE,
+        )
         try:
             candidate = StrategyArtifact.create(
                 run_identity=run_identity,
@@ -227,6 +234,7 @@ def _save_strategy(engine: AlphaEngine) -> pathlib.Path | None:
                 best_score=float(engine.best_score),
                 fold_evidence=folds,
                 generated_at=generated_at,
+                candidate_evaluation_count=candidate_evaluation_count,
             )
         except Exception as exc:
             try:
@@ -389,6 +397,7 @@ def run_training_session(
     random_seed: int,
 ) -> AlphaEngine:
     """Train or exactly resume one normalized symbol; domain errors propagate."""
+    require_search_layer(data_manager, ProtocolConsumer.TRAINING)
     identity = _artifact_identity(data_manager, random_seed)
     required = required_training_bars(
         warmup_bars=formula_warmup_bars(ModelConfig.MAX_FORMULA_LEN),

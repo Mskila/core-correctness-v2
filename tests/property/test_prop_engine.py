@@ -48,7 +48,7 @@ from model_core.alphagpt import AlphaGPT
 @given(
     n_blocks=st.integers(min_value=2, max_value=8),
     configured_gap=st.integers(min_value=0, max_value=50),
-    min_fold_bars=st.integers(min_value=2, max_value=50),
+    min_fold_bars=st.integers(min_value=200, max_value=250),
     warmup_bars=st.integers(min_value=0, max_value=100),
     label_lookahead=st.integers(min_value=1, max_value=5),
     surplus=st.integers(min_value=0, max_value=100),
@@ -99,7 +99,7 @@ def test_walk_forward_insufficient_data_fails_closed(shortfall):
         warmup_bars=200,
         label_lookahead=2,
         n_blocks=5,
-        min_fold_bars=50,
+        min_fold_bars=200,
         configured_gap=20,
     )
     with pytest.raises(InsufficientWalkForwardDataError):
@@ -107,7 +107,7 @@ def test_walk_forward_insufficient_data_fails_closed(shortfall):
             total_bars=max(0, required - shortfall),
             n_blocks=5,
             configured_gap=20,
-            min_fold_bars=50,
+            min_fold_bars=200,
             warmup_bars=200,
             label_lookahead=2,
         )
@@ -147,12 +147,12 @@ def test_walk_forward_invalid_numeric_configuration_uses_domain_error(
     assert f"value={invalid_value!r}" in message
 
 
-@given(min_fold_bars=st.integers(min_value=-100, max_value=1))
+@given(min_fold_bars=st.integers(min_value=-100, max_value=199))
 @settings(max_examples=20)
 def test_required_training_bars_rejects_unscorable_fold_sizes(min_fold_bars):
     with pytest.raises(
         ValueError,
-        match=r"min_fold_bars must be an integer >= 2",
+        match=r"min_fold_bars must be an integer >= 200",
     ):
         required_training_bars(
             warmup_bars=0,

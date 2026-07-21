@@ -191,7 +191,7 @@ def lifecycle(tmp_path_factory, request: pytest.FixtureRequest):
     patch.setattr(ModelConfig, "TRAIN_STEPS", 4)
     patch.setattr(ModelConfig, "MAX_FORMULA_LEN", 3)
     patch.setattr(ModelConfig, "WF_N_BLOCKS", 3)
-    patch.setattr(ModelConfig, "WF_MIN_FOLD_BARS", 20)
+    patch.setattr(ModelConfig, "WF_MIN_FOLD_BARS", 200)
     patch.setattr(ModelConfig, "WF_GAP", 2)
     _test_registry_warmup(patch)
 

@@ -98,15 +98,21 @@ def test_known_defect_register_has_exact_review_counts_and_no_correctness_oracle
     }
     assert counts == {"P0": 8, "P1": 13, "P2": 8, "P3": 1}
     resolved_core04 = {"F-010", "F-011", "F-012", "F-032", "F-039"}
+    resolved_core05 = {"F-009", "F-026"}
     assert {
         item["id"]
         for item in defects
         if item["status"] == "resolved-core04"
     } == resolved_core04
+    assert {
+        item["id"]
+        for item in defects
+        if item["status"] == "resolved-core05"
+    } == resolved_core05
     assert all(
         item["characterization_policy"] == (
             "regression-covered"
-            if item["id"] in resolved_core04
+            if item["id"] in resolved_core04 | resolved_core05
             else "do-not-goldenize"
         )
         for item in defects

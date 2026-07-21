@@ -28,7 +28,7 @@ from .config import ModelConfig
 from .execution import ExecutionResult, performance_metrics, run_execution
 from .reward import apply_oos_gate, target_bars_per_trade
 from .semantics import DataValidationError
-from .walk_forward import MIN_SCORABLE_FOLD_OBSERVATIONS
+from .walk_forward import MIN_EXECUTION_SEGMENT_OBSERVATIONS
 
 _SORTINO_CLIP        = 20.0
 _TURNOVER_EVENT_THRESHOLD = 0.0
@@ -608,11 +608,11 @@ class MT5Backtest:
             ("val_bars", val_end - val_start),
         )
         for field, length in segment_lengths:
-            if length < MIN_SCORABLE_FOLD_OBSERVATIONS:
+            if length < MIN_EXECUTION_SEGMENT_OBSERVATIONS:
                 raise ValueError(
                     "evaluate_fold invalid boundary: "
                     f"field={field}; expected=at least "
-                    f"{MIN_SCORABLE_FOLD_OBSERVATIONS} observations; "
+                    f"{MIN_EXECUTION_SEGMENT_OBSERVATIONS} observations; "
                     f"actual={length}"
                 )
 
