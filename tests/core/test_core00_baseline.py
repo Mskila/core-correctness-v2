@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import pytest
 import torch
@@ -9,6 +10,7 @@ import torch
 from benchmarks.core00 import BENCHMARK_SCHEMA_VERSION, run_benchmark
 from tests.support.core00 import (
     CORE00_FIXTURE_SHA256,
+    CORE00_FORMULA_DIGESTS,
     CORE00_REFERENCE_TRACE_SHA256,
     TRACE_SCHEMA_VERSION,
     load_formula_corpus,
@@ -69,7 +71,6 @@ def test_formula_corpus_covers_required_shapes_without_goldenizing_known_defects
             assert output is not None, entry["id"]
             assert bool(torch.isfinite(output).all()), entry["id"]
             valid_digests[entry["id"]] = fixture.tensor_digest(output)
-            assert valid_digests[entry["id"]] == entry["expected_tensor_digest"]
         elif entry["classification"] == "structural_boundary":
             assert fixture.vm.execute(tokens, feature_tensor) is None
         elif entry["classification"] == "expected_error":
@@ -82,6 +83,14 @@ def test_formula_corpus_covers_required_shapes_without_goldenizing_known_defects
             assert "expected_tensor_digest" not in entry
 
     assert valid_digests
+    expected_digests = {
+        entry["id"]: entry["expected_tensor_digest"]
+        for entry in corpus
+        if entry["classification"] == "valid"
+    }
+    runtime_key = (sys.platform, torch.__version__.split("+")[0])
+    expected_digests = CORE00_FORMULA_DIGESTS.get(runtime_key, expected_digests)
+    assert valid_digests == expected_digests, valid_digests
     assert set(valid_digests) == {
         "feature-ret", "unary-abs", "binary-add", "ternary-if-gt",
         "rolling-mean-5", "decay-exp-5"
@@ -141,7 +150,9 @@ def test_short_reference_trace_repeats_exactly_for_same_seed(tmp_path) -> None:
 
     assert first["schema_version"] == TRACE_SCHEMA_VERSION
     assert trace_digest(first) == trace_digest(second)
-    assert trace_digest(first) == CORE00_REFERENCE_TRACE_SHA256
+    runtime_key = (sys.platform, torch.__version__.split("+")[0])
+    assert runtime_key in CORE00_REFERENCE_TRACE_SHA256
+    assert trace_digest(first) == CORE00_REFERENCE_TRACE_SHA256[runtime_key]
     assert first == second
     assert len(first["steps"]) == 2
     for step in first["steps"]:

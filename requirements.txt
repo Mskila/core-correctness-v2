@@ -1,35 +1,16 @@
-# AlphaGPT MT5 - Python Dependencies
-# Python 3.10+ required (recommended: 3.11)
-#
-# Installation:
-#   pip3 install -r requirements.txt
-#   # Or use: pip install -r requirements.txt (if pip points to Python 3)
+# Cross-platform AlphaMaster core. Install with:
+#   python -m pip install -r requirements.txt -c constraints-core.txt
+# Python support: >=3.10,<3.13
 
-# ===== Core Dependencies (Required for main pipeline) =====
+torch
+numpy
+pandas
+pyarrow
+matplotlib
+python-dotenv
+loguru
+tqdm
+fastapi
+uvicorn[standard]
 
-# Deep Learning & Numerical Computing
-torch>=2.0.0          # PyTorch for model training and inference
-numpy>=1.24.0         # Numerical operations
-
-# Data Processing
-pandas>=2.0.0         # Data manipulation and analysis
-pyarrow==25.0.0       # Canonical Parquet engine used by training and cache workflows
-
-# MT5 Trading Platform
-MetaTrader5>=5.0.45   # MetaTrader 5 Python API for data and order execution
-
-# Environment & Configuration
-python-dotenv>=1.0.0  # Load .env files
-
-# Logging & Progress
-loguru>=0.7.0         # Structured logging
-tqdm>=4.66.0          # Progress bars
-
-# Training Web UI
-fastapi>=0.110.0
-uvicorn[standard]>=0.27.0
-
-# ===== Optional Dependencies (For experimental scripts) =====
-# See requirements-optional.txt for:
-#   - matplotlib, seaborn (for lord/experiment.py visualization)
-#   - tushare (for times.py Chinese stock market data)
+# Windows trading adapter dependencies are isolated in their own extra file.

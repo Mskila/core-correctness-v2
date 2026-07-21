@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
-import msvcrt
 import os
 from pathlib import Path
 import re
@@ -19,6 +18,11 @@ from typing import BinaryIO, Sequence
 from uuid import uuid4
 
 import torch
+
+try:
+    import msvcrt
+except ImportError:  # POSIX core backtest path
+    msvcrt = None  # type: ignore[assignment]
 
 from backtest_viz import BacktestEngine
 from data_pipeline.parquet_manager import ParquetDataManager
@@ -552,7 +556,22 @@ def _open_owned_read_stream(
 ) -> BinaryIO:
     """Open the exact ordinary Windows file while denying replacement."""
     if os.name != "nt":
-        raise OSError("owned signature reads require Windows handle semantics")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            current = os.fstat(descriptor)
+            if not stat.S_ISREG(current.st_mode):
+                raise OSError("signature path is not an ordinary regular file")
+            if _identity_from_stat(current) != expected_identity:
+                raise FileExistsError(
+                    "signature path no longer names the approved file"
+                )
+            return os.fdopen(descriptor, "rb", buffering=0)
+        except BaseException:
+            os.close(descriptor)
+            raise
+    if msvcrt is None:
+        raise RuntimeError("Windows CRT adapter is unavailable")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = (
         ctypes.c_wchar_p,
@@ -679,6 +698,8 @@ def _reserve_owned_file(
 ) -> BinaryIO:
     """Create and return the exact locked file stream with identity recorded."""
     if os.name == "nt":
+        if msvcrt is None:
+            raise RuntimeError("Windows CRT adapter is unavailable")
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateFileW.restype = ctypes.c_void_p
         handle = kernel32.CreateFileW(
@@ -782,10 +803,18 @@ def _reserve_owned_directory(
             ctypes.WinDLL("kernel32").CloseHandle(handle)
         return
 
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CREAT | os.O_EXCL)
+    os.mkdir(path, 0o700)
+    created_identity = _directory_identity(path)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
         current = os.fstat(descriptor)
-        ownership.append((current.st_dev, current.st_ino))
+        opened_identity = (current.st_dev, current.st_ino)
+        if opened_identity != created_identity:
+            raise FileExistsError("owned directory changed during reservation")
+        ownership.append(opened_identity)
     finally:
         os.close(descriptor)
 
@@ -852,6 +881,12 @@ def _close_windows_handle(handle: int) -> None:
 
 
 def _delete_owned_file(path: Path, owned_identity: tuple[int, int]) -> None:
+    if os.name != "nt":
+        current = path.lstat()
+        if not stat.S_ISREG(current.st_mode) or _identity_from_stat(current) != owned_identity:
+            raise FileExistsError("cleanup path no longer names the owned object")
+        path.unlink()
+        return
     handle = _open_owned_delete_handle(path, owned_identity, directory=False)
     try:
         _dispose_owned_handle(handle)
@@ -867,6 +902,22 @@ def _delete_owned_transaction_tree(
     owned_children: dict[str, tuple[int, int]],
 ) -> None:
     """Delete only manifest-owned children and their locked owning directory."""
+    if os.name != "nt":
+        current = root.lstat()
+        if not stat.S_ISDIR(current.st_mode) or _identity_from_stat(current) != owned_identity:
+            raise FileExistsError("cleanup path no longer names the owned directory")
+        for entry in list(os.scandir(root)):
+            expected_identity = owned_children.get(entry.name)
+            if expected_identity is None:
+                continue
+            entry_path = Path(entry.path)
+            entry_stat = entry_path.lstat()
+            if stat.S_ISREG(entry_stat.st_mode) and _identity_from_stat(entry_stat) == expected_identity:
+                entry_path.unlink()
+        if list(os.scandir(root)):
+            raise OSError("transaction cleanup retained unowned or changed children")
+        root.rmdir()
+        return
     handle = _open_owned_delete_handle(root, owned_identity, directory=True)
     try:
         entries = list(os.scandir(root))
@@ -898,6 +949,17 @@ def _cleanup_owned_empty_directory(
     owned_identity: tuple[int, int],
 ) -> list[BaseException]:
     """Remove an empty directory only while its exact object is locked."""
+    if os.name != "nt":
+        try:
+            current = root.lstat()
+            if not stat.S_ISDIR(current.st_mode) or _identity_from_stat(current) != owned_identity:
+                raise FileExistsError("cleanup path no longer names the owned directory")
+            if list(os.scandir(root)):
+                raise OSError("owned output directory is no longer empty")
+            root.rmdir()
+            return []
+        except BaseException as exc:
+            return [exc]
     try:
         handle = _open_owned_delete_handle(root, owned_identity, directory=True)
     except BaseException as exc:

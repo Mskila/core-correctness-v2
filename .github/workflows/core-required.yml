@@ -1,0 +1,92 @@
+name: core-required
+
+on:
+  pull_request:
+    branches: [codex/core-correctness-v2]
+  push:
+    branches: [codex/core-correctness-v2]
+
+env:
+  ALPHAMASTER_CI_SEED: "42"
+  PYTHONHASHSEED: "42"
+
+jobs:
+  lint-type:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: python -m pip install -r requirements-dev.txt -c constraints-core.txt
+      - run: ruff check model_core data_pipeline tests/core tests/property
+      - run: mypy model_core/versions.py model_core/legacy_audit.py scripts/release_gate.py
+
+  core-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python-version }}", cache: pip}
+      - run: python -m pip install -r requirements-dev.txt -c constraints-core.txt
+      - run: python -c "import pyarrow, pandas; print(pyarrow.__version__, pandas.__version__)"
+      - run: >-
+          python -c "import data_pipeline.parquet_manager, model_core.features,
+          model_core.ops, model_core.vm, model_core.execution, run_backtest;
+          print('linux-core-import-ok')"
+      - run: >-
+          pytest tests/core tests/property
+          --cov=model_core --cov=data_pipeline --cov-report=term-missing
+          --cov-fail-under=45
+
+  windows-core:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: python -m pip install -r requirements-dev.txt -c constraints-core.txt
+      - run: >-
+          pytest tests/unit/test_fetcher_closed_bars.py
+          tests/unit/test_web_static_backtest_contract.py tests/unit/test_runner.py
+          tests/unit/test_web_sidecar.py tests/smoke
+
+  deterministic:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: python -m pip install -r requirements-dev.txt -c constraints-core.txt
+      - run: >-
+          pytest
+          tests/core/test_core00_baseline.py::test_short_reference_trace_repeats_exactly_for_same_seed
+          tests/unit/test_deterministic_resume.py
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: python -m pip install -r requirements-dev.txt -c constraints-core.txt
+      - run: >-
+          pytest tests/integration/test_core_correctness_v2.py
+          tests/integration/test_backtest_report_v2.py::test_replay_report_has_complete_identity_cost_metrics_and_name
+          tests/integration/test_backtest_report_v2.py::test_strict_future_oos_report_succeeds_with_explicit_identity
+          tests/integration/test_backtest_report_v2.py::test_registered_final_holdout_report_is_distinct_from_generic_oos
+      - run: python scripts/release_gate.py
+        env:
+          CORE_REQUIRED_GATES: passed

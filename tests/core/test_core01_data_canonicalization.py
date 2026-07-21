@@ -201,10 +201,11 @@ def test_numeric_parquet_requires_unit_and_matches_mt5_identity_and_tensors(
 
 
 def test_core_requirements_pin_a_parquet_engine() -> None:
-    requirements = (Path(__file__).resolve().parents[2] / "requirements.txt").read_text(
-        encoding="utf-8"
-    )
-    assert "pyarrow==25.0.0" in requirements
+    root = Path(__file__).resolve().parents[2]
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    constraints = (root / "constraints-core.txt").read_text(encoding="utf-8")
+    assert "pyarrow" in requirements
+    assert "pyarrow==25.0.0" in constraints
     assert pyarrow.__version__ == "25.0.0"
 
 
