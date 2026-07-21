@@ -396,15 +396,15 @@ def test_configured_three_blocks_drive_sizing_and_two_fold_topology(
     monkeypatch.setattr(engine_module, "required_training_bars", capture_required)
     monkeypatch.setattr(engine_module, "build_walk_forward_folds", capture_build)
     monkeypatch.setattr(ModelConfig, "WF_N_BLOCKS", 3)
-    monkeypatch.setattr(ModelConfig, "WF_MIN_FOLD_BARS", 2)
+    monkeypatch.setattr(ModelConfig, "WF_MIN_FOLD_BARS", 200)
     monkeypatch.setattr(ModelConfig, "WF_GAP", 2)
 
-    engine = _boundary_engine(_valid_training_manager(bars=30), n_folds=3)
+    engine = _boundary_engine(_valid_training_manager(bars=620), n_folds=3)
     engine.train(end_step=0, verbose_header=False)
 
     assert captured["required_kwargs"]["n_blocks"] == ModelConfig.WF_N_BLOCKS == 3
     assert captured["build_kwargs"]["n_blocks"] == ModelConfig.WF_N_BLOCKS == 3
-    assert captured["required_bars"] == 14
+    assert captured["required_bars"] == 608
     assert len(captured["folds"]) == 2
     assert [fold.fold_index for fold in captured["folds"]] == [0, 1]
 

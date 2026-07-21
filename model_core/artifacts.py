@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import re
+from types import MappingProxyType
 from typing import Any, Iterator
 import uuid
 
@@ -27,6 +28,7 @@ from .semantics import (
     DataValidationError,
 )
 from .vocab import FORMULA_VOCAB, VOCAB_VERSION
+from .validation_protocol import FinalOOSEvidence
 from .vm import validate_formula_structure
 
 
@@ -48,6 +50,17 @@ _STRATEGY_FIELDS = (
     "decoded_formula",
     "best_score",
     "fold_evidence",
+    "generated_at",
+    "fingerprint",
+)
+_STRATEGY_V3_FIELDS = (
+    "schema_version",
+    "run_identity",
+    "formula_tokens",
+    "decoded_formula",
+    "best_score",
+    "selection_evidence",
+    "final_oos_evidence",
     "generated_at",
     "fingerprint",
 )
@@ -183,6 +196,8 @@ _TRAINING_CONFIG_CONTAINER_SCHEMA = {
         "blocks": "at_least_two_int",
         "gap": "nonnegative_int",
         "min_fold_bars": "positive_int",
+        "min_trade_events": "positive_int",
+        "required_metrics": "nonempty_string_list",
         "warmup_bars": "nonnegative_int",
         "label_lookahead": "positive_int",
     },
@@ -1777,6 +1792,137 @@ def _validated_strategy_lineage(
     return validated_run_identity, validated_folds
 
 
+def _selection_metadata_payload(
+    run_identity: TrainingRunIdentity,
+    folds: tuple[FoldEvidence, ...],
+    candidate_evaluation_count: object,
+) -> dict[str, object]:
+    if (
+        type(candidate_evaluation_count) is not int
+        or candidate_evaluation_count < 1
+    ):
+        raise ArtifactCompatibilityError(
+            "candidate_evaluation_count must be an exact positive integer"
+        )
+    config = run_identity.artifact_identity.training_config
+    walk_forward = config["walk_forward"]
+    assert isinstance(walk_forward, Mapping)
+    minimum_fold_bars = walk_forward["min_fold_bars"]
+    assert type(minimum_fold_bars) is int
+    return {
+        "candidate_evaluation_count": candidate_evaluation_count,
+        "random_seed": config["random_seed"],
+        "fold_count": len(folds),
+        "timeframe": run_identity.artifact_identity.timeframe,
+        "protocol": "expanding-window-search-validation",
+        "min_fold_bars": minimum_fold_bars,
+        "minimum_trade_events": walk_forward["min_trade_events"],
+    }
+
+
+def _validated_selection_metadata(
+    value: object,
+    *,
+    run_identity: TrainingRunIdentity,
+    folds: tuple[FoldEvidence, ...],
+) -> Mapping[str, object]:
+    mapping = _require_mapping(value, context="selection_metadata")
+    expected = _selection_metadata_payload(
+        run_identity,
+        folds,
+        mapping.get("candidate_evaluation_count"),
+    )
+    if dict(mapping) != expected:
+        raise ArtifactCompatibilityError(
+            "selection_evidence metadata contradicts training configuration"
+        )
+    return MappingProxyType(expected)
+
+
+def _final_oos_evidence_payload(
+    value: FinalOOSEvidence | None,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return {
+        "experiment_id": value.experiment_id,
+        "strategy_fingerprint": value.strategy_fingerprint,
+        "dataset": value.dataset.to_dict(),
+        "holdout_start_time_ns": value.dataset.start_time_ns,
+        "holdout_end_time_ns": value.dataset.end_time_ns,
+        "evaluated_at": value.evaluated_at,
+        "metrics": dict(value.metrics),
+    }
+
+
+def _validated_final_oos_evidence(
+    value: FinalOOSEvidence | None,
+) -> FinalOOSEvidence | None:
+    if value is None:
+        return None
+    if not isinstance(value, FinalOOSEvidence):
+        raise ArtifactCompatibilityError(
+            "final_oos_evidence must be FinalOOSEvidence or null"
+        )
+    return _final_oos_evidence_from_payload(_final_oos_evidence_payload(value))
+
+
+def _final_oos_evidence_from_payload(value: object) -> FinalOOSEvidence | None:
+    if value is None:
+        return None
+    mapping = _require_mapping(value, context="final_oos_evidence")
+    expected_fields = {
+        "experiment_id",
+        "strategy_fingerprint",
+        "dataset",
+        "holdout_start_time_ns",
+        "holdout_end_time_ns",
+        "evaluated_at",
+        "metrics",
+    }
+    if set(mapping) != expected_fields:
+        raise ArtifactCompatibilityError("final_oos_evidence fields are invalid")
+    experiment_id = mapping["experiment_id"]
+    strategy_fingerprint = mapping["strategy_fingerprint"]
+    if type(experiment_id) is not str or not experiment_id:
+        raise ArtifactCompatibilityError("final_oos_evidence experiment_id is invalid")
+    if type(strategy_fingerprint) is not str or not strategy_fingerprint:
+        raise ArtifactCompatibilityError(
+            "final_oos_evidence strategy_fingerprint is invalid"
+        )
+    dataset = DatasetIdentity.from_dict(
+        _require_mapping(mapping["dataset"], context="final_oos_evidence.dataset")
+    )
+    if (
+        mapping["holdout_start_time_ns"] != dataset.start_time_ns
+        or mapping["holdout_end_time_ns"] != dataset.end_time_ns
+    ):
+        raise ArtifactCompatibilityError(
+            "final_oos_evidence holdout range contradicts dataset identity"
+        )
+    evaluated_at = _validate_generated_at(mapping["evaluated_at"])
+    raw_metrics = _require_mapping(
+        mapping["metrics"],
+        context="final_oos_evidence.metrics",
+    )
+    metrics: dict[str, float] = {}
+    for name, metric in raw_metrics.items():
+        if type(name) is not str or not name:
+            raise ArtifactCompatibilityError("final OOS metric name is invalid")
+        if isinstance(metric, bool) or not _is_exact_operational_real(metric):
+            raise ArtifactCompatibilityError(f"final OOS metric {name!r} is invalid")
+        metrics[name] = float(metric)
+    if not metrics:
+        raise ArtifactCompatibilityError("final OOS metrics must not be empty")
+    return FinalOOSEvidence(
+        experiment_id=experiment_id,
+        strategy_fingerprint=strategy_fingerprint,
+        dataset=dataset,
+        evaluated_at=evaluated_at,
+        metrics=MappingProxyType(metrics),
+    )
+
+
 @dataclass(frozen=True)
 class StrategyArtifact:
     schema_version: str
@@ -1787,13 +1933,15 @@ class StrategyArtifact:
     fold_evidence: tuple[FoldEvidence, ...]
     generated_at: str
     fingerprint: str
+    selection_metadata: Mapping[str, object] | None = None
+    final_oos_evidence: FinalOOSEvidence | None = None
 
     def __post_init__(self) -> None:
         _validate_exact_string(self.schema_version, field="schema_version")
-        if self.schema_version != "strategy-v2":
+        if self.schema_version not in {"strategy-v2", "strategy-v3"}:
             raise ArtifactCompatibilityError(
                 "unknown strategy schema: "
-                "expected='strategy-v2' "
+                "expected='strategy-v2' or 'strategy-v3' "
                 f"actual={_safe_diagnostic(self.schema_version)}"
             )
         validated_run_identity, validated_folds = _validated_strategy_lineage(
@@ -1818,6 +1966,35 @@ class StrategyArtifact:
         ):
             raise ArtifactCompatibilityError("fold_evidence must contain FoldEvidence values")
         object.__setattr__(self, "fold_evidence", validated_folds)
+        if self.schema_version == "strategy-v3":
+            metadata = _validated_selection_metadata(
+                self.selection_metadata,
+                run_identity=validated_run_identity,
+                folds=validated_folds,
+            )
+            object.__setattr__(self, "selection_metadata", metadata)
+            final_evidence = _validated_final_oos_evidence(self.final_oos_evidence)
+            if final_evidence is not None:
+                if final_evidence.experiment_id != validated_run_identity.run_id:
+                    raise ArtifactCompatibilityError(
+                        "final_oos_evidence experiment identity mismatch"
+                    )
+                selection_payload = self._payload_without_fingerprint()
+                selection_payload["final_oos_evidence"] = None
+                expected_strategy_fingerprint = sha256_json(selection_payload)
+                if (
+                    final_evidence.strategy_fingerprint
+                    != expected_strategy_fingerprint
+                ):
+                    raise ArtifactCompatibilityError(
+                        "final_oos_evidence strategy fingerprint does not identify "
+                        "the frozen selection artifact"
+                    )
+            object.__setattr__(self, "final_oos_evidence", final_evidence)
+        elif self.selection_metadata is not None or self.final_oos_evidence is not None:
+            raise ArtifactCompatibilityError(
+                "strategy-v2 cannot contain CORE-05 evidence fields"
+            )
         _validate_generated_at(self.generated_at)
         supplied_fingerprint = _validate_hash(self.fingerprint, field="fingerprint")
         expected_fingerprint = sha256_json(self._payload_without_fingerprint())
@@ -1837,16 +2014,20 @@ class StrategyArtifact:
         best_score: float,
         fold_evidence: Sequence[FoldEvidence],
         generated_at: str,
+        candidate_evaluation_count: int | None = None,
+        final_oos_evidence: FinalOOSEvidence | None = None,
     ) -> "StrategyArtifact":
         if type(formula_tokens) not in (list, tuple):
             raise ArtifactCompatibilityError(
                 "formula_tokens unsupported JSON array type: "
-                f"expected=exact built-in list or tuple actual_type={_safe_type_category(formula_tokens)}"
+                "expected=exact built-in list or tuple "
+                f"actual_type={_safe_type_category(formula_tokens)}"
             )
         if type(fold_evidence) not in (list, tuple):
             raise ArtifactCompatibilityError(
                 "fold_evidence unsupported JSON array type: "
-                f"expected=exact built-in list or tuple actual_type={_safe_type_category(fold_evidence)}"
+                "expected=exact built-in list or tuple "
+                f"actual_type={_safe_type_category(fold_evidence)}"
             )
         validated_run_identity, validated_folds = _validated_strategy_lineage(
             run_identity,
@@ -1854,17 +2035,36 @@ class StrategyArtifact:
         )
         tokens = _validate_formula_tokens(list(formula_tokens))
         decoded = _validate_decoded_formula(tokens, decoded_formula)
-        payload = {
-            "schema_version": "strategy-v2",
+        schema_version = (
+            "strategy-v2" if candidate_evaluation_count is None else "strategy-v3"
+        )
+        selection_metadata = None
+        if schema_version == "strategy-v3":
+            selection_metadata = _selection_metadata_payload(
+                validated_run_identity,
+                validated_folds,
+                candidate_evaluation_count,
+            )
+        payload: dict[str, object] = {
+            "schema_version": schema_version,
             "run_identity": validated_run_identity.to_dict(),
             "formula_tokens": list(tokens),
             "decoded_formula": decoded,
             "best_score": best_score,
-            "fold_evidence": [item.to_dict() for item in validated_folds],
             "generated_at": _validate_generated_at(generated_at),
         }
+        if schema_version == "strategy-v2":
+            payload["fold_evidence"] = [item.to_dict() for item in validated_folds]
+        else:
+            payload["selection_evidence"] = {
+                **selection_metadata,
+                "folds": [item.to_dict() for item in validated_folds],
+            }
+            payload["final_oos_evidence"] = _final_oos_evidence_payload(
+                final_oos_evidence
+            )
         return cls(
-            schema_version="strategy-v2",
+            schema_version=schema_version,
             run_identity=validated_run_identity,
             formula_tokens=tokens,
             decoded_formula=decoded,
@@ -1872,18 +2072,85 @@ class StrategyArtifact:
             fold_evidence=validated_folds,
             generated_at=generated_at,
             fingerprint=sha256_json(payload),
+            selection_metadata=selection_metadata,
+            final_oos_evidence=final_oos_evidence,
+        )
+
+    @property
+    def selection_evidence(self) -> Mapping[str, object]:
+        """Return internal validation evidence, never independent final OOS evidence."""
+        if self.selection_metadata is None:
+            config = self.run_identity.artifact_identity.training_config
+            walk_forward = config["walk_forward"]
+            assert isinstance(walk_forward, Mapping)
+            metadata: dict[str, object] = {
+                "candidate_evaluation_count": 0,
+                "random_seed": config["random_seed"],
+                "fold_count": len(self.fold_evidence),
+                "timeframe": self.run_identity.artifact_identity.timeframe,
+                "protocol": "legacy-fold-evidence-as-selection-only",
+                "min_fold_bars": walk_forward["min_fold_bars"],
+                "minimum_trade_events": walk_forward["min_trade_events"],
+            }
+        else:
+            metadata = dict(self.selection_metadata)
+        metadata["folds"] = self.fold_evidence
+        return MappingProxyType(metadata)
+
+    def with_final_oos_evidence(
+        self,
+        evidence: FinalOOSEvidence,
+    ) -> "StrategyArtifact":
+        """Attach the one final evaluation to this exact frozen strategy."""
+        if self.schema_version != "strategy-v3":
+            raise ArtifactCompatibilityError(
+                "final OOS evidence requires a CORE-05 strategy-v3 artifact"
+            )
+        if self.final_oos_evidence is not None:
+            raise ArtifactCompatibilityError("final holdout is already consumed")
+        if evidence.experiment_id != self.run_identity.run_id:
+            raise ArtifactCompatibilityError(
+                "final OOS evidence requires the same experiment identity"
+            )
+        if evidence.strategy_fingerprint != self.fingerprint:
+            raise ArtifactCompatibilityError(
+                "final OOS evidence requires this frozen strategy fingerprint"
+            )
+        assert self.selection_metadata is not None
+        candidate_count = self.selection_metadata["candidate_evaluation_count"]
+        assert type(candidate_count) is int
+        return StrategyArtifact.create(
+            run_identity=self.run_identity,
+            formula_tokens=self.formula_tokens,
+            decoded_formula=self.decoded_formula,
+            best_score=self.best_score,
+            fold_evidence=self.fold_evidence,
+            generated_at=self.generated_at,
+            candidate_evaluation_count=candidate_count,
+            final_oos_evidence=evidence,
         )
 
     def _payload_without_fingerprint(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema_version": self.schema_version,
             "run_identity": self.run_identity.to_dict(),
             "formula_tokens": list(self.formula_tokens),
             "decoded_formula": self.decoded_formula,
             "best_score": self.best_score,
-            "fold_evidence": [item.to_dict() for item in self.fold_evidence],
             "generated_at": self.generated_at,
         }
+        if self.schema_version == "strategy-v3":
+            assert self.selection_metadata is not None
+            payload["selection_evidence"] = {
+                **dict(self.selection_metadata),
+                "folds": [item.to_dict() for item in self.fold_evidence],
+            }
+            payload["final_oos_evidence"] = _final_oos_evidence_payload(
+                self.final_oos_evidence
+            )
+        else:
+            payload["fold_evidence"] = [item.to_dict() for item in self.fold_evidence]
+        return payload
 
     def to_dict(self) -> dict[str, object]:
         snapshot = _validated_strategy_artifact_snapshot(
@@ -1898,13 +2165,25 @@ class StrategyArtifact:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "StrategyArtifact":
         mapping = _require_mapping(value, context="strategy artifact")
-        _require_exact_fields(mapping, _STRATEGY_FIELDS, context="strategy artifact")
+        if "schema_version" not in mapping:
+            raise ArtifactCompatibilityError(
+                "strategy artifact is missing schema_version"
+            )
         _validate_exact_string(mapping["schema_version"], field="schema_version")
-        if mapping["schema_version"] != "strategy-v2":
+        schema_version = mapping["schema_version"]
+        if schema_version == "strategy-v2":
+            _require_exact_fields(mapping, _STRATEGY_FIELDS, context="strategy artifact")
+        elif schema_version == "strategy-v3":
+            _require_exact_fields(
+                mapping,
+                _STRATEGY_V3_FIELDS,
+                context="strategy artifact",
+            )
+        else:
             raise ArtifactCompatibilityError(
                 "unknown strategy schema: "
-                "expected='strategy-v2' "
-                f"actual={_safe_diagnostic(mapping['schema_version'])}"
+                "expected='strategy-v2' or 'strategy-v3' "
+                f"actual={_safe_diagnostic(schema_version)}"
             )
         run_identity = TrainingRunIdentity.from_dict(
             _require_mapping(mapping["run_identity"], context="run_identity")
@@ -1914,9 +2193,24 @@ class StrategyArtifact:
             tokens,
             mapping["decoded_formula"],
         )
-        raw_folds = mapping["fold_evidence"]
+        selection_metadata = None
+        final_oos_evidence = None
+        if schema_version == "strategy-v2":
+            raw_folds = mapping["fold_evidence"]
+        else:
+            raw_selection = _require_mapping(
+                mapping["selection_evidence"],
+                context="selection_evidence",
+            )
+            raw_folds = raw_selection.get("folds")
+            selection_metadata = {
+                key: item for key, item in raw_selection.items() if key != "folds"
+            }
+            final_oos_evidence = _final_oos_evidence_from_payload(
+                mapping["final_oos_evidence"]
+            )
         if not isinstance(raw_folds, list):
-            raise ArtifactCompatibilityError("fold_evidence must be a JSON list")
+            raise ArtifactCompatibilityError("selection evidence folds must be a JSON list")
         folds = tuple(
             FoldEvidence.from_dict(
                 _require_mapping(item, context=f"fold_evidence[{index}]")
@@ -1937,7 +2231,7 @@ class StrategyArtifact:
                 f"expected={expected_fingerprint!r} actual={supplied_fingerprint!r}"
             )
         return cls(
-            schema_version="strategy-v2",
+            schema_version=schema_version,
             run_identity=run_identity,
             formula_tokens=tokens,
             decoded_formula=decoded_formula,
@@ -1945,6 +2239,8 @@ class StrategyArtifact:
             fold_evidence=folds,
             generated_at=mapping["generated_at"],  # type: ignore[arg-type]
             fingerprint=supplied_fingerprint,
+            selection_metadata=selection_metadata,
+            final_oos_evidence=final_oos_evidence,
         )
 
 
@@ -2119,6 +2415,8 @@ def _validated_strategy_artifact_snapshot(
             fold_evidence=value.fold_evidence,
             generated_at=value.generated_at,
             fingerprint=value.fingerprint,
+            selection_metadata=value.selection_metadata,
+            final_oos_evidence=value.final_oos_evidence,
         )
     except ArtifactCompatibilityError as exc:
         raise ArtifactCompatibilityError(

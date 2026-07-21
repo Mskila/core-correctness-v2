@@ -180,14 +180,14 @@ def test_smallest_builder_fold_is_always_scorable(warmup_bars, configured_gap):
         warmup_bars=warmup_bars,
         label_lookahead=2,
         n_blocks=2,
-        min_fold_bars=2,
+        min_fold_bars=200,
         configured_gap=configured_gap,
     )
     fold = build_walk_forward_folds(
         total_bars=total_bars,
         n_blocks=2,
         configured_gap=configured_gap,
-        min_fold_bars=2,
+        min_fold_bars=200,
         warmup_bars=warmup_bars,
         label_lookahead=2,
     )[0]
@@ -197,7 +197,11 @@ def test_smallest_builder_fold_is_always_scorable(warmup_bars, configured_gap):
         (fold.train_start, fold.train_end),
         (fold.val_start, fold.val_end),
     ):
-        factors[:, start:end] = torch.tensor([[1.0, -1.0]])
+        factors[:, start:end] = torch.where(
+            torch.arange(end - start).unsqueeze(0) % 2 == 0,
+            1.0,
+            -1.0,
+        )
         target_ret[:, start:end] = 0.01
     target_valid = torch.arange(total_bars).unsqueeze(0) < total_bars - 2
     bar_time_ns = (

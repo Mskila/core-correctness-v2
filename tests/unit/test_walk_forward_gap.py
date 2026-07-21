@@ -43,8 +43,8 @@ _HUGE_INTEGERS = [
 ]
 
 
-def test_minimum_scorable_fold_observations_is_explicitly_two() -> None:
-    assert walk_forward_module.MIN_SCORABLE_FOLD_OBSERVATIONS == 2
+def test_minimum_scorable_fold_observations_is_statistically_usable() -> None:
+    assert walk_forward_module.MIN_SCORABLE_FOLD_OBSERVATIONS == 200
 
 
 def test_walk_forward_fold_has_exact_fields() -> None:
@@ -83,10 +83,10 @@ def test_walk_forward_keeps_full_effective_gap_and_expands_training() -> None:
 
 def test_effective_gap_is_never_less_than_label_lookahead() -> None:
     folds = build_walk_forward_folds(
-        total_bars=1200,
+        total_bars=1600,
         n_blocks=5,
         configured_gap=0,
-        min_fold_bars=100,
+        min_fold_bars=200,
         warmup_bars=100,
         label_lookahead=2,
     )
@@ -159,27 +159,27 @@ def test_public_sizing_apis_preserve_approved_operational_topology() -> None:
     ) == 3219
 
 
-def test_required_training_bars_rejects_one_bar_folds() -> None:
+def test_required_training_bars_rejects_two_observation_folds() -> None:
     with pytest.raises(
         ValueError,
-        match=r"min_fold_bars must be an integer >= 2",
+        match=r"min_fold_bars must be an integer >= 200",
     ):
         required_training_bars(
             warmup_bars=0,
             label_lookahead=2,
             n_blocks=2,
-            min_fold_bars=1,
+            min_fold_bars=2,
             configured_gap=2,
         )
 
 
-def test_builder_rejects_one_bar_folds_with_domain_details() -> None:
+def test_builder_rejects_two_observation_folds_with_domain_details() -> None:
     with pytest.raises(InsufficientWalkForwardDataError) as exc_info:
         build_walk_forward_folds(
             total_bars=6,
             n_blocks=2,
             configured_gap=2,
-            min_fold_bars=1,
+            min_fold_bars=2,
             warmup_bars=0,
             label_lookahead=2,
         )
@@ -187,14 +187,14 @@ def test_builder_rejects_one_bar_folds_with_domain_details() -> None:
     message = str(exc_info.value)
     for fragment in (
         "parameter=min_fold_bars",
-        "value=1",
-        "reason=min_fold_bars must be an integer >= 2",
+        "value=2",
+        "reason=min_fold_bars must be an integer >= 200",
         "required=",
         "actual=6",
         "warmup=0",
         "gap=2",
         "blocks=2",
-        "min_fold_bars=1",
+        "min_fold_bars=2",
     ):
         assert fragment in message
 

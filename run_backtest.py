@@ -1387,10 +1387,27 @@ def run_backtest(
 
     generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     mode_label = MODE_LABELS[selected_mode]
+    is_independent = selected_mode is BacktestMode.OUT_OF_SAMPLE_BACKTEST
+    registered_final = (
+        strategy.final_oos_evidence is not None
+        and strategy.final_oos_evidence.dataset == test_identity
+    )
     report: dict[str, object] = {
         "report_schema": REPORT_SCHEMA_VERSION,
         "mode": selected_mode.value,
         "mode_label": mode_label,
+        "evidence_scope": {
+            "classification": (
+                "independent_final_oos"
+                if registered_final
+                else "independent_out_of_sample_evaluation"
+                if is_independent
+                else "internal_selection_replay"
+            ),
+            "participated_in_search": not is_independent,
+            "registered_final_holdout": registered_final,
+            "selection_metrics_are_final_oos": False,
+        },
         "symbol": identity.symbol,
         "timeframe": identity.timeframe,
         "strategy_fingerprint": strategy.fingerprint,

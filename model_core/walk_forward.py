@@ -9,7 +9,8 @@ from model_core.ops import MAX_OPERATOR_LOOKBACK
 from model_core.semantics import InsufficientWalkForwardDataError
 
 
-MIN_SCORABLE_FOLD_OBSERVATIONS = 2
+MIN_SCORABLE_FOLD_OBSERVATIONS = 200
+MIN_EXECUTION_SEGMENT_OBSERVATIONS = 2
 MAX_OPERATIONAL_INTEGER = (1 << 63) - 1
 
 

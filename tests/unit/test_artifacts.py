@@ -192,6 +192,8 @@ def training_config(*, seed: int = 42) -> dict[str, object]:
             "blocks": 5,
             "gap": LABEL_LOOKAHEAD_BARS,
             "min_fold_bars": 200,
+            "min_trade_events": 5,
+            "required_metrics": ["ic", "net_return", "sortino"],
             "warmup_bars": 200,
             "label_lookahead": LABEL_LOOKAHEAD_BARS,
         },
