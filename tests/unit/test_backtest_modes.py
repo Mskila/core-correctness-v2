@@ -18,6 +18,8 @@ from model_core.artifacts import (
 )
 from model_core.semantics import (
     CORE_SEMANTICS_VERSION,
+    DATA_CANONICALIZATION_VERSION,
+    DATA_SCHEMA_VERSION,
     EXECUTION_SEMANTICS_VERSION,
     LABEL_LOOKAHEAD_BARS,
     LABEL_SEMANTICS_VERSION,
@@ -215,7 +217,10 @@ def dataset(
     bars: int = 10,
 ) -> DatasetIdentity:
     return DatasetIdentity(
-        schema_version="ohlcv-v2",
+        schema_version=DATA_SCHEMA_VERSION,
+        canonicalization_version=DATA_CANONICALIZATION_VERSION,
+        time_unit="ns",
+        gap_policy="segment",
         symbol=symbol,
         timeframe=timeframe,
         start_time_ns=start,
@@ -228,6 +233,9 @@ def dataset(
 
 DATASET_FIELDS = (
     "schema_version",
+    "canonicalization_version",
+    "time_unit",
+    "gap_policy",
     "symbol",
     "timeframe",
     "start_time_ns",
@@ -260,7 +268,10 @@ def hostile_dataset(
     **overrides: object,
 ) -> DatasetIdentity:
     values: dict[str, object] = {
-        "schema_version": "ohlcv-v2",
+        "schema_version": DATA_SCHEMA_VERSION,
+        "canonicalization_version": DATA_CANONICALIZATION_VERSION,
+        "time_unit": "ns",
+        "gap_policy": "segment",
         "symbol": "EURUSD",
         "timeframe": "H1",
         "start_time_ns": 1_000,

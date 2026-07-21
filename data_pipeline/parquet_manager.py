@@ -40,7 +40,12 @@ def parse_parquet_filename(path: str | Path) -> tuple[str, str]:
     return match.group(1), match.group(2).upper()
 
 
-def inspect_parquet_file(path: str | Path) -> dict[str, Any]:
+def inspect_parquet_file(
+    path: str | Path,
+    *,
+    numeric_time_unit: str | None = None,
+    gap_policy: str = "segment",
+) -> dict[str, Any]:
     """Inspect a Parquet file only after full canonical validation."""
     parquet_path = Path(path)
     if not parquet_path.exists():
@@ -53,7 +58,8 @@ def inspect_parquet_file(path: str | Path) -> dict[str, Any]:
         pd.read_parquet(parquet_path),
         symbol=symbol,
         timeframe=timeframe,
-        numeric_time_unit="s",
+        numeric_time_unit=numeric_time_unit,
+        gap_policy=gap_policy,
     )
     float32_ohlcv_arrays(dataset.frame)
     span_seconds = (
@@ -65,6 +71,10 @@ def inspect_parquet_file(path: str | Path) -> dict[str, Any]:
         "filename": parquet_path.name,
         "symbol": symbol,
         "timeframe": dataset.identity.timeframe,
+        "canonicalization_version": dataset.identity.canonicalization_version,
+        "time_unit": dataset.identity.time_unit,
+        "gap_policy": dataset.identity.gap_policy,
+        "gap_count": dataset.gap_count,
         "bars": dataset.identity.bars,
         "years_h1": years,
         "valid": True,
@@ -84,10 +94,15 @@ class ParquetDataManager:
         self,
         file_path: str | Path,
         required_bars: int | None = None,
+        *,
+        numeric_time_unit: str | None = None,
+        gap_policy: str = "segment",
     ) -> None:
         self.file_path = Path(file_path)
         self.symbol, self.timeframe = parse_parquet_filename(self.file_path)
         self.required_bars = required_bars
+        self.numeric_time_unit = numeric_time_unit
+        self.gap_policy = gap_policy
         self._clear_loaded_state()
 
     def _clear_loaded_state(self) -> None:
@@ -95,6 +110,7 @@ class ParquetDataManager:
         self._target_ret: torch.Tensor | None = None
         self._target_valid: torch.Tensor | None = None
         self._data_identities: tuple[DatasetIdentity, ...] | None = None
+        self._segment_ids: torch.Tensor | None = None
 
     def load(self) -> None:
         self._clear_loaded_state()
@@ -102,7 +118,8 @@ class ParquetDataManager:
             pd.read_parquet(self.file_path),
             symbol=self.symbol,
             timeframe=self.timeframe,
-            numeric_time_unit="s",
+            numeric_time_unit=self.numeric_time_unit,
+            gap_policy=self.gap_policy,
         )
         if self.required_bars is not None:
             assert_minimum_bars(
@@ -122,11 +139,15 @@ class ParquetDataManager:
             dtype=torch.int64,
         )
 
-        target_ret, target_valid = compute_forward_open_returns(raw["open"])
+        segment_ids = torch.tensor(dataset.segment_ids[None, :], dtype=torch.int64)
+        target_ret, target_valid = compute_forward_open_returns(
+            raw["open"], segment_ids
+        )
         self._raw_dict = raw
         self._target_ret = target_ret
         self._target_valid = target_valid
         self._data_identities = (dataset.identity,)
+        self._segment_ids = segment_ids
         logger.info(
             f"[数据] 已加载 {self.symbol} {self.timeframe}，"
             f"共 {raw['open'].shape[1]} 根K线，文件 {self.file_path.name}"
@@ -142,6 +163,7 @@ class ParquetDataManager:
             or self._target_ret is None
             or self._target_valid is None
             or self._data_identities is None
+            or self._segment_ids is None
         ):
             raise RuntimeError("Data not loaded. Call ParquetDataManager.load() first.")
 
@@ -176,3 +198,8 @@ class ParquetDataManager:
     def data_identities(self) -> tuple[DatasetIdentity, ...]:
         self._ensure_loaded()
         return self._data_identities  # type: ignore[return-value]
+
+    @property
+    def segment_ids(self) -> torch.Tensor:
+        self._ensure_loaded()
+        return self._segment_ids.clone()  # type: ignore[union-attr]

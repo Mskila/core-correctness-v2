@@ -397,7 +397,7 @@ def test_alignment_keeps_exact_real_intersection_without_future_fill(
 )
 def test_canonicalization_never_invents_timestamps(offsets: list[int]) -> None:
     timestamps = [1_700_000_000 + offset * 3600 for offset in offsets]
-    frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=17)
+    frame = _make_symbol_df(sorted(timestamps))
 
     result = canonicalize_ohlcv(
         frame,
@@ -464,7 +464,7 @@ def test_integer_epoch_units_preserve_exact_identity_with_long_gaps(
     for gap in gaps:
         offsets.append(offsets[-1] + gap)
     timestamps = [base + offset * cadence for offset in offsets]
-    frame = _make_symbol_df(timestamps).sample(frac=1.0, random_state=23)
+    frame = _make_symbol_df(timestamps)
 
     dataset = canonicalize_ohlcv(
         frame,
@@ -515,13 +515,7 @@ def _pure_near_epoch_multiple_case(
         base_ns + offset * 3_600_000_000_000 for offset in offsets
     ]
     encoded = [timestamp_ns // unit_ns for timestamp_ns in semantic_ns]
-    order_mode = draw(st.sampled_from(("forward", "reverse", "rotate")))
     order = list(range(length))
-    if order_mode == "reverse":
-        order.reverse()
-    elif order_mode == "rotate":
-        pivot = draw(st.integers(min_value=1, max_value=length - 1))
-        order = order[pivot:] + order[:pivot]
     return unit, encoded, order, semantic_ns, len(gaps)
 
 

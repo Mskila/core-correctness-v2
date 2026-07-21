@@ -14,6 +14,8 @@ import model_core.artifacts as artifacts_module
 from model_core.config import ModelConfig
 from model_core.semantics import (
     CORE_SEMANTICS_VERSION,
+    DATA_CANONICALIZATION_VERSION,
+    DATA_SCHEMA_VERSION,
     EXECUTION_SEMANTICS_VERSION,
     LABEL_LOOKAHEAD_BARS,
     LABEL_SEMANTICS_VERSION,
@@ -44,7 +46,10 @@ def dataset_identity(
     time_fingerprint: str = "b" * 64,
 ) -> DatasetIdentity:
     return DatasetIdentity(
-        schema_version="ohlcv-v2",
+        schema_version=DATA_SCHEMA_VERSION,
+        canonicalization_version=DATA_CANONICALIZATION_VERSION,
+        time_unit="ns",
+        gap_policy="segment",
         symbol=symbol,
         timeframe=timeframe,
         start_time_ns=start,
@@ -57,6 +62,9 @@ def dataset_identity(
 
 DATASET_FIELDS = (
     "schema_version",
+    "canonicalization_version",
+    "time_unit",
+    "gap_policy",
     "symbol",
     "timeframe",
     "start_time_ns",
@@ -100,7 +108,10 @@ def instrumented_dataset_identity(
 
     return (
         InstrumentedDatasetIdentity(
-            schema_version="ohlcv-v2",
+            schema_version=DATA_SCHEMA_VERSION,
+            canonicalization_version=DATA_CANONICALIZATION_VERSION,
+            time_unit="ns",
+            gap_policy="segment",
             symbol="EURUSD",
             timeframe="H1",
             start_time_ns=1_000,
@@ -4154,7 +4165,7 @@ def test_raw_json_load_rejects_same_and_conflicting_root_duplicates(
     [
         ("run_id", None, "0" * 32),
         ("core_semantics_version", "2", "1"),
-        ("schema_version", "ohlcv-v2", "legacy-dataset"),
+        ("schema_version", "ohlcv-v3", "legacy-dataset"),
         ("batch_size", 192, 1),
         ("coeff_max", ModelConfig.ENTROPY_COEFF_MAX, -1.0),
         ("fold_index", 0, 99),
