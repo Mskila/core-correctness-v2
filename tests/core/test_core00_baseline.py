@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import pytest
+import torch
 import torch
 
 from benchmarks.core00 import BENCHMARK_SCHEMA_VERSION, run_benchmark
@@ -141,7 +143,9 @@ def test_short_reference_trace_repeats_exactly_for_same_seed(tmp_path) -> None:
 
     assert first["schema_version"] == TRACE_SCHEMA_VERSION
     assert trace_digest(first) == trace_digest(second)
-    assert trace_digest(first) == CORE00_REFERENCE_TRACE_SHA256
+    runtime_key = (sys.platform, torch.__version__.split("+")[0])
+    assert runtime_key in CORE00_REFERENCE_TRACE_SHA256
+    assert trace_digest(first) == CORE00_REFERENCE_TRACE_SHA256[runtime_key]
     assert first == second
     assert len(first["steps"]) == 2
     for step in first["steps"]:

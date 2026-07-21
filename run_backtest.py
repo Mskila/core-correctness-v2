@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
-import msvcrt
 import os
 from pathlib import Path
 import re
@@ -19,6 +18,11 @@ from typing import BinaryIO, Sequence
 from uuid import uuid4
 
 import torch
+
+try:
+    import msvcrt
+except ImportError:  # POSIX core backtest path
+    msvcrt = None  # type: ignore[assignment]
 
 from backtest_viz import BacktestEngine
 from data_pipeline.parquet_manager import ParquetDataManager
@@ -552,7 +556,22 @@ def _open_owned_read_stream(
 ) -> BinaryIO:
     """Open the exact ordinary Windows file while denying replacement."""
     if os.name != "nt":
-        raise OSError("owned signature reads require Windows handle semantics")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            current = os.fstat(descriptor)
+            if not stat.S_ISREG(current.st_mode):
+                raise OSError("signature path is not an ordinary regular file")
+            if _identity_from_stat(current) != expected_identity:
+                raise FileExistsError(
+                    "signature path no longer names the approved file"
+                )
+            return os.fdopen(descriptor, "rb", buffering=0)
+        except BaseException:
+            os.close(descriptor)
+            raise
+    if msvcrt is None:
+        raise RuntimeError("Windows CRT adapter is unavailable")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = (
         ctypes.c_wchar_p,
@@ -679,6 +698,8 @@ def _reserve_owned_file(
 ) -> BinaryIO:
     """Create and return the exact locked file stream with identity recorded."""
     if os.name == "nt":
+        if msvcrt is None:
+            raise RuntimeError("Windows CRT adapter is unavailable")
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateFileW.restype = ctypes.c_void_p
         handle = kernel32.CreateFileW(
