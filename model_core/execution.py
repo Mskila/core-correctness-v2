@@ -146,8 +146,8 @@ def _validate_additive_component_preservation(
 
 def factor_to_position(factors: Tensor, *, min_exposure: float) -> Tensor:
     """Convert finite factors to continuous positions with a neutral band."""
-    if not math.isfinite(min_exposure) or min_exposure < 0.0:
-        raise DataValidationError("min_exposure must be finite and non-negative")
+    if not math.isfinite(min_exposure) or not 0.0 <= min_exposure < 1.0:
+        raise DataValidationError("min_exposure must satisfy 0 <= min_exposure < 1")
     _validate_supported_device(factors.device, context="factors")
     _validate_supported_float_tensor(factors, name="factors")
     if not bool(torch.isfinite(factors).all()):

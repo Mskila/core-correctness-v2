@@ -89,6 +89,7 @@ _REQUIRED_TRAINING_CONFIG_FIELDS = {
     "train_steps",
     "max_formula_len",
     "reward",
+    "timeframe_reward",
     "entropy",
     "elite",
     "restart",
@@ -105,7 +106,7 @@ _TRAINING_CONFIG_SCALAR_SCHEMA = {
     "train_steps": "positive_int",
     "max_formula_len": "positive_int",
     "cost_rate": "nonnegative_number",
-    "neutral_band": "unit_number",
+    "neutral_band": "unit_interval_exclusive",
     "random_seed": "nonnegative_int",
 }
 _TRAINING_CONFIG_CONTAINER_SCHEMA = {
@@ -122,6 +123,8 @@ _TRAINING_CONFIG_CONTAINER_SCHEMA = {
         "ic_gate_thresh": "nonnegative_number",
         "ic_gate_mult": "nonnegative_number",
         "ic_neg_mult": "nonnegative_number",
+        "ic_gate_scale_floor": "nonnegative_number",
+        "oos_gate_scale": "nonnegative_number",
         "ema_baseline": "bool",
         "ema_decay": "unit_number",
         "ema_warmup": "nonnegative_int",
@@ -132,6 +135,11 @@ _TRAINING_CONFIG_CONTAINER_SCHEMA = {
         "half_consistency_bonus": "bool",
         "beta_neutral_thresh": "unit_number",
         "beta_neutral_light_thresh": "unit_number",
+    },
+    "timeframe_reward": {
+        "timeframe": "nonempty_string",
+        "target_trades_per_day": "positive_number",
+        "target_bars_per_trade": "positive_number",
     },
     "entropy": {
         "coeff_max": "nonnegative_number",
@@ -762,15 +770,35 @@ def _validate_config_value(value: object, *, rule: str, path: str) -> None:
                 actual=value,
             )
         return
-    if rule in {"nonnegative_number", "unit_number"}:
+    if rule in {
+        "positive_number",
+        "nonnegative_number",
+        "unit_number",
+        "unit_interval_exclusive",
+    }:
         if not _is_exact_operational_real(value):
             _config_value_error(path, expected="finite number", actual=value)
         assert type(value) in (int, float)
-        if value < 0 or (rule == "unit_number" and value > 1):
+        invalid = (
+            value <= 0
+            if rule == "positive_number"
+            else value < 0
+            or (rule == "unit_number" and value > 1)
+            or (rule == "unit_interval_exclusive" and value >= 1)
+        )
+        if invalid:
             expected = (
-                "finite number >= 0"
-                if rule == "nonnegative_number"
-                else "number in [0, 1]"
+                "finite number > 0"
+                if rule == "positive_number"
+                else (
+                    "finite number >= 0"
+                    if rule == "nonnegative_number"
+                    else (
+                        "number in [0, 1]"
+                        if rule == "unit_number"
+                        else "number in [0, 1)"
+                    )
+                )
             )
             _config_value_error(path, expected=expected, actual=value)
         return
@@ -879,6 +907,25 @@ def _validate_training_config_fields(value: Mapping[str, object]) -> None:
             "training_config.walk_forward.label_lookahead",
             expected=str(LABEL_LOOKAHEAD_BARS),
             actual=walk_forward["label_lookahead"],
+        )
+    timeframe_reward = value["timeframe_reward"]
+    assert isinstance(timeframe_reward, Mapping)
+    from model_core.reward import target_bars_per_trade
+
+    try:
+        expected_target = target_bars_per_trade(
+            timeframe_reward["timeframe"],
+            timeframe_reward["target_trades_per_day"],
+        )
+    except DataValidationError as exc:
+        raise ArtifactCompatibilityError(
+            "training_config.timeframe_reward is invalid"
+        ) from exc
+    if timeframe_reward["target_bars_per_trade"] != expected_target:
+        _config_value_error(
+            "training_config.timeframe_reward.target_bars_per_trade",
+            expected=str(expected_target),
+            actual=timeframe_reward["target_bars_per_trade"],
         )
 
 
@@ -1135,6 +1182,14 @@ class ArtifactIdentity:
         )
         _reject_environment_config(config)
         _validate_training_config_fields(config)
+        timeframe_reward = config["timeframe_reward"]
+        assert isinstance(timeframe_reward, Mapping)
+        if timeframe_reward["timeframe"] != self.timeframe:
+            raise ArtifactCompatibilityError(
+                "training_config.timeframe_reward.timeframe mismatch: "
+                f"expected={_safe_diagnostic(self.timeframe)} "
+                f"actual={_safe_diagnostic(timeframe_reward['timeframe'])}"
+            )
         if not isinstance(config, _FrozenDict):
             canonical_json_bytes(config)
         frozen_config = _json_value(

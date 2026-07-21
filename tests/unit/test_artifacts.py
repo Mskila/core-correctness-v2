@@ -138,6 +138,8 @@ def training_config(*, seed: int = 42) -> dict[str, object]:
             "ic_gate_thresh": 0.01,
             "ic_gate_mult": 1.15,
             "ic_neg_mult": 0.75,
+            "ic_gate_scale_floor": 0.0,
+            "oos_gate_scale": 0.5,
             "ema_baseline": True,
             "ema_decay": 0.95,
             "ema_warmup": 10,
@@ -148,6 +150,11 @@ def training_config(*, seed: int = 42) -> dict[str, object]:
             "half_consistency_bonus": True,
             "beta_neutral_thresh": 0.85,
             "beta_neutral_light_thresh": 0.70,
+        },
+        "timeframe_reward": {
+            "timeframe": "H1",
+            "target_trades_per_day": 2.0,
+            "target_bars_per_trade": 12.0,
         },
         "entropy": actual_entropy_config(),
         "elite": {
@@ -1637,6 +1644,14 @@ def test_verify_artifact_identity_reports_each_mismatch(field: str, value: str) 
         changes["training_dataset"] = replace(expected.training_dataset, symbol=value)
     elif field == "timeframe":
         changes["training_dataset"] = replace(expected.training_dataset, timeframe=value)
+        changed_config = training_config()
+        changed_config["timeframe_reward"] = {
+            "timeframe": value,
+            "target_trades_per_day": 2.0,
+            "target_bars_per_trade": 3.0,
+        }
+        changes["training_config"] = changed_config
+        changes["training_config_hash"] = sha256_json(changed_config)
     elif field == "training_config_hash":
         changed_config = training_config(seed=43)
         changes["training_config"] = changed_config
@@ -4164,7 +4179,7 @@ def test_raw_json_load_rejects_same_and_conflicting_root_duplicates(
     ("key", "value", "earlier_value"),
     [
         ("run_id", None, "0" * 32),
-        ("core_semantics_version", "2", "1"),
+        ("core_semantics_version", "3", "2"),
         ("schema_version", "ohlcv-v3", "legacy-dataset"),
         ("batch_size", 192, 1),
         ("coeff_max", ModelConfig.ENTROPY_COEFF_MAX, -1.0),

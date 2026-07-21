@@ -8,7 +8,13 @@ from fastapi.testclient import TestClient
 import web.app as web_app
 import web.progress as progress
 import web.strategy_file as strategy_file
-from model_core.artifacts import ArtifactIdentity, StrategyArtifact, TrainingRunIdentity
+from model_core.artifacts import (
+    ArtifactIdentity,
+    StrategyArtifact,
+    TrainingRunIdentity,
+    sha256_json,
+)
+from model_core.reward import target_bars_per_trade
 from model_core.vocab import FORMULA_VOCAB
 from tests.unit.test_artifacts import strategy_artifact
 from web.strategy_file import inspect_strategy_file
@@ -28,6 +34,12 @@ def _timeframe_artifact(
     template = strategy_artifact()
     source = template.run_identity.artifact_identity
     dataset = replace(source.training_dataset, timeframe=timeframe)
+    config = source.to_dict()["training_config"]
+    config["timeframe_reward"] = {
+        "timeframe": timeframe,
+        "target_trades_per_day": 2.0,
+        "target_bars_per_trade": target_bars_per_trade(timeframe, 2.0),
+    }
     identity = ArtifactIdentity(
         core_semantics_version=source.core_semantics_version,
         vocab_version=source.vocab_version,
@@ -36,8 +48,8 @@ def _timeframe_artifact(
         symbol=source.symbol,
         timeframe=timeframe,
         training_dataset=dataset,
-        training_config=source.training_config,
-        training_config_hash=source.training_config_hash,
+        training_config=config,
+        training_config_hash=sha256_json(config),
     )
     run = (
         TrainingRunIdentity.create(identity)

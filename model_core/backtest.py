@@ -26,6 +26,7 @@ from torch import Tensor
 from config import Config
 from .config import ModelConfig
 from .execution import ExecutionResult, performance_metrics, run_execution
+from .reward import apply_oos_gate, target_bars_per_trade
 from .semantics import DataValidationError
 from .walk_forward import MIN_SCORABLE_FOLD_OBSERVATIONS
 
@@ -149,8 +150,22 @@ def compute_ic_metrics(
 class MT5Backtest:
     """MT5 组合级回测评估器。"""
 
-    def __init__(self, cost_rate: float = 0.0001):
+    def __init__(
+        self,
+        cost_rate: float = 0.0001,
+        *,
+        timeframe: str = "H1",
+        target_trades_per_day: float = 2.0,
+        oos_gate_scale: float = 0.5,
+    ):
         self.cost_rate = cost_rate
+        self.timeframe = timeframe
+        self.target_trades_per_day = target_trades_per_day
+        self.target_bars_per_trade = target_bars_per_trade(
+            timeframe,
+            target_trades_per_day,
+        )
+        self.oos_gate_scale = oos_gate_scale
 
     @staticmethod
     def _promoted_finite_metric(
@@ -359,14 +374,11 @@ class MT5Backtest:
     def _turnover_quality(
         self, activity: tuple[int, list[int], list[int]]
     ) -> float:
-        """交易频率质量奖励（每天约 1 笔为最优）。
-
-        目标：每 12 bar 一笔（H1 每天约一笔）。
-        """
+        """Score activity against the configured per-day target."""
         total_bars, event_counts, all_runs = activity
         total_trades = sum(event_counts)
 
-        target_trades = total_bars / 12.0
+        target_trades = total_bars / self.target_bars_per_trade
         actual_ratio  = total_trades / max(target_trades, 1.0)
 
         if actual_ratio <= 0:
@@ -651,9 +663,7 @@ class MT5Backtest:
         """在指定训练/验证切片上计算组合多目标得分。
 
         train_score：用于 REINFORCE 梯度更新（in-sample 多目标）。
-        val_score：用于选冠军，加入 OOS Sortino 门控：
-          - OOS Sortino <= 0：乘以 0.1~0.5 惩罚，强制冠军必须在验证段盈利
-          - OOS Sortino > 0：乘以最多 1.2 奖励
+        val_score：用于选冠军，加入符号无关的加法 OOS Sortino 门控。
         """
         self._validate_fold_request(
             factors,
@@ -692,13 +702,12 @@ class MT5Backtest:
             *val_values, val_result, eval_bars=val_end - val_start
         )
         oos_sor = performance_metrics(val_result).sortino
-        if oos_sor <= 0:
-            # OOS亏损：重惩罚（Sortino=-1 → mult=0.1；Sortino=0 → mult=0.5）
-            mult = max(0.1, 0.5 + oos_sor * 0.4)
-        else:
-            # OOS盈利：轻奖励（最多+20%）
-            mult = min(1.2, 1.0 + oos_sor * 0.1)
-        val_score = base_val * mult
+        gate = apply_oos_gate(
+            float(base_val.item()),
+            oos_sor,
+            scale=self.oos_gate_scale,
+        )
+        val_score = base_val.new_tensor(gate.final)
 
         return (
             self._require_finite_public_score(train_score),

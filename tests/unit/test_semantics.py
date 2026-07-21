@@ -17,7 +17,7 @@ from model_core.semantics import (
 
 
 def test_v2_semantics_constants_are_explicit() -> None:
-    assert CORE_SEMANTICS_VERSION == "2"
+    assert CORE_SEMANTICS_VERSION == "3"
     assert DATA_SCHEMA_VERSION == "ohlcv-v3"
     assert DATA_CANONICALIZATION_VERSION == "float32-le-ns-gap-v1"
     assert LABEL_SEMANTICS_VERSION == "close-t__open-t1-to-open-t2-v2"

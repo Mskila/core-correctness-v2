@@ -356,6 +356,12 @@ def test_checkpoint_lord_mismatch_is_rejected_before_state_installation(
         ("timeframe", lambda value: (
             value.__setitem__("timeframe", "D1"),
             value["training_dataset"].__setitem__("timeframe", "D1"),
+            value["training_config"]["timeframe_reward"].update(
+                {"timeframe": "D1", "target_bars_per_trade": 0.5}
+            ),
+            value.__setitem__(
+                "training_config_hash", sha256_json(value["training_config"])
+            ),
         )),
         ("data_fingerprint", lambda value: value["training_dataset"].__setitem__(
             "data_fingerprint", "c" * 64
