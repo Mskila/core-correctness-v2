@@ -7,4 +7,3 @@ def publish_training_history(engine):
 
 
 __all__ = ["publish_training_history"]
-

@@ -45,4 +45,3 @@ class ErrorTelemetry:
                 "counts": dict(sorted(self._counts.items())),
                 "messages": [dict(row) for row in self._messages],
             }
-

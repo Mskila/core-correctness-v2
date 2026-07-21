@@ -19,4 +19,3 @@ def evaluate_training_formula(vm, formula, features, *, step: int, index: int):
 
 
 __all__ = ["evaluate_training_formula"]
-
