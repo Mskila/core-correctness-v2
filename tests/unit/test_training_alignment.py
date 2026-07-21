@@ -36,7 +36,11 @@ from model_core.semantics import (
     DataValidationError,
     InsufficientWalkForwardDataError,
 )
-from model_core.vm import StackVM
+from model_core.vm import (
+    FormulaErrorKind,
+    FormulaEvaluationError,
+    StackVM,
+)
 from model_core.walk_forward import WalkForwardFold
 from tests.unit.test_artifacts import (
     artifact_identity,
@@ -1170,6 +1174,44 @@ def test_chunk_boundary_publishes_full_canonical_history(monkeypatch, tmp_path) 
     }
     assert payload["step"] == [0]
     assert calls["checkpoint"] == 1
+
+
+def test_training_records_structured_formula_error_telemetry(
+    monkeypatch, tmp_path
+) -> None:
+    engine, factor, _calls, _before = _failure_training_engine(
+        monkeypatch, tmp_path, lambda _formula, _features: factor.clone()
+    )
+    calls = 0
+
+    def evaluate(formula, _features):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise FormulaEvaluationError(
+                formula=formula,
+                token_index=0,
+                operator="RET",
+                error_kind=FormulaErrorKind.NONFINITE,
+                detail="fixed nonfinite witness",
+            )
+        return factor.clone()
+
+    engine.vm = SimpleNamespace(evaluate=evaluate)
+    engine.train(end_step=1, verbose_header=False)
+
+    counts = engine.training_history["formula_error_counts"][-1]
+    assert counts == {
+        "invalid_formula": 0,
+        "domain_error": 0,
+        "nonfinite": 1,
+        "shape_error": 0,
+        "operator_error": 0,
+    }
+    samples = engine.training_history["formula_error_samples"][-1]
+    assert len(samples) == 1
+    assert "kind=nonfinite" in samples[0]
+    assert "fixed nonfinite witness" in samples[0]
 
 
 def _install_legacy_final_strategy_oracle(

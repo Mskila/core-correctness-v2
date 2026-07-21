@@ -156,4 +156,4 @@ def test_min_exposure_accepts_documented_range(valid: float) -> None:
 
 @pytest.mark.core
 def test_core02_bumps_training_semantics_version() -> None:
-    assert CORE_SEMANTICS_VERSION == "3"
+    assert int(CORE_SEMANTICS_VERSION) >= 3

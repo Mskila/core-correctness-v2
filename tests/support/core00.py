@@ -22,7 +22,7 @@ from model_core.vm import StackVM
 
 
 TRACE_SCHEMA_VERSION = "core00-reference-trace-v1"
-CORE00_REFERENCE_TRACE_SHA256 = "fc8360a90919d7979db661877ff60efdeb02a7b55e10bde7aa9ce7c9c6d52b01"
+CORE00_REFERENCE_TRACE_SHA256 = "eac1b45fd5f979d968d6422deddc538fde2f868c8e96a5bcf9d2e84a4e9c64cc"
 CORE00_FIXTURE_SHA256 = "2fa10bf75e68532f2177bb2b982842e7a4db470837a782a1004aeed4d0e5468e"
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 

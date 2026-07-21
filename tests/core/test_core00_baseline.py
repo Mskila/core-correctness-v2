@@ -72,6 +72,10 @@ def test_formula_corpus_covers_required_shapes_without_goldenizing_known_defects
             assert valid_digests[entry["id"]] == entry["expected_tensor_digest"]
         elif entry["classification"] == "structural_boundary":
             assert fixture.vm.execute(tokens, feature_tensor) is None
+        elif entry["classification"] == "expected_error":
+            assert fixture.vm.execute(tokens, feature_tensor) is None
+            assert fixture.vm.last_error is not None
+            assert fixture.vm.last_error.error_kind.value == entry["expected_error_kind"]
         else:
             assert entry["classification"] == "known_defect"
             assert entry["known_defect_ids"]
@@ -79,7 +83,8 @@ def test_formula_corpus_covers_required_shapes_without_goldenizing_known_defects
 
     assert valid_digests
     assert set(valid_digests) == {
-        "feature-ret", "unary-abs", "binary-add", "ternary-if-gt", "rolling-mean-5"
+        "feature-ret", "unary-abs", "binary-add", "ternary-if-gt",
+        "rolling-mean-5", "decay-exp-5"
     }
 
 
@@ -92,8 +97,20 @@ def test_known_defect_register_has_exact_review_counts_and_no_correctness_oracle
         for priority in ("P0", "P1", "P2", "P3")
     }
     assert counts == {"P0": 8, "P1": 13, "P2": 8, "P3": 1}
-    assert all(item["status"] == "known-defect" for item in defects)
-    assert all(item["characterization_policy"] == "do-not-goldenize" for item in defects)
+    resolved_core04 = {"F-010", "F-011", "F-012", "F-032", "F-039"}
+    assert {
+        item["id"]
+        for item in defects
+        if item["status"] == "resolved-core04"
+    } == resolved_core04
+    assert all(
+        item["characterization_policy"] == (
+            "regression-covered"
+            if item["id"] in resolved_core04
+            else "do-not-goldenize"
+        )
+        for item in defects
+    )
     forbidden = {"expected", "expected_value", "golden", "accepted_behavior"}
     assert all(forbidden.isdisjoint(item) for item in defects)
     expected_packages = {

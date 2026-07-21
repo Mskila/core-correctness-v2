@@ -4,8 +4,8 @@
   {"id":"binary-add","category":"binary","classification":"valid","tokens":["RET","RET5","ADD"],"expected_tensor_digest":"dbe2ef01805a856407312ddcaad4a019f7bcaa483c44daa697160260a6215d5b"},
   {"id":"ternary-if-gt","category":"ternary","classification":"valid","tokens":["RET","RET5","RET20","IF_GT"],"expected_tensor_digest":"681b120f4f122b2e33e4fef954f94eb54be5d3cf120927c0f158c2e864dbfaef"},
   {"id":"rolling-mean-5","category":"rolling","classification":"valid","tokens":["RET","TS_MEAN_5"],"expected_tensor_digest":"3cd6acba8609d2d5ece1669a2eac7a9b0ca744fc50724ad360ffe7835e617789"},
-  {"id":"decay-exp-5","category":"ts_decay","classification":"known_defect","known_defect_ids":["F-010"],"tokens":["RET","TS_DECAY_EXP_5"]},
-  {"id":"division-zero-prone","category":"nonfinite_prone","classification":"known_defect","known_defect_ids":["F-012"],"tokens":["RET","RET5","DIV"]},
+  {"id":"decay-exp-5","category":"ts_decay","classification":"valid","tokens":["RET","TS_DECAY_EXP_5"],"expected_tensor_digest":"2fa2ba70645eefe0612a6759620383600b8ae51c2bb1a90fbc50b44174e01af3"},
+  {"id":"division-zero-prone","category":"nonfinite_prone","classification":"expected_error","expected_error_kind":"domain_error","tokens":["RET","RET5","DIV"]},
   {"id":"underflow-add","category":"structural_boundary","classification":"structural_boundary","tokens":["ADD"]},
   {"id":"extra-stack","category":"structural_boundary","classification":"structural_boundary","tokens":["RET","RET5"]}
 ]

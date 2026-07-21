@@ -65,6 +65,7 @@ _DATASET_IDENTITY_FIELDS = (
     "canonicalization_version",
     "time_unit",
     "gap_policy",
+    "volume_type",
     "symbol",
     "timeframe",
     "start_time_ns",
@@ -964,6 +965,7 @@ def _dataset_identity_from_payload(
     canonicalization_version = payload["canonicalization_version"]
     time_unit = payload["time_unit"]
     gap_policy = payload["gap_policy"]
+    volume_type = payload["volume_type"]
     symbol = payload["symbol"]
     timeframe = payload["timeframe"]
     start_time_ns = payload["start_time_ns"]
@@ -1002,6 +1004,12 @@ def _dataset_identity_from_payload(
     if gap_policy not in {"reject", "segment", "explicitly-allowed"}:
         raise ArtifactCompatibilityError(
             f"{context}.gap_policy is invalid: actual={_safe_diagnostic(gap_policy)}"
+        )
+    _validate_exact_string(volume_type, field=f"{context}.volume_type")
+    if volume_type not in {"tick", "real", "quote", "base"}:
+        raise ArtifactCompatibilityError(
+            f"{context}.volume_type is invalid: "
+            f"actual={_safe_diagnostic(volume_type)}"
         )
     if type(symbol) is not str:
         raise ArtifactCompatibilityError(
@@ -1068,6 +1076,7 @@ def _dataset_identity_from_payload(
         canonicalization_version=canonicalization_version,  # type: ignore[arg-type]
         time_unit=time_unit,  # type: ignore[arg-type]
         gap_policy=gap_policy,  # type: ignore[arg-type]
+        volume_type=volume_type,  # type: ignore[arg-type]
         symbol=symbol,
         timeframe=timeframe,
         start_time_ns=start_time_ns,
@@ -1094,6 +1103,7 @@ def _dataset_identity_payload(value: DatasetIdentity) -> dict[str, object]:
         "canonicalization_version": value.canonicalization_version,
         "time_unit": value.time_unit,
         "gap_policy": value.gap_policy,
+        "volume_type": value.volume_type,
         "symbol": value.symbol,
         "timeframe": value.timeframe,
         "start_time_ns": value.start_time_ns,
