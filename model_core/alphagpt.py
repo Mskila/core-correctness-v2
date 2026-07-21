@@ -259,6 +259,9 @@ class AlphaGPT(nn.Module):
         # MTPHead for multi-task output
         self.mtp_head = MTPHead(self.d_model, self.vocab_size, num_tasks=3)
         self.head_critic = nn.Linear(self.d_model, 1)
+        self._causal_mask_cache: dict[
+            tuple[int, str, int | None, torch.dtype], torch.Tensor
+        ] = {}
 
     def forward(self, idx):
         # idx: [Batch, SeqLen]
@@ -271,7 +274,15 @@ class AlphaGPT(nn.Module):
         x = self.token_emb(idx) + self.pos_emb[:, :T, :]
         
         # Causal Mask
-        mask = nn.Transformer.generate_square_subsequent_mask(T).to(idx.device)
+        mask_key = (T, idx.device.type, idx.device.index, x.dtype)
+        mask = self._causal_mask_cache.get(mask_key)
+        if mask is None:
+            mask = nn.Transformer.generate_square_subsequent_mask(
+                T,
+                device=idx.device,
+                dtype=x.dtype,
+            )
+            self._causal_mask_cache[mask_key] = mask
         
         # Process through looped transformer
         x = self.blocks(x, mask=mask, is_causal=True)

@@ -43,6 +43,7 @@ class ModelConfig:
     BATCH_SIZE      = 192   # 每步采样公式数（原 128，1.5x 提升覆盖率）
     TRAIN_STEPS     = 9000  # 每组训练步数（55次重启需要更多步数）
     MAX_FORMULA_LEN = 8     # 公式长度上限：保持 8（10 会导致 CPU 训练慢 3 倍）
+    TRAIN_LOG_INTERVAL = 10  # 终端详细日志节流；训练历史仍逐步记录
 
     # ── 特征维度（由 vocab.py 自动派生，无需手动修改）──────────────────
     INPUT_DIM: int = FORMULA_VOCAB.feature_count  # == 10

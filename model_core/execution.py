@@ -46,6 +46,19 @@ class ExecutionResult:
             return value.clone()
         return value
 
+    def _borrow_tensor(self, name: str) -> Tensor:
+        """Return an internal read-only-by-contract tensor for core consumers."""
+        if name not in _EXECUTION_RESULT_TENSOR_FIELDS:
+            raise KeyError(f"unknown execution tensor field: {name}")
+        value = object.__getattribute__(self, name)
+        if not isinstance(value, Tensor):
+            raise TypeError(f"execution field is not a Tensor: {name}")
+        return value
+
+    def copy_tensor(self, name: str) -> Tensor:
+        """Return an explicit defensive copy of a result tensor."""
+        return self._borrow_tensor(name).clone()
+
 
 @dataclass(frozen=True)
 class PerformanceMetrics:
@@ -673,9 +686,9 @@ def _equal_weight_portfolio_log_returns(
     result: ExecutionResult,
 ) -> tuple[Tensor, float, float]:
     """Aggregate simultaneous symbols by time with explicit equal weights."""
-    net_pnl_by_symbol = result.net_pnl
-    target_valid = result.target_valid
-    bar_time_ns = result.bar_time_ns
+    net_pnl_by_symbol = result._borrow_tensor("net_pnl")
+    target_valid = result._borrow_tensor("target_valid")
+    bar_time_ns = result._borrow_tensor("bar_time_ns")
     _validate_performance_result(
         net_pnl=net_pnl_by_symbol,
         target_valid=target_valid,
@@ -850,12 +863,12 @@ def build_execution_ledger(
     symbols: list[str] | tuple[str, ...],
 ) -> list[LedgerEntry]:
     """Copy each valid shared execution row into an auditable ledger."""
-    target_valid = result.target_valid
-    bar_time_ns = result.bar_time_ns
-    position = result.position
-    gross_pnl = result.gross_pnl
-    cost = result.cost
-    net_pnl = result.net_pnl
+    target_valid = result._borrow_tensor("target_valid")
+    bar_time_ns = result._borrow_tensor("bar_time_ns")
+    position = result._borrow_tensor("position")
+    gross_pnl = result._borrow_tensor("gross_pnl")
+    cost = result._borrow_tensor("cost")
+    net_pnl = result._borrow_tensor("net_pnl")
     valid_counts = _validate_ledger_result(
         bar_time_ns=bar_time_ns,
         target_valid=target_valid,
