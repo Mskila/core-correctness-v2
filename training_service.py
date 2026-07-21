@@ -438,12 +438,20 @@ def run_training_session(
         use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
         lord_decay_rate=ModelConfig.LORD_DECAY_RATE,
         lord_num_iterations=ModelConfig.LORD_NUM_ITERATIONS,
+        evaluation_workers=ModelConfig.EVALUATION_WORKERS,
     )
     engine.source_path = None if source_path is None else str(source_path)
     start_step = 0
     if selected is not None:
         start_step = engine.load_checkpoint(str(selected[0]))
     if start_step < ModelConfig.TRAIN_STEPS:
-        engine.train(start_step=start_step)
+        try:
+            engine.train(start_step=start_step)
+        finally:
+            close_evaluator = getattr(
+                engine, "_close_active_formula_evaluator", None
+            )
+            if callable(close_evaluator):
+                close_evaluator()
     _save_strategy(engine)
     return engine

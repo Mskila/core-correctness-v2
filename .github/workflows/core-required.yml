@@ -73,6 +73,7 @@ jobs:
           pytest
           tests/core/test_core00_baseline.py::test_short_reference_trace_repeats_exactly_for_same_seed
           tests/unit/test_deterministic_resume.py
+          tests/unit/test_parallel_evaluator.py
 
   integration:
     runs-on: ubuntu-latest
