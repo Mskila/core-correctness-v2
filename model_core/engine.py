@@ -26,7 +26,13 @@ from .config import ModelConfig
 from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
 from .vm import FormulaErrorKind, FormulaEvaluationError, StackVM
 from .backtest import MT5Backtest, compute_ic_metrics
+from .artifact_publication import publish_training_history as _publish_training_history
+from .batch_transaction import begin_batch_transaction as _begin_transaction_boundary
+from .checkpoint_codec import save_checkpoint as _save_checkpoint
+from .formula_evaluation import evaluate_training_formula as _evaluate_training_formula
 from .reward import apply_ic_gate
+from .sampling import ConstrainedSampler
+from .serial_decision import commit_pending_actions as _commit_serial_decisions
 from .semantics import (
     CHECKPOINT_SCHEMA_VERSION,
     LABEL_LOOKAHEAD_BARS,
@@ -2524,113 +2530,8 @@ def _scale_invariant_centered(values: torch.Tensor) -> torch.Tensor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ConstrainedSampler — 保证 100% 合法公式
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ConstrainedSampler:
-    def __init__(self, vocab_size: int, feat_offset: int, arity_map: dict[int, int],
-                 positive_only_ids: set[int] | None = None):
-        self.vocab_size  = vocab_size
-        self.feat_offset = feat_offset
-        self.arity_map   = arity_map
-        self.delta: dict[int, int] = {}
-        for tid in range(vocab_size):
-            if tid < feat_offset:
-                self.delta[tid] = 1
-            else:
-                a = arity_map.get(tid, 1)
-                self.delta[tid] = 1 - a
-        # 恒正算子 token id 集合（用于算子链约束）
-        self.positive_only_ids = positive_only_ids or set()
-        # 构建感染传播/恢复算子 id 集合
-        from .vm import is_infected_propagating, is_sign_restoring
-        from .ops import OPS_CONFIG as _ops
-        self.infected_propagating_ids = set()
-        self.sign_restore_ids = set()
-        for i, cfg in enumerate(_ops):
-            tid = i + feat_offset
-            if is_infected_propagating(cfg[0]):
-                self.infected_propagating_ids.add(tid)
-            if is_sign_restoring(cfg[0]):
-                self.sign_restore_ids.add(tid)
-
-    def valid_mask(self, stack_depth: int, step_idx: int,
-                   total_steps: int, device: torch.device,
-                   prev_token: int | None = None,
-                   infected_chain_len: int = 0) -> torch.Tensor:
-        remaining = total_steps - step_idx
-        mask = torch.ones(self.vocab_size, dtype=torch.bool, device=device)
-        for tid in range(self.vocab_size):
-            d         = self.delta[tid]
-            new_depth = stack_depth + d
-            if new_depth < 1:
-                mask[tid] = False;  continue
-            min_future = new_depth + (remaining - 1) * (-2)
-            max_future = new_depth + (remaining - 1) * 1
-            if 1 < min_future or 1 > max_future:
-                mask[tid] = False
-            # ── 算子链约束（感染模型）──────────────────────────────
-            # 如果已感染且感染链 >= 2，禁止再使用传播算子
-            # （允许恢复算子和非传播算子如 ADD/SUB/MUL）
-            if infected_chain_len >= 2 and tid in self.infected_propagating_ids:
-                mask[tid] = False
-            # 如果已感染且感染链 >= 3，禁止所有算子（强制恢复或结束）
-            # 实际上不禁止恢复算子，只禁止传播和恒正算子
-            if infected_chain_len >= 3:
-                if tid in self.infected_propagating_ids or tid in self.positive_only_ids:
-                    mask[tid] = False
-        if not mask.any():
-            for tid in range(self.vocab_size):
-                if stack_depth + self.delta[tid] >= 1:
-                    mask[tid] = True
-        return mask
-
-    def apply_mask_to_logits(self, logits: torch.Tensor, stack_depths: list[int],
-                              step_idx: int, total_steps: int,
-                              prev_tokens: list[int | None] | None = None,
-                              infected_chain_lens: list[int] | None = None) -> torch.Tensor:
-        masked = logits.clone()
-        device = logits.device
-        for b, depth in enumerate(stack_depths):
-            prev_t = prev_tokens[b] if prev_tokens else None
-            icl = infected_chain_lens[b] if infected_chain_lens else 0
-            vmask = self.valid_mask(depth, step_idx, total_steps, device,
-                                    prev_token=prev_t, infected_chain_len=icl)
-            masked[b][~vmask] = -1e9
-        return masked
-
-    def update_infection(self, token: int, infected_chain_len: int) -> int:
-        """更新感染链长度，返回新的感染链长度。"""
-        if token in self.positive_only_ids:
-            return infected_chain_len + 1
-        elif token in self.sign_restore_ids:
-            return 0
-        elif token in self.infected_propagating_ids:
-            if infected_chain_len > 0:
-                return infected_chain_len + 1
-            return 0
-        return infected_chain_len  # 非传播/非恢复算子，不改变状态
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # AlphaEngine — __init__ 与静态辅助方法
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _evaluate_training_formula(vm, formula, features, *, step: int, index: int):
-    """Use structured VM evaluation while preserving injected legacy test VMs."""
-    attributes = getattr(vm, "__dict__", {})
-    has_execute_override = type(attributes) is dict and "execute" in attributes
-    evaluate = getattr(vm, "evaluate", None)
-    if callable(evaluate) and not has_execute_override:
-        return evaluate(formula, features)
-    result = vm.execute(formula, features)
-    if result is None:
-        raise RuntimeError(
-            "training program evaluation failed: vm.execute returned None; "
-            f"step={step} formula_index={index} formula_length={len(formula)}"
-        )
-    return result
-
 
 class AlphaEngine:
     @staticmethod
@@ -3045,10 +2946,13 @@ class AlphaEngine:
     def _begin_batch_transaction(
         self, next_step: int, run_identity: TrainingRunIdentity
     ) -> _BatchTransaction:
-        run_identity = _revalidate_run_identity(
-            self, run_identity, "training batch before artifact observation"
+        return _begin_transaction_boundary(
+            self,
+            next_step,
+            run_identity,
+            revalidate=_revalidate_run_identity,
+            transaction_type=_BatchTransaction,
         )
-        return _BatchTransaction(self, [], run_identity)
 
     def _commit_pending_actions(
         self,
@@ -3057,73 +2961,11 @@ class AlphaEngine:
         publish_strategy: bool = True,
     ) -> list[str]:
         """Replay one validated batch transaction and publish its final winner once."""
-        before_best_score = self.best_score
-        before_best_formula = self.best_formula
-        before_best_snapshot = self._best_snapshot
-        before_best_update_step = self._best_update_step
-        before_stagnation_steps = self._stagnation_steps
-        before_factor_pool = list(self.factor_pool)
-        before_factor_counter = self._factor_pool_counter
-        before_elite_pool = list(self._elite_pool)
-        before_elite_counter = self._elite_counter
-        messages: list[str] = []
-        has_winner = False
-        action = snapshot = buffered_factor = None
-        try:
-            for action in pending_actions:
-                if action[0] == "elite":
-                    _, final_val, fml, action_step = action
-                    self._update_elite_pool(final_val, fml, action_step)
-                    continue
-                if len(action) == 10:
-                    (
-                        _, final_val, fml, snapshot, action_step, buffered_factor,
-                        old_best, ic_i, exposure, fold_evidence,
-                    ) = action
-                else:
-                    (
-                        _, final_val, fml, snapshot, action_step, buffered_factor,
-                        old_best, ic_i, exposure,
-                    ) = action
-                    fold_evidence = None
-                self.best_score = final_val
-                self.best_formula = fml
-                if fold_evidence is not None:
-                    self.best_metrics = {
-                        "validation_score": final_val,
-                        "fold_evidence": fold_evidence,
-                    }
-                self._best_snapshot = snapshot
-                self._best_update_step = action_step
-                self._stagnation_steps = 0
-                self._update_factor_pool(final_val, buffered_factor)
-                has_winner = True
-                messages.append(
-                    f"[!] 新最优 @ 第{action_step}步: 验证={final_val:.3f} "
-                    f"(原 {old_best:.3f}，+{final_val-old_best:.3f}) "
-                    f"IC={ic_i:.4f} 暴露度={exposure:.1%} | "
-                    f"{fml}\n    {self._decode_formula(fml)}"
-                )
-            if has_winner and publish_strategy:
-                self._save_strategy_live()
-        except BaseException as failure:
-            self.best_score = before_best_score
-            self.best_formula = before_best_formula
-            self._best_snapshot = before_best_snapshot
-            self._best_update_step = before_best_update_step
-            self._stagnation_steps = before_stagnation_steps
-            self.factor_pool = before_factor_pool
-            self._factor_pool_counter = before_factor_counter
-            self._elite_pool = before_elite_pool
-            self._elite_counter = before_elite_counter
-            pending_actions.clear()
-            messages.clear()
-            action = snapshot = buffered_factor = None
-            traceback.clear_frames(failure.__traceback__)
-            raise
-        pending_actions.clear()
-        action = snapshot = buffered_factor = None
-        return messages
+        return _commit_serial_decisions(
+            self,
+            pending_actions,
+            publish_strategy=publish_strategy,
+        )
 
     def _apply_corr_penalty(
         self,
@@ -3968,23 +3810,25 @@ class AlphaEngine:
                 )
                 history_path = pathlib.Path(current_identity.history_filename())
                 transaction.run_artifact(
-                    self._save_training_history_live,
+                    _publish_training_history,
                     [
                         history_path,
                         history_path.with_name(f".{history_path.name}.tmp"),
                     ],
+                    self,
                 )
                 checkpoint_path = (
                     _CHECKPOINT_DIR / current_identity.checkpoint_filename(step)
                 )
                 ckpt = transaction.run_artifact(
-                    self.save_checkpoint,
+                    _save_checkpoint,
                     [
                         checkpoint_path,
                         checkpoint_path.with_name(
                             f".{checkpoint_path.name}.tmp"
                         ),
                     ],
+                    self,
                     step,
                 )
                 tqdm.write(f"[检查点] → {ckpt} (最优={self.best_score:.3f})")

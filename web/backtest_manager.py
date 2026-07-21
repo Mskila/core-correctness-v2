@@ -20,6 +20,12 @@ if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.train_logging import strip_ansi
+from model_core.error_telemetry import ErrorTelemetry
+from web.process_lifecycle import (
+    ProcessLifecycleError,
+    popen_group_options,
+    stop_process_tree,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -87,6 +93,7 @@ class BacktestManager:
         self._job: BacktestJob | None = None
         self._log_fp = None
         self._stopped_by_user = False
+        self._errors = ErrorTelemetry()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -100,6 +107,7 @@ class BacktestManager:
             "phase_label": phase_label,
             "phase_index": phase_idx,
             "phase_total": len(BACKTEST_PHASES),
+            "errors": self._errors.snapshot(),
         }
 
     def start(
@@ -143,10 +151,6 @@ class BacktestManager:
             env["PYTHONUTF8"] = "1"
             env["LOGURU_COLORIZE"] = "0"
 
-            creationflags = 0
-            if sys.platform == "win32":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
             self._stopped_by_user = False
             self._proc = subprocess.Popen(
                 cmd,
@@ -154,7 +158,7 @@ class BacktestManager:
                 stdout=self._log_fp,
                 stderr=subprocess.STDOUT,
                 env=env,
-                creationflags=creationflags,
+                **popen_group_options(),
             )
             self._job = BacktestJob(
                 strategy_file=strategy_file,
@@ -169,18 +173,22 @@ class BacktestManager:
             )
             return self._job
 
-    def stop(self) -> bool:
+    def stop(self, *, timeout: float = 5.0) -> bool:
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 return False
             self._stopped_by_user = True
             try:
-                self._proc.terminate()
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+                stop_process_tree(
+                    self._proc,
+                    timeout=timeout,
+                    telemetry=self._errors,
+                )
+            except ProcessLifecycleError as failure:
+                if self._job is not None:
+                    self._job.error = str(failure)
+                raise
+            self._refresh_state()
             return True
 
     def _current_phase(self) -> tuple[str, str, int]:
@@ -217,6 +225,7 @@ class BacktestManager:
             try:
                 content = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
+                self._errors.record("log.read", "backtest log read failed")
                 return []
             return [strip_ansi(line) for line in content.splitlines()[-lines:]]
 
@@ -245,13 +254,16 @@ class BacktestManager:
                     with path.open("a", encoding="utf-8") as fp:
                         fp.write(f"\n[Web] 回测进程已结束，退出码: {code}\n")
             except OSError:
-                pass
+                self._errors.record("log.append_exit", "backtest exit log append failed")
         if self._log_fp:
             try:
                 self._log_fp.flush()
+            except Exception as failure:
+                self._errors.record("log.flush", failure)
+            try:
                 self._log_fp.close()
-            except Exception:
-                pass
+            except Exception as failure:
+                self._errors.record("log.close", failure)
             self._log_fp = None
         self._proc = None
 
