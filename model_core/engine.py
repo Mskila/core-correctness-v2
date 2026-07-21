@@ -26,6 +26,7 @@ from .config import ModelConfig
 from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
 from .vm import StackVM
 from .backtest import MT5Backtest, compute_ic_metrics
+from .reward import apply_ic_gate
 from .semantics import (
     LABEL_LOOKAHEAD_BARS,
     ArtifactCompatibilityError,
@@ -2767,7 +2768,22 @@ class AlphaEngine:
             self.rank_monitor = None
 
         self.vm = StackVM()
-        self.bt = MT5Backtest()
+        training_config = (
+            run_identity.artifact_identity.training_config
+            if type(run_identity) is TrainingRunIdentity
+            else ModelConfig.training_config_snapshot(42, timeframe="H1")
+        )
+        timeframe_reward = training_config["timeframe_reward"]
+        reward_config = training_config["reward"]
+        self._reward_config = dict(reward_config)
+        self.bt = MT5Backtest(
+            cost_rate=float(training_config["cost_rate"]),
+            timeframe=str(timeframe_reward["timeframe"]),
+            target_trades_per_day=float(
+                timeframe_reward["target_trades_per_day"]
+            ),
+            oos_gate_scale=float(reward_config["oos_gate_scale"]),
+        )
 
         from .vocab import FORMULA_VOCAB as _v
         self.sampler = ConstrainedSampler(
@@ -2875,19 +2891,26 @@ class AlphaEngine:
     # ── IC gate: direction-based, dimension-agnostic ──────────────────────────
 
     @staticmethod
-    def _apply_ic_gate(reward: torch.Tensor, ic_mean) -> torch.Tensor:
-        """IC 门控：用 IC 符号而非量值调整 reward，完全规避量纲问题。
-        IC > thresh  → reward × IC_GATE_MULT  (正向预测，奖励)
-        IC < -thresh → reward × IC_NEG_MULT   (反向预测，惩罚)
-        |IC| ≤ thresh→ 不修改                  (噪声区)
-        """
-        ic_val = ic_mean.item() if isinstance(ic_mean, torch.Tensor) else float(ic_mean)
-        t = ModelConfig.IC_GATE_THRESH
-        if ic_val > t:
-            return reward * ModelConfig.IC_GATE_MULT
-        elif ic_val < -t:
-            return reward * ModelConfig.IC_NEG_MULT
-        return reward
+    def _apply_ic_gate(
+        reward: torch.Tensor,
+        ic_mean,
+        config: dict[str, object] | None = None,
+    ) -> torch.Tensor:
+        """Apply the sign-safe pure IC gate using authoritative defaults."""
+        values = config or {
+            "ic_gate_thresh": ModelConfig.IC_GATE_THRESH,
+            "ic_gate_mult": ModelConfig.IC_GATE_MULT,
+            "ic_neg_mult": ModelConfig.IC_NEG_MULT,
+            "ic_gate_scale_floor": ModelConfig.IC_GATE_SCALE_FLOOR,
+        }
+        return apply_ic_gate(
+            reward,
+            ic_mean,
+            threshold=float(values["ic_gate_thresh"]),
+            positive_multiplier=float(values["ic_gate_mult"]),
+            negative_multiplier=float(values["ic_neg_mult"]),
+            scale_floor=float(values["ic_gate_scale_floor"]),
+        ).final
 
 
     # ── Elite pool ────────────────────────────────────────────────────────────
@@ -3565,7 +3588,11 @@ class AlphaEngine:
                                     t_ret[:, fold.train_start:fold.train_end],
                                     t_valid[:, fold.train_start:fold.train_end],
                                 )
-                                tr_adj = AlphaEngine._apply_ic_gate(tr_sc, ic_m)
+                                tr_adj = AlphaEngine._apply_ic_gate(
+                                    tr_sc,
+                                    ic_m,
+                                    getattr(self, "_reward_config", None),
+                                )
                                 fold_tr.append(ModelConfig.REWARD_ALPHA * tr_adj)
                                 fold_vl.append(vl_sc)
                                 fold_ic.append(ic_m)

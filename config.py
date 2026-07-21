@@ -24,12 +24,6 @@ except ImportError:
         TIMEFRAME_MN1 = 49153
     mt5 = _MT5Stub()
 
-try:
-    import torch
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _TORCH_AVAILABLE = False
-
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -116,18 +110,6 @@ class Config:
     BARS_COUNT            = 10_000_000
     DATA_REFRESH_INTERVAL = 300    # 秒，实盘数据刷新间隔
     KLINE_CACHE_DIR       = os.getenv("KLINE_CACHE_DIR", r"D:\K线数据")  # 本地 K 线缓存目录
-
-    # ── 模型参数（仅供参考，训练实际使用 model_core.config.ModelConfig）────
-    # 训练参数的权威来源是 model_core/config.py，这里的值不生效
-    BATCH_SIZE      = 128          # 参见 ModelConfig.BATCH_SIZE
-    TRAIN_STEPS     = 300          # 参见 ModelConfig.TRAIN_STEPS
-    MAX_FORMULA_LEN = 8            # 参见 ModelConfig.MAX_FORMULA_LEN
-    # DEVICE 同样以 model_core/config.py 为准（已改为 cpu，原因见该文件注释）
-    DEVICE          = (
-        torch.device("cpu")
-        if _TORCH_AVAILABLE
-        else "cpu"
-    )
 
     # ── 风控参数 ──────────────────────────────────────────
     RISK_PER_TRADE     = 0.01      # legacy: 保留给旧接口/测试；实盘仓位使用 VOL_TARGET_* 参数

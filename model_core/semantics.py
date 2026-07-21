@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-CORE_SEMANTICS_VERSION = "2"
+CORE_SEMANTICS_VERSION = "3"
 DATA_SCHEMA_VERSION = "ohlcv-v3"
 DATA_CANONICALIZATION_VERSION = "float32-le-ns-gap-v1"
 LABEL_SEMANTICS_VERSION = "close-t__open-t1-to-open-t2-v2"

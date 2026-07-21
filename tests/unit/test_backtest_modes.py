@@ -310,6 +310,8 @@ def training_config() -> dict[str, object]:
             "ic_gate_thresh": 0.01,
             "ic_gate_mult": 1.15,
             "ic_neg_mult": 0.75,
+            "ic_gate_scale_floor": 0.0,
+            "oos_gate_scale": 0.5,
             "ema_baseline": True,
             "ema_decay": 0.95,
             "ema_warmup": 10,
@@ -320,6 +322,11 @@ def training_config() -> dict[str, object]:
             "half_consistency_bonus": True,
             "beta_neutral_thresh": 0.85,
             "beta_neutral_light_thresh": 0.70,
+        },
+        "timeframe_reward": {
+            "timeframe": "H1",
+            "target_trades_per_day": 2.0,
+            "target_bars_per_trade": 12.0,
         },
         "entropy": {
             "coeff_max": ModelConfig.ENTROPY_COEFF_MAX,

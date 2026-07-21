@@ -12,7 +12,6 @@ import tempfile
 import numpy as np
 import torch
 
-from config import Config
 from data_pipeline.validation import assert_minimum_bars
 from model_core.artifacts import (
     ArtifactIdentity,
@@ -40,77 +39,12 @@ CHECKPOINT_DIR = pathlib.Path("checkpoints")
 STRATEGY_DIR = pathlib.Path("strategies")
 
 
-def _training_config(random_seed: int) -> dict[str, object]:
-    return {
-        "model": {"input_dim": ModelConfig.INPUT_DIM, "hidden_dim": 96, "num_layers": 3},
-        "batch_size": ModelConfig.BATCH_SIZE,
-        "train_steps": ModelConfig.TRAIN_STEPS,
-        "max_formula_len": ModelConfig.MAX_FORMULA_LEN,
-        "reward": {
-            "ic": 1.0, "return": 1.0, "alpha": ModelConfig.REWARD_ALPHA,
-            "mode": ModelConfig.REWARD_MODE,
-            "ic_gate_thresh": ModelConfig.IC_GATE_THRESH,
-            "ic_gate_mult": ModelConfig.IC_GATE_MULT,
-            "ic_neg_mult": ModelConfig.IC_NEG_MULT,
-            "ema_baseline": ModelConfig.REWARD_EMA_BASELINE,
-            "ema_decay": ModelConfig.REWARD_EMA_DECAY,
-            "ema_warmup": ModelConfig.REWARD_EMA_WARMUP,
-            "factor_top_k": ModelConfig.FACTOR_TOP_K,
-            "corr_threshold": ModelConfig.CORR_THRESHOLD,
-            "corr_penalty": ModelConfig.CORR_PENALTY,
-            "beta_neutral_penalty": ModelConfig.BETA_NEUTRAL_PENALTY,
-            "half_consistency_bonus": ModelConfig.HALF_CONSISTENCY_BONUS,
-            "beta_neutral_thresh": ModelConfig.BETA_NEUTRAL_THRESH,
-            "beta_neutral_light_thresh": ModelConfig.BETA_NEUTRAL_LIGHT_THRESH,
-        },
-        "entropy": {
-            "coeff_max": ModelConfig.ENTROPY_COEFF_MAX,
-            "coeff_power": ModelConfig.ENTROPY_COEFF_POWER,
-            "collapse_thresh": ModelConfig.ENTROPY_COLLAPSE_THRESH,
-            "collapse_steps": ModelConfig.ENTROPY_COLLAPSE_STEPS,
-            "floor_enabled": ModelConfig.ENTROPY_FLOOR,
-            "floor_thresh": ModelConfig.ENTROPY_FLOOR_THRESH,
-            "floor_lambda": ModelConfig.ENTROPY_FLOOR_LAMBDA,
-        },
-        "elite": {
-            "size": ModelConfig.ELITE_POOL_SIZE,
-            "replay_frac": ModelConfig.ELITE_REPLAY_FRAC,
-            "reward_scale": ModelConfig.ELITE_REWARD_SCALE,
-            "decay": ModelConfig.ELITE_DECAY,
-            "decay_half_life": ModelConfig.ELITE_DECAY_HALF_LIFE,
-        },
-        "restart": {
-            "max_restarts": ModelConfig.MAX_RESTARTS,
-            "restart_noise": ModelConfig.RESTART_NOISE,
-            "stagnation_window": ModelConfig.STAGNATION_WINDOW,
-            "full_reset_every": ModelConfig.FULL_RESET_EVERY,
-            "partial_reset": ModelConfig.PARTIAL_RESET,
-            "partial_reset_layers": list(ModelConfig.PARTIAL_RESET_LAYERS),
-        },
-        "noise": {
-            "initial": ModelConfig.RESTART_NOISE,
-            "boost": ModelConfig.NOISE_BOOST_FACTOR,
-            "adaptive": ModelConfig.ADAPTIVE_NOISE,
-            "min": ModelConfig.NOISE_MIN,
-            "max": ModelConfig.NOISE_MAX,
-            "boost_factor": ModelConfig.NOISE_BOOST_FACTOR,
-        },
-        "lord": {
-            "use_lord_regularization": ModelConfig.USE_LORD_REGULARIZATION,
-            "lord_decay_rate": ModelConfig.LORD_DECAY_RATE,
-            "lord_num_iterations": ModelConfig.LORD_NUM_ITERATIONS,
-        },
-        "walk_forward": {
-            "blocks": ModelConfig.WF_N_BLOCKS,
-            "gap": ModelConfig.WF_GAP,
-            "min_fold_bars": ModelConfig.WF_MIN_FOLD_BARS,
-            "warmup_bars": formula_warmup_bars(ModelConfig.MAX_FORMULA_LEN),
-            "label_lookahead": LABEL_LOOKAHEAD_BARS,
-        },
-        "cost_rate": Config.COST_RATE,
-        "neutral_band": Config.MIN_TRADE_EXPOSURE,
-        "random_seed": random_seed,
-    }
+def _training_config(
+    random_seed: int,
+    *,
+    timeframe: str = "H1",
+) -> dict[str, object]:
+    return ModelConfig.training_config_snapshot(random_seed, timeframe=timeframe)
 
 
 def _artifact_identity(data_manager, random_seed: int) -> ArtifactIdentity:
@@ -141,7 +75,7 @@ def _artifact_identity(data_manager, random_seed: int) -> ArtifactIdentity:
             f"expected={dataset_normalized[:80]} "
             f"actual={manager_normalized[:80]}"
         )
-    config = _training_config(random_seed)
+    config = _training_config(random_seed, timeframe=dataset.timeframe)
     return ArtifactIdentity(
         core_semantics_version=CORE_SEMANTICS_VERSION,
         vocab_version=VOCAB_VERSION,

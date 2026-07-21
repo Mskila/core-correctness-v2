@@ -54,6 +54,9 @@ class ModelConfig:
     IC_GATE_THRESH:    float = 0.01
     IC_GATE_MULT:      float = 1.15
     IC_NEG_MULT:       float = 0.75   # 收益优先：不过度误杀反向/非线性高收益因子
+    IC_GATE_SCALE_FLOOR: float = 0.0
+    OOS_GATE_SCALE: float = 0.5
+    TARGET_TRADES_PER_DAY: float = 2.0
 
     # ── FTMO 专属奖励模式 ─────────────────────────────────────────────
     # "standard": 收益+风险平衡（默认，原权重）
@@ -151,3 +154,103 @@ class ModelConfig:
     HALF_CONSISTENCY_BONUS:   bool  = True             # 前后一致性奖惩
     BETA_NEUTRAL_THRESH:      float = 0.85             # 超过此比例同方向触发重罚
     BETA_NEUTRAL_LIGHT_THRESH: float = 0.70            # 轻度失衡阈值
+
+    @classmethod
+    def training_config_snapshot(
+        cls,
+        random_seed: int,
+        *,
+        timeframe: str = "H1",
+    ) -> dict[str, object]:
+        """Export the sole authoritative, identity-hashed training snapshot."""
+        from config import Config
+        from model_core.reward import target_bars_per_trade
+        from model_core.semantics import LABEL_LOOKAHEAD_BARS
+        from model_core.walk_forward import formula_warmup_bars
+
+        return {
+            "model": {
+                "input_dim": cls.INPUT_DIM,
+                "hidden_dim": 96,
+                "num_layers": 3,
+            },
+            "batch_size": cls.BATCH_SIZE,
+            "train_steps": cls.TRAIN_STEPS,
+            "max_formula_len": cls.MAX_FORMULA_LEN,
+            "reward": {
+                "ic": 1.0,
+                "return": 1.0,
+                "alpha": cls.REWARD_ALPHA,
+                "mode": cls.REWARD_MODE,
+                "ic_gate_thresh": cls.IC_GATE_THRESH,
+                "ic_gate_mult": cls.IC_GATE_MULT,
+                "ic_neg_mult": cls.IC_NEG_MULT,
+                "ic_gate_scale_floor": cls.IC_GATE_SCALE_FLOOR,
+                "oos_gate_scale": cls.OOS_GATE_SCALE,
+                "ema_baseline": cls.REWARD_EMA_BASELINE,
+                "ema_decay": cls.REWARD_EMA_DECAY,
+                "ema_warmup": cls.REWARD_EMA_WARMUP,
+                "factor_top_k": cls.FACTOR_TOP_K,
+                "corr_threshold": cls.CORR_THRESHOLD,
+                "corr_penalty": cls.CORR_PENALTY,
+                "beta_neutral_penalty": cls.BETA_NEUTRAL_PENALTY,
+                "half_consistency_bonus": cls.HALF_CONSISTENCY_BONUS,
+                "beta_neutral_thresh": cls.BETA_NEUTRAL_THRESH,
+                "beta_neutral_light_thresh": cls.BETA_NEUTRAL_LIGHT_THRESH,
+            },
+            "timeframe_reward": {
+                "timeframe": timeframe,
+                "target_trades_per_day": cls.TARGET_TRADES_PER_DAY,
+                "target_bars_per_trade": target_bars_per_trade(
+                    timeframe,
+                    cls.TARGET_TRADES_PER_DAY,
+                ),
+            },
+            "entropy": {
+                "coeff_max": cls.ENTROPY_COEFF_MAX,
+                "coeff_power": cls.ENTROPY_COEFF_POWER,
+                "collapse_thresh": cls.ENTROPY_COLLAPSE_THRESH,
+                "collapse_steps": cls.ENTROPY_COLLAPSE_STEPS,
+                "floor_enabled": cls.ENTROPY_FLOOR,
+                "floor_thresh": cls.ENTROPY_FLOOR_THRESH,
+                "floor_lambda": cls.ENTROPY_FLOOR_LAMBDA,
+            },
+            "elite": {
+                "size": cls.ELITE_POOL_SIZE,
+                "replay_frac": cls.ELITE_REPLAY_FRAC,
+                "reward_scale": cls.ELITE_REWARD_SCALE,
+                "decay": cls.ELITE_DECAY,
+                "decay_half_life": cls.ELITE_DECAY_HALF_LIFE,
+            },
+            "restart": {
+                "max_restarts": cls.MAX_RESTARTS,
+                "restart_noise": cls.RESTART_NOISE,
+                "stagnation_window": cls.STAGNATION_WINDOW,
+                "full_reset_every": cls.FULL_RESET_EVERY,
+                "partial_reset": cls.PARTIAL_RESET,
+                "partial_reset_layers": list(cls.PARTIAL_RESET_LAYERS),
+            },
+            "noise": {
+                "initial": cls.RESTART_NOISE,
+                "boost": cls.NOISE_BOOST_FACTOR,
+                "adaptive": cls.ADAPTIVE_NOISE,
+                "min": cls.NOISE_MIN,
+                "max": cls.NOISE_MAX,
+                "boost_factor": cls.NOISE_BOOST_FACTOR,
+            },
+            "lord": {
+                "use_lord_regularization": cls.USE_LORD_REGULARIZATION,
+                "lord_decay_rate": cls.LORD_DECAY_RATE,
+                "lord_num_iterations": cls.LORD_NUM_ITERATIONS,
+            },
+            "walk_forward": {
+                "blocks": cls.WF_N_BLOCKS,
+                "gap": cls.WF_GAP,
+                "min_fold_bars": cls.WF_MIN_FOLD_BARS,
+                "warmup_bars": formula_warmup_bars(cls.MAX_FORMULA_LEN),
+                "label_lookahead": LABEL_LOOKAHEAD_BARS,
+            },
+            "cost_rate": Config.COST_RATE,
+            "neutral_band": Config.MIN_TRADE_EXPOSURE,
+            "random_seed": random_seed,
+        }

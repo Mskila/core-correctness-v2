@@ -57,6 +57,11 @@ def _write_dataset(path: Path, frame: pd.DataFrame):
 
 def _strategy_for(training_identity, path: Path) -> StrategyArtifact:
     config = training_config()
+    config["timeframe_reward"] = {
+        "timeframe": training_identity.timeframe,
+        "target_trades_per_day": 2.0,
+        "target_bars_per_trade": 3.0,
+    }
     identity = ArtifactIdentity(
         core_semantics_version=CORE_SEMANTICS_VERSION,
         vocab_version=VOCAB_VERSION,
