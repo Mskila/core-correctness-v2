@@ -50,6 +50,7 @@ def dataset_identity(
         canonicalization_version=DATA_CANONICALIZATION_VERSION,
         time_unit="ns",
         gap_policy="segment",
+        volume_type="tick",
         symbol=symbol,
         timeframe=timeframe,
         start_time_ns=start,
@@ -65,6 +66,7 @@ DATASET_FIELDS = (
     "canonicalization_version",
     "time_unit",
     "gap_policy",
+    "volume_type",
     "symbol",
     "timeframe",
     "start_time_ns",
@@ -112,6 +114,7 @@ def instrumented_dataset_identity(
             canonicalization_version=DATA_CANONICALIZATION_VERSION,
             time_unit="ns",
             gap_policy="segment",
+            volume_type="tick",
             symbol="EURUSD",
             timeframe="H1",
             start_time_ns=1_000,
@@ -2497,7 +2500,7 @@ def test_strategy_create_rejects_decoded_formula_that_disagrees_with_tokens() ->
     with pytest.raises(ArtifactCompatibilityError, match="decoded_formula"):
         StrategyArtifact.create(
             run_identity=base.run_identity,
-            formula_tokens=[0, 1],
+            formula_tokens=[0],
             decoded_formula="DIFFERENT_FORMULA",
             best_score=1.0,
             fold_evidence=base.fold_evidence,
@@ -4179,8 +4182,8 @@ def test_raw_json_load_rejects_same_and_conflicting_root_duplicates(
     ("key", "value", "earlier_value"),
     [
         ("run_id", None, "0" * 32),
-        ("core_semantics_version", "3", "2"),
-        ("schema_version", "ohlcv-v3", "legacy-dataset"),
+        ("core_semantics_version", "4", "3"),
+        ("schema_version", "ohlcv-v4", "legacy-dataset"),
         ("batch_size", 192, 1),
         ("coeff_max", ModelConfig.ENTROPY_COEFF_MAX, -1.0),
         ("fold_index", 0, 99),

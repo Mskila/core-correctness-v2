@@ -24,7 +24,7 @@ from tqdm import tqdm
 from data_pipeline.validation import assert_minimum_bars
 from .config import ModelConfig
 from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
-from .vm import StackVM
+from .vm import FormulaErrorKind, FormulaEvaluationError, StackVM
 from .backtest import MT5Backtest, compute_ic_metrics
 from .reward import apply_ic_gate
 from .semantics import (
@@ -1981,6 +1981,38 @@ class _BatchTransaction:
             raise
         return result
 
+    def run_formula(self, operation, /, *args, **kwargs):
+        """Run a pure VM evaluation without rolling back expected rejection."""
+        if not self.active:
+            raise RuntimeError("batch transaction is no longer active")
+        try:
+            if self.run_identity is not None:
+                _revalidate_run_identity(
+                    self.engine,
+                    self.run_identity,
+                    "training formula evaluation before call",
+                )
+            result = operation(*args, **kwargs)
+            if self.run_identity is not None:
+                _revalidate_run_identity(
+                    self.engine,
+                    self.run_identity,
+                    "training formula evaluation after call",
+                )
+            return result
+        except FormulaEvaluationError:
+            raise
+        except BaseException as failure:
+            try:
+                self.rollback()
+            except BaseException as rollback_failure:
+                failure.add_note(
+                    "batch rollback also failed: "
+                    + _safe_failure_summary(rollback_failure)
+                )
+            traceback.clear_frames(failure.__traceback__)
+            raise
+
     def run_artifact(
         self,
         operation,
@@ -2510,15 +2542,15 @@ class ConstrainedSampler:
         # 恒正算子 token id 集合（用于算子链约束）
         self.positive_only_ids = positive_only_ids or set()
         # 构建感染传播/恢复算子 id 集合
-        from .vm import INFECTED_PROPAGATING_OPS, SIGN_RESTORE_OPS
+        from .vm import is_infected_propagating, is_sign_restoring
         from .ops import OPS_CONFIG as _ops
         self.infected_propagating_ids = set()
         self.sign_restore_ids = set()
         for i, cfg in enumerate(_ops):
             tid = i + feat_offset
-            if cfg[0] in INFECTED_PROPAGATING_OPS:
+            if is_infected_propagating(cfg[0]):
                 self.infected_propagating_ids.add(tid)
-            if cfg[0] in SIGN_RESTORE_OPS:
+            if is_sign_restoring(cfg[0]):
                 self.sign_restore_ids.add(tid)
 
     def valid_mask(self, stack_depth: int, step_idx: int,
@@ -2582,6 +2614,22 @@ class ConstrainedSampler:
 # ─────────────────────────────────────────────────────────────────────────────
 # AlphaEngine — __init__ 与静态辅助方法
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _evaluate_training_formula(vm, formula, features, *, step: int, index: int):
+    """Use structured VM evaluation while preserving injected legacy test VMs."""
+    attributes = getattr(vm, "__dict__", {})
+    has_execute_override = type(attributes) is dict and "execute" in attributes
+    evaluate = getattr(vm, "evaluate", None)
+    if callable(evaluate) and not has_execute_override:
+        return evaluate(formula, features)
+    result = vm.execute(formula, features)
+    if result is None:
+        raise RuntimeError(
+            "training program evaluation failed: vm.execute returned None; "
+            f"step={step} formula_index={index} formula_length={len(formula)}"
+        )
+    return result
+
 
 class AlphaEngine:
     @staticmethod
@@ -3526,21 +3574,35 @@ class AlphaEngine:
             )
 
             ok_cnt = none_cnt = const_cnt = 0
+            formula_error_counts = {
+                kind.value: 0 for kind in FormulaErrorKind
+            }
+            formula_error_samples: list[str] = []
+            formula_valid = [True] * tot
             step_max_val = -float('inf');  step_best_f = None
             bic, bis, bsor = [], [], []
 
             for i, fml in enumerate(all_fmls):
                 try:
                     with torch.no_grad():
-                        res = transaction.run(self.vm.execute, fml, feat)
+                        res = transaction.run_formula(
+                            _evaluate_training_formula,
+                            self.vm,
+                            fml,
+                            feat,
+                            step=step,
+                            index=i,
+                        )
+                except FormulaEvaluationError as failure:
+                    formula_valid[i] = False
+                    none_cnt += 1
+                    formula_error_counts[failure.error_kind.value] += 1
+                    if len(formula_error_samples) < 5:
+                        formula_error_samples.append(str(failure)[:500])
+                    continue
                 except BaseException as failure:
                     traceback.clear_frames(failure.__traceback__)
                     raise
-                if res is None:
-                    raise RuntimeError(
-                        "training program evaluation failed: vm.execute returned None; "
-                        f"step={step} formula_index={i} formula_length={len(fml)}"
-                    )
                 del res
 
             shadow_best_score = self.best_score
@@ -3555,13 +3617,27 @@ class AlphaEngine:
                 for i, fml in enumerate(all_fmls):
                     res = None
                     selection_factor = None
+                    if not formula_valid[i]:
+                        rewards[i] = val_scores[i] = -2.0
+                        continue
                     with torch.no_grad():
-                        res = transaction.run(self.vm.execute, fml, feat)
-                    if res is None:
-                        raise RuntimeError(
-                            "training program evaluation failed: vm.execute returned None; "
-                            f"step={step} formula_index={i} formula_length={len(fml)}"
-                        )
+                        try:
+                            res = transaction.run_formula(
+                                _evaluate_training_formula,
+                                self.vm,
+                                fml,
+                                feat,
+                                step=step,
+                                index=i,
+                            )
+                        except FormulaEvaluationError as failure:
+                            formula_valid[i] = False
+                            none_cnt += 1
+                            formula_error_counts[failure.error_kind.value] += 1
+                            if len(formula_error_samples) < 5:
+                                formula_error_samples.append(str(failure)[:500])
+                            rewards[i] = val_scores[i] = -2.0
+                            continue
                     selection_factor = self._select_fold_bars(res, selection_index)
                     if not _has_exact_variation(selection_factor):
                         rewards[i] = val_scores[i] = -2.0
@@ -3827,6 +3903,7 @@ class AlphaEngine:
                 f"[{step+1}/{end_step}] "
                 f"新公式={n_new} 精英={n_elite} | "
                 f"有效={ok_cnt} 无效={none_cnt} 常数={const_cnt} | "
+                f"公式错误={formula_error_counts} | "
                 f"奖励={avg_rew:.3f} 验证={avg_val:.3f} | "
                 f"IC={bim:.4f} | 熵={ent_val:.3f}(系数={ent_coeff:.3f}) | "
                 f"最优={self.best_score:.3f} 停滞={self._stagnation_steps} "
@@ -3870,6 +3947,12 @@ class AlphaEngine:
             self.training_history.setdefault('batch_uniq_tokens', []).append(uniq_tokens)
             self.training_history.setdefault('batch_uniq_fmls', []).append(uniq_fmls)
             self.training_history.setdefault('batch_fml_div', []).append(fml_div)
+            self.training_history.setdefault('formula_error_counts', []).append(
+                dict(formula_error_counts)
+            )
+            self.training_history.setdefault('formula_error_samples', []).append(
+                list(formula_error_samples)
+            )
 
             # ── Part F: Entropy collapse detection & restart ─────────
             transaction.run(self._apply_adaptive_restart, step, ent_val)

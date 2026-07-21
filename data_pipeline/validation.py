@@ -50,11 +50,13 @@ _TIMEFRAME_NS = {
 }
 _CANONICAL_TIMEFRAMES = frozenset({*_TIMEFRAME_NS, "MN1"})
 _GAP_POLICIES = frozenset({"reject", "segment", "explicitly-allowed"})
+_VOLUME_TYPES = frozenset({"tick", "real", "quote", "base"})
 _DATASET_IDENTITY_FIELDS = (
     "schema_version",
     "canonicalization_version",
     "time_unit",
     "gap_policy",
+    "volume_type",
     "symbol",
     "timeframe",
     "start_time_ns",
@@ -131,6 +133,14 @@ def _validate_dataset_identity_values(value: Mapping[str, object]) -> None:
             actual=gap_policy,
         )
 
+    volume_type = value["volume_type"]
+    if type(volume_type) is not str or volume_type not in _VOLUME_TYPES:
+        _raise_identity_field_error(
+            "volume_type",
+            expected=f"exact str in {sorted(_VOLUME_TYPES)!r}",
+            actual=volume_type,
+        )
+
     symbol = value["symbol"]
     if type(symbol) is not str or not symbol.strip():
         _raise_identity_field_error(
@@ -194,6 +204,7 @@ class DatasetIdentity:
     canonicalization_version: str
     time_unit: str
     gap_policy: str
+    volume_type: str
     symbol: str
     timeframe: str
     start_time_ns: int
@@ -208,6 +219,7 @@ class DatasetIdentity:
         canonicalization_version: object = _MISSING_IDENTITY_FIELD,
         time_unit: object = _MISSING_IDENTITY_FIELD,
         gap_policy: object = _MISSING_IDENTITY_FIELD,
+        volume_type: object = _MISSING_IDENTITY_FIELD,
         symbol: object = _MISSING_IDENTITY_FIELD,
         timeframe: object = _MISSING_IDENTITY_FIELD,
         start_time_ns: object = _MISSING_IDENTITY_FIELD,
@@ -226,6 +238,7 @@ class DatasetIdentity:
                     canonicalization_version,
                     time_unit,
                     gap_policy,
+                    volume_type,
                     symbol,
                     timeframe,
                     start_time_ns,
@@ -280,6 +293,7 @@ class CanonicalDataset:
     _frame: pd.DataFrame = field(repr=False, compare=False)
     identity: DatasetIdentity
     gap_count: int
+    volume_type: str
     _segment_ids: np.ndarray = field(repr=False, compare=False)
 
     def __init__(
@@ -288,10 +302,12 @@ class CanonicalDataset:
         identity: DatasetIdentity,
         gap_count: int,
         segment_ids: np.ndarray,
+        volume_type: str,
     ) -> None:
         object.__setattr__(self, "_frame", frame.copy(deep=True))
         object.__setattr__(self, "identity", identity)
         object.__setattr__(self, "gap_count", gap_count)
+        object.__setattr__(self, "volume_type", volume_type)
         object.__setattr__(
             self,
             "_segment_ids",
@@ -390,6 +406,16 @@ def _normalize_numeric_time_unit(value: object) -> str:
             return normalized
     raise DataValidationError(
         "numeric time unit must be one of s, ms, us or ns"
+    )
+
+
+def _normalize_volume_type(value: object) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _VOLUME_TYPES:
+            return normalized
+    raise DataValidationError(
+        f"volume_type must be one of {sorted(_VOLUME_TYPES)!r}"
     )
 
 
@@ -531,6 +557,7 @@ def _fingerprints(
     symbol: str,
     timeframe: str,
     gap_policy: str,
+    volume_type: str,
 ) -> tuple[str, str, np.ndarray]:
     time_ns = frame["time"].astype("int64").to_numpy(dtype="<i8", copy=True)
     value_bytes = frame.loc[:, _VALUE_COLUMNS].to_numpy(dtype="<f4", copy=True)
@@ -544,6 +571,7 @@ def _fingerprints(
         "start_time_ns": int(time_ns[0]),
         "symbol": symbol,
         "timeframe": timeframe,
+        "volume_type": volume_type,
     }
     metadata_bytes = json.dumps(
         metadata,
@@ -567,6 +595,7 @@ def canonicalize_ohlcv(
     timeframe: str | int,
     numeric_time_unit: str | None = None,
     gap_policy: str = "segment",
+    volume_type: str | None = None,
 ) -> CanonicalDataset:
     """Validate and canonicalize an OHLCV frame without filling missing bars."""
     if not isinstance(frame, pd.DataFrame):
@@ -583,8 +612,41 @@ def canonicalize_ohlcv(
     result.columns = [str(column).strip().lower() for column in result.columns]
     if result.columns.duplicated().any():
         raise DataValidationError("duplicate columns after lower-case normalization")
-    if "volume" not in result.columns and "tick_volume" in result.columns:
-        result = result.rename(columns={"tick_volume": "volume"})
+    explicit_volume_type = (
+        _normalize_volume_type(volume_type) if volume_type is not None else None
+    )
+    specialized_volume_columns = {
+        "tick": "tick_volume",
+        "real": "real_volume",
+        "quote": "quote_volume",
+        "base": "base_volume",
+    }
+    if "volume" in result.columns:
+        canonical_volume_type = explicit_volume_type or "tick"
+    else:
+        available = [
+            kind
+            for kind, column in specialized_volume_columns.items()
+            if column in result.columns
+        ]
+        if len(available) != 1:
+            raise DataValidationError(
+                "OHLCV input must provide exactly one volume source when the "
+                "canonical volume column is absent"
+            )
+        inferred_volume_type = available[0]
+        if (
+            explicit_volume_type is not None
+            and explicit_volume_type != inferred_volume_type
+        ):
+            raise DataValidationError(
+                "volume_type conflicts with the source volume column: "
+                f"declared={explicit_volume_type!r} inferred={inferred_volume_type!r}"
+            )
+        canonical_volume_type = inferred_volume_type
+        result = result.rename(
+            columns={specialized_volume_columns[inferred_volume_type]: "volume"}
+        )
 
     missing = [column for column in _CANONICAL_COLUMNS if column not in result.columns]
     if missing:
@@ -671,12 +733,14 @@ def canonicalize_ohlcv(
         symbol=str(symbol),
         timeframe=canonical_timeframe,
         gap_policy=canonical_gap_policy,
+        volume_type=canonical_volume_type,
     )
     identity = DatasetIdentity(
         schema_version=DATA_SCHEMA_VERSION,
         canonicalization_version=DATA_CANONICALIZATION_VERSION,
         time_unit="ns",
         gap_policy=canonical_gap_policy,
+        volume_type=canonical_volume_type,
         symbol=str(symbol),
         timeframe=canonical_timeframe,
         start_time_ns=int(time_ns[0]),
@@ -690,4 +754,5 @@ def canonicalize_ohlcv(
         identity=identity,
         gap_count=gap_count,
         segment_ids=segment_ids,
+        volume_type=canonical_volume_type,
     )

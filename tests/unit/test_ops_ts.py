@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import torch
 import model_core.ops as ops_module
 from model_core.ops import (
+    DomainError,
     OPERATOR_REGISTRY,
     OPS_CONFIG,
     _ts_corr_10,
@@ -289,7 +290,7 @@ class TestProductFiveFormula:
             torch.tensor(
                 [
                     [0.10, -0.20, 0.05, 0.30, -0.10, 0.25, -0.15, 0.40],
-                    [0.20, -1.20, 0.15, -0.30, 0.40, -0.05, 0.25, -0.10],
+                    [0.20, -0.20, 0.15, -0.30, 0.40, -0.05, 0.25, -0.10],
                 ],
                 dtype=torch.float32,
             ),
@@ -311,11 +312,10 @@ class TestProductFiveFormula:
 
         for x in cases:
             actual = product(x)
-            safe = x.clamp_min(-0.999)
             expected = torch.stack(
                 [
                     torch.prod(
-                        1.0 + safe[:, max(0, end - 4):end + 1], dim=1
+                        1.0 + x[:, max(0, end - 4):end + 1], dim=1
                     )
                     - 1.0
                     for end in range(x.shape[1])
@@ -325,7 +325,10 @@ class TestProductFiveFormula:
 
             torch.testing.assert_close(actual, expected, rtol=0, atol=2.0e-7)
 
-    def test_registry_transform_clamps_true_log_sum_at_both_limits(self):
+        with pytest.raises(DomainError, match="> -1"):
+            product(torch.tensor([[0.2, -1.2, 0.1]], dtype=torch.float32))
+
+    def test_registry_transform_preserves_unclamped_finite_log_sum(self):
         target_log_sums = torch.tensor(
             [12.0, -12.0, 9.5, -9.5], dtype=torch.float64
         )
@@ -342,7 +345,7 @@ class TestProductFiveFormula:
         assert 9.0 < raw_log_sums[2] < 10.0
         assert -10.0 < raw_log_sums[3] < -9.0
 
-        expected = torch.expm1(target_log_sums.clamp(-10.0, 10.0))
+        expected = torch.expm1(target_log_sums)
         actual = product(returns)[:, -1]
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

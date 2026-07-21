@@ -101,6 +101,7 @@ class MT5DataManager:
         self._target_ret: torch.Tensor | None = None
         self._target_valid: torch.Tensor | None = None
         self._data_identities: tuple[DatasetIdentity, ...] | None = None
+        self._volume_types: tuple[str, ...] | None = None
         self._segment_ids: torch.Tensor | None = None
 
     def load(self, symbols: list[str] | None = None) -> None:
@@ -158,12 +159,16 @@ class MT5DataManager:
         data_identities = tuple(
             aligned_datasets[symbol].identity for symbol in symbol_list
         )
+        volume_types = tuple(
+            aligned_datasets[symbol].volume_type for symbol in symbol_list
+        )
 
         self._symbols = symbol_list
         self._raw_dict = raw_dict
         self._target_ret = target_ret
         self._target_valid = target_valid
         self._data_identities = data_identities
+        self._volume_types = volume_types
         self._segment_ids = segment_ids
         self._requested_symbols = None if symbols is None else list(symbol_list)
         logger.info(
@@ -216,6 +221,11 @@ class MT5DataManager:
         return self._data_identities  # type: ignore[return-value]
 
     @property
+    def volume_types(self) -> tuple[str, ...]:
+        self._ensure_loaded()
+        return self._volume_types  # type: ignore[return-value]
+
+    @property
     def symbols(self) -> list[str]:
         return list(self._symbols)
 
@@ -231,6 +241,7 @@ class MT5DataManager:
             or self._target_ret is None
             or self._target_valid is None
             or self._data_identities is None
+            or self._volume_types is None
             or self._segment_ids is None
         ):
             raise RuntimeError("Data not loaded. Call MT5DataManager.load() first.")

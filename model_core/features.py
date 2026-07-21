@@ -8,7 +8,9 @@ Output: [N, F, T], all finite; F is derived from FEATURE_REGISTRY.
 每个特征的 compute 并堆叠为 [N, F, T]。计算逻辑与顺序与重构前逐元素一致。
 每个 compute 的签名为 `(raw_dict: dict) -> Tensor[N, T]`。
 """
+from dataclasses import dataclass
 import functools
+from types import MappingProxyType
 
 import torch
 
@@ -1479,6 +1481,17 @@ def _load_active_feature_allowlist(path=None) -> set[str] | None:
 _ACTIVE_FEATURES = _load_active_feature_allowlist()
 
 
+@dataclass(frozen=True, slots=True)
+class FeatureMetadata:
+    """Auditable name-to-implementation metadata for one registered feature."""
+
+    name: str
+    category: str
+    definition: str
+    implementation: str
+    volume_input: str | None
+
+
 def _with_feature_shape_check(name: str, compute):
     @functools.wraps(compute)
     def _checked(raw: dict) -> torch.Tensor:
@@ -1505,6 +1518,7 @@ def _with_feature_shape_check(name: str, compute):
 
     return _checked
 
+_feature_metadata: dict[str, FeatureMetadata] = {}
 for _name, _category, _compute, _lookback in _FEATURE_DEFS:
     if _ACTIVE_FEATURES is not None and _name not in _ACTIVE_FEATURES:
         continue
@@ -1516,6 +1530,17 @@ for _name, _category, _compute, _lookback in _FEATURE_DEFS:
             lookback=_lookback,
         )
     )
+    _doc = (_compute.__doc__ or "").strip().splitlines()
+    _definition = _doc[0].strip() if _doc else f"Registered {_category} feature {_name}"
+    _feature_metadata[_name] = FeatureMetadata(
+        name=_name,
+        category=_category,
+        definition=_definition,
+        implementation=f"{_compute.__module__}.{_compute.__qualname__}",
+        volume_input="dataset.volume" if _category == "volume" else None,
+    )
+
+FEATURE_METADATA_BY_NAME = MappingProxyType(_feature_metadata)
 
 # 由注册表导出有序特征名视图（保持 import 兼容；vocab.py 侧整合见后续任务）
 FEATURE_NAMES = FEATURE_REGISTRY.feature_names

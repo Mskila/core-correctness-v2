@@ -37,6 +37,16 @@ class ShapeError(Exception):
     """
 
 
+class DomainError(Exception):
+    """An operator received finite operands outside its mathematical domain."""
+
+
+def _safe_divide(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if bool((y == 0).any()):
+        raise DomainError("DIV denominator must be non-zero")
+    return x / y
+
+
 def _ts_delay(x: torch.Tensor, d: int) -> torch.Tensor:
     if d == 0: return x
     out = torch.zeros_like(x)
@@ -80,7 +90,7 @@ def _ts_std(x: torch.Tensor, d: int) -> torch.Tensor:
     w = _ts_rolling(x, d)                          # [N, T, d]
     m = w.mean(dim=-1, keepdim=True)
     std = ((w - m) ** 2).mean(dim=-1).sqrt() + 1e-6
-    return torch.nan_to_num(std, nan=0.0)
+    return std
 
 
 def _ts_rank(x: torch.Tensor, d: int) -> torch.Tensor:
@@ -88,7 +98,7 @@ def _ts_rank(x: torch.Tensor, d: int) -> torch.Tensor:
     w = _ts_rolling(x, d)                          # [N, T, d]
     cur = w[:, :, -1:]                             # 当前值，[N, T, 1]
     rank = (w < cur).float().mean(dim=-1)          # [N, T]
-    return torch.nan_to_num(rank, nan=0.0)
+    return rank
 
 
 def _ts_corr_10(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -107,7 +117,7 @@ def _ts_corr_10(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     mask = (sx < 1e-6) | (sy < 1e-6)
     corr = cov / (sx * sy + 1e-8)
     corr[mask] = 0.0
-    return torch.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+    return corr
 
 
 # ── v3.0 新增算子 helper ─────────────────────────────────────────────
@@ -186,7 +196,7 @@ def _ema_simple(x: torch.Tensor, span: int, exact: bool = False) -> torch.Tensor
             )
         chunks.append((chunk * weights).sum(dim=-1)[:, :width])
     out = torch.cat(chunks, dim=1)
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out
 
 
 def _ts_quantile(x: torch.Tensor, d: int) -> torch.Tensor:
@@ -194,7 +204,7 @@ def _ts_quantile(x: torch.Tensor, d: int) -> torch.Tensor:
     w = _ts_rolling(x, d)
     cur = w[:, :, -1:]
     rank = (w <= cur).float().mean(dim=-1)
-    return torch.nan_to_num(rank, nan=0.5)
+    return rank
 
 
 def _ts_skew(x: torch.Tensor, d: int) -> torch.Tensor:
@@ -203,7 +213,7 @@ def _ts_skew(x: torch.Tensor, d: int) -> torch.Tensor:
     m = w.mean(dim=-1, keepdim=True)
     s = ((w - m) ** 2).mean(dim=-1).sqrt() + 1e-6
     skew = ((w - m) ** 3).mean(dim=-1) / (s ** 3)
-    return torch.nan_to_num(skew, nan=0.0, posinf=0.0, neginf=0.0)
+    return skew
 
 
 def _delta(x: torch.Tensor, d: int = 1) -> torch.Tensor:
@@ -240,8 +250,11 @@ def _decay_linear(x: torch.Tensor, d: int) -> torch.Tensor:
 def _decay_exp(x: torch.Tensor, d: int, alpha: float = 0.5) -> torch.Tensor:
     """指数衰减加权平均（近期权重更高）。与 DECAY_LINEAR 对应，平滑更激进。"""
     w = _ts_rolling(x, d)
-    weights = torch.tensor([alpha * (1 - alpha) ** i for i in range(d)],
-                           dtype=x.dtype, device=x.device)
+    weights = torch.tensor(
+        [alpha * (1 - alpha) ** (d - 1 - i) for i in range(d)],
+        dtype=x.dtype,
+        device=x.device,
+    )
     weights = weights / weights.sum()
     return (w * weights).sum(dim=-1)
 
@@ -261,16 +274,17 @@ def _ts_covariance(x: torch.Tensor, y: torch.Tensor, d: int) -> torch.Tensor:
     mx = wx.mean(dim=-1, keepdim=True)
     my = wy.mean(dim=-1, keepdim=True)
     cov = ((wx - mx) * (wy - my)).mean(dim=-1)
-    return torch.nan_to_num(cov, nan=0.0)
+    return cov
 
 
 def _ts_product(x: torch.Tensor, d: int) -> torch.Tensor:
     """d 期因果滑动乘积。用对数累加避免数值爆炸：prod = exp(sum(log(x+1)))。
     适合收益累积，输出接近 "过去 d 期累计收益"。
-    输入先 clamp 到 [-0.999, +inf)，避免 log1p 在 x<=-1 时产生 NaN。
+    输入必须严格大于 -1；域外输入由 VM 结构化报告。
     """
-    x_safe = torch.clamp(x, -0.999, None)
-    log_x = torch.log1p(x_safe)
+    if bool((x <= -1).any()):
+        raise DomainError("PRODUCT_5 requires every operand value to be > -1")
+    log_x = torch.log1p(x)
     padded = torch.cat(
         [
             torch.zeros(
@@ -283,18 +297,13 @@ def _ts_product(x: torch.Tensor, d: int) -> torch.Tensor:
     log_sum = padded[:, :x.shape[1]]
     for offset in range(1, d):
         log_sum = log_sum + padded[:, offset:offset + x.shape[1]]
-    # clamp 对数累加和防止 expm1 溢出到 float32 边界（>1e38）
-    log_sum = log_sum.clamp(-10.0, 10.0)
-    out = torch.expm1(log_sum)
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.expm1(log_sum)
 
 
 def _signed_power(x: torch.Tensor, a: float = 2.0) -> torch.Tensor:
     """带符号乘方: sign(x) * |x|^a。Alpha#001 SignedPower。保留符号同时放大极端值。"""
     out = torch.sign(x) * torch.abs(x) ** a
-    # 防溢出：|x|^a 在链式调用中可能爆炸到 float32 边界（如 3.3e38），
-    # 导致后续 mean/std 计算溢出为 inf。clamp 到安全范围。
-    return torch.nan_to_num(out.clamp(-1e9, 1e9), nan=0.0, posinf=0.0, neginf=0.0)
+    return out
 
 
 # ── 形状一致性校验包装（R2.9, R2.13）─────────────────────────────────────
@@ -349,7 +358,7 @@ _INITIAL_OPERATORS = [
     ('ADD',    lambda x, y: x + y,          2, 1),
     ('SUB',    lambda x, y: x - y,          2, 1),
     ('MUL',    lambda x, y: x * y,          2, 1),
-    ('DIV',    lambda x, y: x / (y + 1e-6), 2, 1),
+    ('DIV',    _safe_divide,                2, 1),
     ('NEG',    lambda x: -x,                1, 1),
     ('ABS',    torch.abs,                   1, 1),
     ('SIGN',   torch.sign,                  1, 1),
@@ -461,7 +470,7 @@ assert len(OPERATOR_REGISTRY.operator_specs) == len(_INITIAL_OPERATORS), (
 #
 # 新增 8 个算子（TS_SUM_5/10/20、MIN、MAX、POWER、SIGNED_LOG、SQRT），
 # 追加在既有 44 个 V2 单标的算子之后，保持既有顺序不变。
-# 全部算子出口 nan_to_num→0，满足形状契约 [N,T]→[N,T]（R2.9, R2.10）。
+# VM 统一验证中间结果有限性；算子不得把非有限结果静默改写为零。
 # 时序求和用因果 unfold（零填充），每步 t 只用 [t-w+1..t]（R2.11, R2.12）。
 
 
@@ -476,33 +485,33 @@ def _ts_sum(x: torch.Tensor, d: int) -> torch.Tensor:
 
 def _power_signed(x: torch.Tensor, a: float = 2.0) -> torch.Tensor:
     """符号幂变换（R2.5）：sign(x)*|x|^a，Alpha101 SignedPower 风格。
-    取 |x| 作为底数，避免负数的非整数幂；出口 clamp(-1e9, 1e9) 防爆炸。
+    取 |x| 作为底数，避免负数的非整数幂；溢出交由 VM fail-closed。
     """
     out = torch.sign(x) * torch.abs(x) ** a
-    return torch.nan_to_num(out.clamp(-1e9, 1e9), nan=0.0, posinf=0.0, neginf=0.0)
+    return out
 
 
 def _signed_log(x: torch.Tensor) -> torch.Tensor:
     """带符号自然对数（R2.5）：sign(x)*log1p(|x|)，全实数域安全，负输入不产 NaN。"""
     out = torch.sign(x) * torch.log1p(torch.abs(x))
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out
 
 
 def _signed_sqrt(x: torch.Tensor) -> torch.Tensor:
     """带符号平方根（R2.5）：sign(x)*sqrt(|x|)，负输入不产 NaN。"""
     out = torch.sign(x) * torch.sqrt(torch.abs(x))
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out
 
 
 # 算子列表（追加在既有 44 个 V2 单标算子之后）
 _TASK33_OPERATORS = [
     # 时序求和（arity 1，因果，R2.3）
-    ('TS_SUM_5',    lambda x: torch.nan_to_num(_ts_sum(x, 5),  nan=0.0), 1, 5),
-    ('TS_SUM_10',   lambda x: torch.nan_to_num(_ts_sum(x, 10), nan=0.0), 1, 10),
-    ('TS_SUM_20',   lambda x: torch.nan_to_num(_ts_sum(x, 20), nan=0.0), 1, 20),
+    ('TS_SUM_5',    lambda x: _ts_sum(x, 5),  1, 5),
+    ('TS_SUM_10',   lambda x: _ts_sum(x, 10), 1, 10),
+    ('TS_SUM_20',   lambda x: _ts_sum(x, 20), 1, 20),
     # 元素级二元极值（arity 2，天然因果，R2.4）
-    ('MIN', lambda x, y: torch.nan_to_num(torch.minimum(x, y), nan=0.0), 2, 1),
-    ('MAX', lambda x, y: torch.nan_to_num(torch.maximum(x, y), nan=0.0), 2, 1),
+    ('MIN', torch.minimum, 2, 1),
+    ('MAX', torch.maximum, 2, 1),
     # 幅度变换（arity 1，天然因果，R2.5）
     ('POWER',      lambda x: _power_signed(x, 2.0), 1, 1),
     ('SIGNED_LOG', _signed_log,                      1, 1),
@@ -582,7 +591,7 @@ def _winsorize(x: torch.Tensor, lo: float = 0.05, hi: float = 0.95) -> torch.Ten
     safe_lower = torch.where(span < 1e-9, x, lower)
     safe_upper = torch.where(span < 1e-9, x, upper)
     out = torch.clamp(x, safe_lower, safe_upper)
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out
 
 
 def _clip_fixed(x: torch.Tensor) -> torch.Tensor:
@@ -593,13 +602,13 @@ def _clip_fixed(x: torch.Tensor) -> torch.Tensor:
 def _sigmoid_squash(x: torch.Tensor) -> torch.Tensor:
     """2*sigmoid(x)-1，squash 到 [-1, 1]（R2.6）。"""
     out = 2.0 * torch.sigmoid(x) - 1.0
-    return torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0)
+    return out
 
 
 def _tanh_squash(x: torch.Tensor) -> torch.Tensor:
     """tanh(x)，squash 到 (-1, 1)（R2.6）。"""
     out = torch.tanh(x)
-    return torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0)
+    return out
 
 
 # 条件/逻辑算子（R2.7）—— 全部形状校验（由 _with_shape_check 包装）
@@ -607,25 +616,25 @@ def _tanh_squash(x: torch.Tensor) -> torch.Tensor:
 def _gt(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """(x > y).float()，形状校验（R2.7）。"""
     out = (x > y).float()
-    return torch.nan_to_num(out, nan=0.0)
+    return out
 
 
 def _lt(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """(x < y).float()，形状校验（R2.7）。"""
     out = (x < y).float()
-    return torch.nan_to_num(out, nan=0.0)
+    return out
 
 
 def _and(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """((x>0) & (y>0)).float()，形状校验（R2.7）。"""
     out = ((x > 0) & (y > 0)).float()
-    return torch.nan_to_num(out, nan=0.0)
+    return out
 
 
 def _or(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """((x>0) | (y>0)).float()，形状校验（R2.7）。"""
     out = ((x > 0) | (y > 0)).float()
-    return torch.nan_to_num(out, nan=0.0)
+    return out
 
 
 def _if_gt(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -633,7 +642,7 @@ def _if_gt(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
     语义：条件操作数 x>0 时取 y，否则取 z。
     """
     out = torch.where(x > 0, y, z)
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out
 
 
 _TASK34_OPERATORS = [

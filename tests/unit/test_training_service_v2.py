@@ -103,7 +103,8 @@ class OneManager:
         DatasetIdentity(
             schema_version=DATA_SCHEMA_VERSION,
             canonicalization_version=DATA_CANONICALIZATION_VERSION,
-            time_unit="ns", gap_policy="segment", symbol="EURUSD", timeframe="H1",
+            time_unit="ns", gap_policy="segment", volume_type="tick",
+            symbol="EURUSD", timeframe="H1",
             start_time_ns=1_000, end_time_ns=9_000_000, bars=9_000,
             data_fingerprint="a" * 64, time_fingerprint="b" * 64,
         ),
@@ -298,7 +299,8 @@ def test_resume_discovers_canonicalized_filename_by_internal_identity(
             DatasetIdentity(
                 schema_version=DATA_SCHEMA_VERSION,
                 canonicalization_version=DATA_CANONICALIZATION_VERSION,
-                time_unit="ns", gap_policy="segment", symbol=symbol, timeframe="H1",
+                time_unit="ns", gap_policy="segment", volume_type="tick",
+                symbol=symbol, timeframe="H1",
                 start_time_ns=1_000, end_time_ns=9_000_000, bars=9_000,
                 data_fingerprint="c" * 64, time_fingerprint="d" * 64,
             ),
@@ -325,7 +327,8 @@ def _identity_for_symbol(symbol, fingerprint="e"):
             DatasetIdentity(
                 schema_version=DATA_SCHEMA_VERSION,
                 canonicalization_version=DATA_CANONICALIZATION_VERSION,
-                time_unit="ns", gap_policy="segment", symbol=symbol, timeframe="H1",
+                time_unit="ns", gap_policy="segment", volume_type="tick",
+                symbol=symbol, timeframe="H1",
                 start_time_ns=1_000, end_time_ns=9_000_000, bars=9_000,
                 data_fingerprint=fingerprint * 64,
                 time_fingerprint="f" * 64,
