@@ -85,8 +85,11 @@ def _run_cost_case_or_assert_fail_closed(
     except DataValidationError as exc:
         message = str(exc)
         assert cost_rate > 0.0
-        assert "cost" in message
-        assert "underflow" in message or "representable" in message
+        assert "cost" in message or "portfolio simple return" in message
+        assert any(
+            term in message
+            for term in ("underflow", "representable", "preserved", "insolvency")
+        )
         return None
 
     if cost_rate > 0.0:
@@ -225,7 +228,7 @@ def test_deterministic_smooth_float32_paths_preserve_every_nonzero_cost(
     assert bool((result.cost[valid][nonzero_turnover] > 0).all())
     torch.testing.assert_close(
         result.gross_pnl[valid] - result.cost[valid],
-        result.net_pnl[valid],
-        rtol=0.0,
+        torch.expm1(result.net_pnl[valid]),
+        rtol=2e-15,
         atol=0.0,
     )

@@ -27,6 +27,7 @@ from model_core.artifacts import (
     StrategyArtifact,
     validate_backtest_dataset,
 )
+from model_core.execution import classify_position_events
 
 
 DEFAULT_COMMISSION_PCT = 0.02
@@ -1377,6 +1378,13 @@ def run_backtest(
             f"difference={difference!r} tolerance=1e-8"
         )
 
+    event_counts = [
+        classify_position_events(
+            result.execution.position[index, result.execution.target_valid[index]]
+        )
+        for index in range(result.execution.position.shape[0])
+    ]
+
     generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     mode_label = MODE_LABELS[selected_mode]
     report: dict[str, object] = {
@@ -1406,6 +1414,29 @@ def run_backtest(
             "slippage_pct": slippage,
             "cost_rate": cost_rate,
             "total_cost_rate": cost_rate,
+            "unit": "equity_fraction_simple_return",
+        },
+        "return_accounting": {
+            "asset_input": "log_return",
+            "asset_conversion": "asset_simple=expm1(asset_log_return)",
+            "gross_unit": "equity_fraction_simple_return",
+            "cost_unit": "equity_fraction_simple_return",
+            "net_fact": "net_log_return=log1p(gross_simple_return-cost)",
+            "insolvency_boundary": "gross_simple_return-cost<=-1 is invalid",
+            "portfolio_weighting": "equal_weight_by_exit_timestamp",
+        },
+        "trade_statistics": {
+            "turnover_events": sum(value.turnover_events for value in event_counts),
+            "entries": sum(value.entries for value in event_counts),
+            "exits": sum(value.exits for value in event_counts),
+            "reversals": sum(value.reversals for value in event_counts),
+            "liquidation_events": sum(
+                value.liquidation_events for value in event_counts
+            ),
+            "display_trades": sum(value.display_trades for value in event_counts),
+            "n_trades": sum(value.display_trades for value in event_counts),
+            "n_trades_definition": "display_trades=entries+reversals",
+            "turnover_definition": "every non-zero absolute position change",
         },
         "min_exposure": min_exposure,
         "formula_tokens": list(strategy.formula_tokens),

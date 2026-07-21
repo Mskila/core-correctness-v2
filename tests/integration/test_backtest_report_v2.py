@@ -160,6 +160,8 @@ def test_replay_report_has_complete_identity_cost_metrics_and_name(lifecycle) ->
         "test_start_time_ns",
         "test_end_time_ns",
         "cost",
+        "return_accounting",
+        "trade_statistics",
         "min_exposure",
         "metrics",
         "ledger",
@@ -173,6 +175,11 @@ def test_replay_report_has_complete_identity_cost_metrics_and_name(lifecycle) ->
     assert report["training_dataset"] == lifecycle["train_identity"].to_dict()
     assert report["test_dataset"] == lifecycle["train_identity"].to_dict()
     assert report["cost"]["cost_rate"] == pytest.approx(0.0003)
+    assert report["cost"]["unit"] == "equity_fraction_simple_return"
+    assert report["return_accounting"]["net_fact"].startswith("net_log_return=log1p")
+    assert report["trade_statistics"]["n_trades_definition"] == (
+        "display_trades=entries+reversals"
+    )
     assert set(report["metrics"]) >= {"periods_per_year", "sharpe", "sortino"}
     assert report["ledger_reconciliation"]["absolute_difference"] <= 1e-8
     assert "in_sample_replay_EURUSD" in report_path.name
