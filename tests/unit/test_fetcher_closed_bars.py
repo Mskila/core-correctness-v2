@@ -268,7 +268,7 @@ def test_direct_scalar_payload_is_reported_as_data_validation_error(
         fetcher.fetch("EURUSD", 16385, 3)
 
 
-def test_offline_fetcher_canonicalizes_legacy_cache_without_disk_mutation(
+def test_offline_fetcher_rejects_unversioned_numeric_legacy_cache_without_mutation(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cache = KlineCache(tmp_path, timeframe=16385)
@@ -284,10 +284,8 @@ def test_offline_fetcher_canonicalizes_legacy_cache_without_disk_mutation(
     before = path.read_bytes()
     monkeypatch.setattr("data_pipeline.kline_cache._default_cache_dir", lambda: tmp_path)
 
-    actual = MT5DataFetcher(offline=True).fetch("EURUSD", 16385, 4)
-
-    assert actual.columns.tolist() == ["time", "open", "high", "low", "close", "volume"]
-    assert str(actual["time"].dtype) == "datetime64[ns, UTC]"
+    with pytest.raises(DataValidationError, match=r"provenance|unit"):
+        MT5DataFetcher(offline=True).fetch("EURUSD", 16385, 4)
     assert path.read_bytes() == before
 
 

@@ -2,6 +2,7 @@ import pytest
 
 from model_core.semantics import (
     CORE_SEMANTICS_VERSION,
+    DATA_CANONICALIZATION_VERSION,
     DATA_SCHEMA_VERSION,
     EXECUTION_SEMANTICS_VERSION,
     LABEL_LOOKAHEAD_BARS,
@@ -17,7 +18,8 @@ from model_core.semantics import (
 
 def test_v2_semantics_constants_are_explicit() -> None:
     assert CORE_SEMANTICS_VERSION == "2"
-    assert DATA_SCHEMA_VERSION == "ohlcv-v2"
+    assert DATA_SCHEMA_VERSION == "ohlcv-v3"
+    assert DATA_CANONICALIZATION_VERSION == "float32-le-ns-gap-v1"
     assert LABEL_SEMANTICS_VERSION == "close-t__open-t1-to-open-t2-v2"
     assert EXECUTION_SEMANTICS_VERSION == "tanh-threshold-cost-liquidate-v2"
     assert LABEL_LOOKAHEAD_BARS == 2

@@ -19,7 +19,11 @@ from data_pipeline.validation import (
     float32_ohlcv_arrays,
     normalize_timeframe_name,
 )
-from model_core.semantics import DATA_SCHEMA_VERSION, DataValidationError
+from model_core.semantics import (
+    DATA_CANONICALIZATION_VERSION,
+    DATA_SCHEMA_VERSION,
+    DataValidationError,
+)
 
 
 def valid_frame() -> pd.DataFrame:
@@ -158,7 +162,7 @@ def test_canonical_output_maps_tick_volume_and_has_fixed_schema() -> None:
         "volume",
     ]
     assert str(result.frame["time"].dtype) == "datetime64[ns, UTC]"
-    assert all(result.frame[column].dtype == np.dtype("float64") for column in result.frame.columns[1:])
+    assert all(result.frame[column].dtype == np.dtype("float32") for column in result.frame.columns[1:])
     assert result.frame["volume"].tolist() == valid_frame()["volume"].tolist()
     assert result.identity.timeframe == "H1"
 
@@ -171,17 +175,14 @@ def test_existing_volume_takes_precedence_over_tick_volume() -> None:
     assert result.frame["volume"].tolist() == valid_frame()["volume"].tolist()
 
 
-def test_time_is_stably_sorted_without_changing_bar_contents() -> None:
+def test_nonmonotonic_time_is_rejected_instead_of_silently_sorted() -> None:
     frame = valid_frame().iloc[[2, 0, 1, 5, 3, 4]].copy()
-    expected = valid_frame().reset_index(drop=True)
-    expected["time"] = expected["time"].astype("datetime64[ns, UTC]")
 
-    result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
-
-    pd.testing.assert_frame_equal(result.frame, expected)
+    with pytest.raises(DataValidationError, match="strictly increasing"):
+        canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
 
-def test_numeric_time_preserves_rows_with_nonmonotonic_input_index() -> None:
+def test_numeric_nonmonotonic_time_is_rejected_independent_of_index() -> None:
     frame = pd.DataFrame(
         {
             "time": _UNIQUE_PURE_NUMERIC_TIMES["s"][:3],
@@ -194,21 +195,14 @@ def test_numeric_time_preserves_rows_with_nonmonotonic_input_index() -> None:
     ).iloc[[2, 0, 1]]
     reset = frame.reset_index(drop=True)
 
-    retained_index = canonicalize_ohlcv(
-        frame,
-        symbol="EURUSD",
-        timeframe="H1",
-        numeric_time_unit="s",
-    )
-    reset_index = canonicalize_ohlcv(
-        reset,
-        symbol="EURUSD",
-        timeframe="H1",
-        numeric_time_unit="s",
-    )
-
-    pd.testing.assert_frame_equal(retained_index.frame, reset_index.frame)
-    assert retained_index.identity == reset_index.identity
+    for candidate in (frame, reset):
+        with pytest.raises(DataValidationError, match="strictly increasing"):
+            canonicalize_ohlcv(
+                candidate,
+                symbol="EURUSD",
+                timeframe="H1",
+                numeric_time_unit="s",
+            )
 
 
 def _time_values_for_index_invariance(kind: str) -> list[object]:
@@ -255,7 +249,6 @@ def test_canonicalization_is_independent_of_input_index_labels(
 ) -> None:
     frame = valid_frame()
     frame["time"] = _time_values_for_index_invariance(time_kind)
-    frame = frame.iloc[[4, 1, 5, 0, 3, 2]].copy()
     if index_kind == "duplicate":
         frame.index = [7, 7, 2, 2, 9, 9]
     elif index_kind == "string":
@@ -287,7 +280,7 @@ def test_canonicalization_is_independent_of_input_index_labels(
     assert frame.index.equals(expected_index)
 
 
-def test_unsorted_rows_keep_time_ohlcv_and_volume_bound_together() -> None:
+def test_unsorted_rows_are_rejected_without_mutating_input() -> None:
     frame = valid_frame()
     frame["time"] = _time_values_for_index_invariance("ms")
     frame["open"] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
@@ -299,29 +292,13 @@ def test_unsorted_rows_keep_time_ohlcv_and_volume_bound_together() -> None:
     frame.index = ["f", "c", "a", "e", "b", "d"]
     expected_input = frame.copy(deep=True)
 
-    dataset = canonicalize_ohlcv(
-        frame,
-        symbol="EURUSD",
-        timeframe="H1",
-        numeric_time_unit="ms",
-    )
-
-    assert list(
-        zip(
-            dataset.frame["open"].tolist(),
-            dataset.frame["high"].tolist(),
-            dataset.frame["low"].tolist(),
-            dataset.frame["close"].tolist(),
-            dataset.frame["volume"].tolist(),
+    with pytest.raises(DataValidationError, match="strictly increasing"):
+        canonicalize_ohlcv(
+            frame,
+            symbol="EURUSD",
+            timeframe="H1",
+            numeric_time_unit="ms",
         )
-    ) == [
-        (10.0, 11.0, 9.0, 10.25, 100.0),
-        (20.0, 21.0, 19.0, 20.25, 200.0),
-        (30.0, 31.0, 29.0, 30.25, 300.0),
-        (40.0, 41.0, 39.0, 40.25, 400.0),
-        (50.0, 51.0, 49.0, 50.25, 500.0),
-        (60.0, 61.0, 59.0, 60.25, 600.0),
-    ]
     pd.testing.assert_frame_equal(frame, expected_input)
 
 
@@ -372,8 +349,9 @@ def test_explicit_numeric_time_unit_round_trips_real_cadence(
 ) -> None:
     timestamps = [base + step * offset for offset in offsets]
 
+    ordered = sorted(timestamps)
     dataset = canonicalize_ohlcv(
-        _frame_with_numeric_times(timestamps),
+        _frame_with_numeric_times(ordered),
         symbol="EURUSD",
         timeframe="H1",
         numeric_time_unit=unit,
@@ -510,14 +488,15 @@ def test_four_numeric_controls_round_trip_with_declared_unit(
     unit: str,
     timestamps: list[int],
 ) -> None:
+    ordered = sorted(timestamps)
     dataset = canonicalize_ohlcv(
-        _frame_with_numeric_times(timestamps),
+        _frame_with_numeric_times(ordered),
         symbol="EURUSD",
         timeframe="H1",
         numeric_time_unit=unit,
     )
 
-    expected = sorted(value * _TEST_TIME_UNIT_NS[unit] for value in timestamps)
+    expected = [value * _TEST_TIME_UNIT_NS[unit] for value in ordered]
     assert dataset.frame["time"].astype("int64").tolist() == expected
 
 
@@ -710,7 +689,7 @@ def test_epoch_origin_matrix_round_trips_declared_unit(
         timestamp_ns // _TEST_TIME_UNIT_NS[unit]
         for timestamp_ns in semantic_ns
     ]
-    frame = _frame_with_numeric_times(timestamps).iloc[[3, 0, 4, 1, 2]]
+    frame = _frame_with_numeric_times(timestamps)
 
     result = canonicalize_ohlcv(
         frame,
@@ -854,7 +833,7 @@ def test_cadence_multiple_matrix_round_trips_declared_unit(
         semantic_ns.append(semantic_ns[-1] + multiplier * nominal_ns)
     encoded = [timestamp_ns // unit_ns for timestamp_ns in semantic_ns]
     frame = valid_frame().iloc[:3].copy()
-    frame["time"] = encoded[::-1]
+    frame["time"] = encoded
 
     dataset = canonicalize_ohlcv(
         frame,
@@ -921,14 +900,10 @@ def test_numeric_epoch_matrix_round_trips_generator_declared_unit() -> None:
                         base_ns + offset * _TEST_H1_NS for offset in offsets
                     ]
                     encoded = [value // unit_ns for value in semantic_ns]
-                    orders = [
-                        list(range(length)),
-                        list(reversed(range(length))),
-                        list(range(1, length)) + [0],
-                    ]
+                    orders = [list(range(length))]
                     expected_identity = None
                     for order_name, order in zip(
-                        ("forward", "reverse", "rotate"),
+                        ("forward",),
                         orders,
                     ):
                         cases += 1
@@ -964,8 +939,8 @@ def test_numeric_epoch_matrix_round_trips_generator_declared_unit() -> None:
                                 )
                             )
 
-    assert cases == 1_440
-    assert successful_cases == 1_440
+    assert cases == 480
+    assert successful_cases == 480
     assert not failures, (
         f"declared-unit round-trip mismatches: {len(failures)}/1440; {failures[:5]}"
     )
@@ -986,7 +961,7 @@ def test_long_irregular_numeric_sequences_round_trip_declared_unit(
         offsets.append(offsets[-1] + gap)
     semantic_ns = [base_ns + offset * _TEST_H1_NS for offset in offsets]
     encoded = [value // unit_ns for value in semantic_ns]
-    frame = _frame_with_numeric_times(encoded).iloc[[7, 2, 0, 5, 1, 6, 3, 4]]
+    frame = _frame_with_numeric_times(encoded)
 
     dataset = canonicalize_ohlcv(
         frame,
@@ -1549,7 +1524,7 @@ def test_integer_numeric_timestamp_units_have_stable_utc_identity(
     expected_ns: int,
 ) -> None:
     frame = valid_frame().iloc[:3].copy()
-    frame["time"] = timestamps[::-1]
+    frame["time"] = timestamps
 
     result = canonicalize_ohlcv(
         frame,
@@ -1650,6 +1625,9 @@ def test_fingerprint_is_index_and_timezone_independent_and_content_sensitive() -
 
 _IDENTITY_FIELDS = (
     "schema_version",
+    "canonicalization_version",
+    "time_unit",
+    "gap_policy",
     "symbol",
     "timeframe",
     "start_time_ns",
@@ -1663,6 +1641,9 @@ _IDENTITY_FIELDS = (
 def valid_identity_payload() -> dict[str, object]:
     return {
         "schema_version": DATA_SCHEMA_VERSION,
+        "canonicalization_version": DATA_CANONICALIZATION_VERSION,
+        "time_unit": "ns",
+        "gap_policy": "segment",
         "symbol": "EURUSD",
         "timeframe": "H1",
         "start_time_ns": 1_000,
@@ -1847,6 +1828,12 @@ def test_dataset_identity_to_dict_revalidates_bypassed_mutation() -> None:
 _INVALID_IDENTITY_VALUES = (
     ("schema_version", 2),
     ("schema_version", "ohlcv-v1"),
+    ("canonicalization_version", "legacy-canonicalization"),
+    ("canonicalization_version", 1),
+    ("time_unit", "s"),
+    ("time_unit", 1),
+    ("gap_policy", "allow"),
+    ("gap_policy", True),
     ("symbol", 7),
     ("symbol", True),
     ("symbol", ""),
@@ -2118,7 +2105,8 @@ def test_exact_integral_non_builtin_numeric_values_remain_exact(
 
     result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
-    assert result.frame["volume"].tolist() == [float(value)] * len(frame)
+    expected = float(np.float32(float(value)))
+    assert result.frame["volume"].tolist() == [expected] * len(frame)
 
 
 def test_non_integral_decimal_behavior_is_unchanged() -> None:
@@ -2151,7 +2139,7 @@ def test_distinct_lossy_integral_sources_cannot_share_a_canonical_identity() -> 
 
 
 @pytest.mark.parametrize("value", [2**53, 2**53 + 2])
-def test_exactly_representable_large_integers_remain_exact(value: int) -> None:
+def test_exact_float64_large_integers_are_canonically_quantized(value: int) -> None:
     frame = valid_frame()
     frame["open"] = pd.Series([value] * len(frame), dtype="int64")
     frame["high"] = pd.Series([value + 2] * len(frame), dtype="int64")
@@ -2162,7 +2150,9 @@ def test_exactly_representable_large_integers_remain_exact(value: int) -> None:
     result = canonicalize_ohlcv(frame, symbol="EURUSD", timeframe="H1")
 
     for field in ["open", "low", "close", "volume"]:
-        assert result.frame[field].tolist() == [float(value)] * len(frame)
+        expected = float(np.float32(value))
+        assert result.frame[field].tolist() == [expected] * len(frame)
+    assert result.frame["high"].tolist() == [float(np.float32(value + 2))] * len(frame)
 
 
 @pytest.mark.parametrize(
@@ -2200,28 +2190,23 @@ def test_zero_and_negative_zero_volume_remain_valid_float32() -> None:
 
 
 @pytest.mark.parametrize("field", ["open", "high", "low", "close", "volume"])
-@pytest.mark.parametrize(
-    ("value", "message"),
-    [(1.0e-50, "non-zero"), (1.0e40, "finite")],
-    ids=["underflow", "overflow"],
-)
-def test_float32_conversion_rejects_each_field_without_silent_change(
+@pytest.mark.parametrize("value", [1.0e40, float("inf"), float("nan")])
+def test_float32_conversion_rejects_nonfinite_or_overflow(
     field: str,
     value: float,
-    message: str,
 ) -> None:
     canonical = _float32_exact_canonical_frame()
     canonical[field] = value
 
     with pytest.raises(
         DataValidationError,
-        match=rf"{message}.*field={field}",
+        match=rf"finite.*field={field}",
     ):
         float32_ohlcv_arrays(canonical)
 
 
 @pytest.mark.parametrize("field", ["open", "high", "low", "close", "volume"])
-def test_float32_conversion_rejects_each_lossy_finite_round_trip(
+def test_float32_conversion_quantizes_each_lossy_finite_round_trip(
     field: str,
 ) -> None:
     canonical = _float32_exact_canonical_frame()
@@ -2230,11 +2215,18 @@ def test_float32_conversion_rejects_each_lossy_finite_round_trip(
         dtype=np.float64,
     )
 
-    with pytest.raises(
-        DataValidationError,
-        match=rf"float32.*field={field}",
-    ):
-        float32_ohlcv_arrays(canonical)
+    converted = float32_ohlcv_arrays(canonical)[field]
+    np.testing.assert_array_equal(converted, canonical[field].to_numpy(dtype=np.float32))
+
+
+@pytest.mark.parametrize("field", ["open", "high", "low", "close", "volume"])
+def test_float32_conversion_allows_finite_underflow(field: str) -> None:
+    canonical = _float32_exact_canonical_frame()
+    canonical[field] = 1.0e-50
+
+    converted = float32_ohlcv_arrays(canonical)[field]
+
+    assert np.equal(converted, 0.0).all()
 
 
 @pytest.mark.parametrize("field", ["open", "high", "low", "close", "volume"])

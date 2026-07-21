@@ -20,6 +20,7 @@ from model_core.semantics import DataValidationError, DatasetAlignmentError
 
 def compute_forward_open_returns(
     open_prices: torch.Tensor,
+    segment_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the V2 t+1-open to t+2-open label and validity mask."""
     if open_prices.ndim != 2 or open_prices.shape[1] < 3:
@@ -70,6 +71,13 @@ def compute_forward_open_returns(
     valid = torch.zeros_like(open_prices, dtype=torch.bool)
     values[:, :-2] = forward_returns
     valid[:, :-2] = True
+    if segment_ids is not None:
+        if segment_ids.shape != open_prices.shape or segment_ids.dtype != torch.int64:
+            raise DataValidationError(
+                "segment_ids must be int64 with the same shape as open prices"
+            )
+        valid[:, :-2] &= segment_ids[:, 1:-1] == segment_ids[:, 2:]
+        values = torch.where(valid, values, torch.zeros_like(values))
     return values, valid
 
 
@@ -81,8 +89,9 @@ class MT5DataManager:
     ``target_valid`` and ``bar_time``. ``bar_time`` stores UTC nanoseconds.
     """
 
-    def __init__(self, fetcher: MT5DataFetcher) -> None:
+    def __init__(self, fetcher: MT5DataFetcher, *, gap_policy: str = "segment") -> None:
         self._fetcher = fetcher
+        self._gap_policy = gap_policy
         self._requested_symbols: list[str] | None = None
         self._clear_loaded_state()
 
@@ -92,6 +101,7 @@ class MT5DataManager:
         self._target_ret: torch.Tensor | None = None
         self._target_valid: torch.Tensor | None = None
         self._data_identities: tuple[DatasetIdentity, ...] | None = None
+        self._segment_ids: torch.Tensor | None = None
 
     def load(self, symbols: list[str] | None = None) -> None:
         """Fetch, validate and strictly align requested symbols."""
@@ -119,6 +129,7 @@ class MT5DataManager:
                 symbol=symbol,
                 timeframe=timeframe,
                 numeric_time_unit="s",
+                gap_policy=self._gap_policy,
             )
             canonical_frames[symbol] = dataset.frame
 
@@ -128,6 +139,7 @@ class MT5DataManager:
                 aligned[symbol],
                 symbol=symbol,
                 timeframe=timeframe,
+                gap_policy=self._gap_policy,
             )
             for symbol in symbol_list
         }
@@ -136,8 +148,12 @@ class MT5DataManager:
             symbol: aligned_datasets[symbol].frame for symbol in symbol_list
         }
         raw_dict = self._build_raw_dict(aligned_frames, symbol_list)
+        segment_ids = torch.tensor(
+            np.stack([aligned_datasets[symbol].segment_ids for symbol in symbol_list]),
+            dtype=torch.int64,
+        )
         target_ret, target_valid = compute_forward_open_returns(
-            raw_dict["open"]
+            raw_dict["open"], segment_ids
         )
         data_identities = tuple(
             aligned_datasets[symbol].identity for symbol in symbol_list
@@ -148,6 +164,7 @@ class MT5DataManager:
         self._target_ret = target_ret
         self._target_valid = target_valid
         self._data_identities = data_identities
+        self._segment_ids = segment_ids
         self._requested_symbols = None if symbols is None else list(symbol_list)
         logger.info(
             f"Data loaded. raw_dict shape: N={len(self._symbols)}, "
@@ -202,6 +219,11 @@ class MT5DataManager:
     def symbols(self) -> list[str]:
         return list(self._symbols)
 
+    @property
+    def segment_ids(self) -> torch.Tensor:
+        self._ensure_loaded()
+        return self._segment_ids.clone()  # type: ignore[union-attr]
+
     def _ensure_loaded(self) -> None:
         if (
             not self._symbols
@@ -209,6 +231,7 @@ class MT5DataManager:
             or self._target_ret is None
             or self._target_valid is None
             or self._data_identities is None
+            or self._segment_ids is None
         ):
             raise RuntimeError("Data not loaded. Call MT5DataManager.load() first.")
 

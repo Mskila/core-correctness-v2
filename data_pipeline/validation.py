@@ -12,7 +12,11 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from model_core.semantics import DATA_SCHEMA_VERSION, DataValidationError
+from model_core.semantics import (
+    DATA_CANONICALIZATION_VERSION,
+    DATA_SCHEMA_VERSION,
+    DataValidationError,
+)
 
 
 _CANONICAL_COLUMNS = ("time", "open", "high", "low", "close", "volume")
@@ -45,8 +49,12 @@ _TIMEFRAME_NS = {
     "W1": 7 * 24 * 60 * 60 * 1_000_000_000,
 }
 _CANONICAL_TIMEFRAMES = frozenset({*_TIMEFRAME_NS, "MN1"})
+_GAP_POLICIES = frozenset({"reject", "segment", "explicitly-allowed"})
 _DATASET_IDENTITY_FIELDS = (
     "schema_version",
+    "canonicalization_version",
+    "time_unit",
+    "gap_policy",
     "symbol",
     "timeframe",
     "start_time_ns",
@@ -96,6 +104,31 @@ def _validate_dataset_identity_values(value: Mapping[str, object]) -> None:
             "schema_version",
             expected=f"exact str {DATA_SCHEMA_VERSION!r}",
             actual=schema_version,
+        )
+
+    canonicalization_version = value["canonicalization_version"]
+    if (
+        type(canonicalization_version) is not str
+        or canonicalization_version != DATA_CANONICALIZATION_VERSION
+    ):
+        _raise_identity_field_error(
+            "canonicalization_version",
+            expected=f"exact str {DATA_CANONICALIZATION_VERSION!r}",
+            actual=canonicalization_version,
+        )
+
+    time_unit = value["time_unit"]
+    if type(time_unit) is not str or time_unit != "ns":
+        _raise_identity_field_error(
+            "time_unit", expected="exact str 'ns'", actual=time_unit
+        )
+
+    gap_policy = value["gap_policy"]
+    if type(gap_policy) is not str or gap_policy not in _GAP_POLICIES:
+        _raise_identity_field_error(
+            "gap_policy",
+            expected=f"exact str in {sorted(_GAP_POLICIES)!r}",
+            actual=gap_policy,
         )
 
     symbol = value["symbol"]
@@ -158,6 +191,9 @@ def _validate_dataset_identity_values(value: Mapping[str, object]) -> None:
 @dataclass(frozen=True, init=False)
 class DatasetIdentity:
     schema_version: str
+    canonicalization_version: str
+    time_unit: str
+    gap_policy: str
     symbol: str
     timeframe: str
     start_time_ns: int
@@ -169,6 +205,9 @@ class DatasetIdentity:
     def __init__(
         self,
         schema_version: object = _MISSING_IDENTITY_FIELD,
+        canonicalization_version: object = _MISSING_IDENTITY_FIELD,
+        time_unit: object = _MISSING_IDENTITY_FIELD,
+        gap_policy: object = _MISSING_IDENTITY_FIELD,
         symbol: object = _MISSING_IDENTITY_FIELD,
         timeframe: object = _MISSING_IDENTITY_FIELD,
         start_time_ns: object = _MISSING_IDENTITY_FIELD,
@@ -184,6 +223,9 @@ class DatasetIdentity:
                 _DATASET_IDENTITY_FIELDS,
                 (
                     schema_version,
+                    canonicalization_version,
+                    time_unit,
+                    gap_policy,
                     symbol,
                     timeframe,
                     start_time_ns,
@@ -238,21 +280,33 @@ class CanonicalDataset:
     _frame: pd.DataFrame = field(repr=False, compare=False)
     identity: DatasetIdentity
     gap_count: int
+    _segment_ids: np.ndarray = field(repr=False, compare=False)
 
     def __init__(
         self,
         frame: pd.DataFrame,
         identity: DatasetIdentity,
         gap_count: int,
+        segment_ids: np.ndarray,
     ) -> None:
         object.__setattr__(self, "_frame", frame.copy(deep=True))
         object.__setattr__(self, "identity", identity)
         object.__setattr__(self, "gap_count", gap_count)
+        object.__setattr__(
+            self,
+            "_segment_ids",
+            np.asarray(segment_ids, dtype=np.int64).copy(),
+        )
 
     @property
     def frame(self) -> pd.DataFrame:
         """Return a defensive copy so content cannot diverge from identity."""
         return self._frame.copy(deep=True)
+
+    @property
+    def segment_ids(self) -> np.ndarray:
+        """Return defensive per-bar segment identifiers."""
+        return self._segment_ids.copy()
 
 
 def normalize_timeframe_name(value: str | int) -> str:
@@ -336,6 +390,16 @@ def _normalize_numeric_time_unit(value: object) -> str:
             return normalized
     raise DataValidationError(
         "numeric time unit must be one of s, ms, us or ns"
+    )
+
+
+def _normalize_gap_policy(value: object) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _GAP_POLICIES:
+            return normalized
+    raise DataValidationError(
+        "gap policy must be one of reject, segment or explicitly-allowed"
     )
 
 
@@ -446,7 +510,7 @@ def _coerce_value_column(values: pd.Series, *, field: str) -> pd.Series:
 
 
 def float32_ohlcv_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
-    """Convert canonical OHLCV values to float32 without silent value loss."""
+    """Return finite canonical float32 values without requiring exact reversal."""
     converted: dict[str, np.ndarray] = {}
     for field in _VALUE_COLUMNS:
         source = frame[field].to_numpy(dtype=np.float64, copy=False)
@@ -457,17 +521,7 @@ def float32_ohlcv_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
                 "OHLCV values must remain finite after float32 conversion: "
                 f"field={field}"
             )
-        if np.any((source != 0.0) & (values == 0.0)):
-            raise DataValidationError(
-                "OHLCV values must remain non-zero after float32 conversion: "
-                f"field={field}"
-            )
-        if not np.equal(values.astype(np.float64), source).all():
-            raise DataValidationError(
-                "OHLCV values must round-trip exactly through float32 conversion: "
-                f"field={field}"
-            )
-        converted[field] = values
+        converted[field] = values.astype("<f4", copy=False)
     return converted
 
 
@@ -476,13 +530,17 @@ def _fingerprints(
     frame: pd.DataFrame,
     symbol: str,
     timeframe: str,
+    gap_policy: str,
 ) -> tuple[str, str, np.ndarray]:
     time_ns = frame["time"].astype("int64").to_numpy(dtype="<i8", copy=True)
-    value_bytes = frame.loc[:, _VALUE_COLUMNS].to_numpy(dtype="<f8", copy=True)
+    value_bytes = frame.loc[:, _VALUE_COLUMNS].to_numpy(dtype="<f4", copy=True)
     metadata = {
         "bars": len(frame),
         "end_time_ns": int(time_ns[-1]),
         "schema_version": DATA_SCHEMA_VERSION,
+        "canonicalization_version": DATA_CANONICALIZATION_VERSION,
+        "time_unit": "ns",
+        "gap_policy": gap_policy,
         "start_time_ns": int(time_ns[0]),
         "symbol": symbol,
         "timeframe": timeframe,
@@ -508,12 +566,14 @@ def canonicalize_ohlcv(
     symbol: str,
     timeframe: str | int,
     numeric_time_unit: str | None = None,
+    gap_policy: str = "segment",
 ) -> CanonicalDataset:
     """Validate and canonicalize an OHLCV frame without filling missing bars."""
     if not isinstance(frame, pd.DataFrame):
         raise DataValidationError("OHLCV input must be a pandas DataFrame")
 
     canonical_timeframe = normalize_timeframe_name(timeframe)
+    canonical_gap_policy = _normalize_gap_policy(gap_policy)
     canonical_numeric_time_unit = (
         _normalize_numeric_time_unit(numeric_time_unit)
         if numeric_time_unit is not None
@@ -542,16 +602,26 @@ def canonicalize_ohlcv(
     result["time"] = converted_time.array
     if result["time"].duplicated().any():
         raise DataValidationError("duplicate timestamp")
-    result = result.sort_values("time", kind="mergesort").reset_index(drop=True)
 
     if result.empty:
         raise DataValidationError("OHLCV data has no bars")
 
+    original_time_ns = result["time"].astype("int64").to_numpy(
+        dtype=np.int64,
+        copy=False,
+    )
+    if any(
+        int(current) <= int(previous)
+        for previous, current in zip(original_time_ns, original_time_ns[1:])
+    ):
+        raise DataValidationError("time must be strictly increasing")
+    result = result.reset_index(drop=True)
+
     for column in _VALUE_COLUMNS:
         result[column] = _coerce_value_column(result[column], field=column)
-    values = result.loc[:, _VALUE_COLUMNS].to_numpy(dtype=np.float64, copy=False)
-    if not np.isfinite(values).all():
-        raise DataValidationError("non-finite OHLCV value")
+    converted_values = float32_ohlcv_arrays(result)
+    for column in _VALUE_COLUMNS:
+        result[column] = converted_values[column]
 
     if (result.loc[:, ("open", "high", "low", "close")] <= 0.0).any().any():
         raise DataValidationError("OHLC prices must be positive")
@@ -574,6 +644,7 @@ def canonicalize_ohlcv(
         raise DataValidationError("time must be strictly increasing")
 
     nominal_ns = _TIMEFRAME_NS.get(canonical_timeframe)
+    segment_ids = np.zeros(len(result), dtype=np.int64)
     if nominal_ns is None:
         gap_count = 0
     else:
@@ -581,15 +652,31 @@ def canonicalize_ohlcv(
             raise DataValidationError(
                 f"bar spacing is shorter than timeframe {canonical_timeframe}"
             )
-        gap_count = sum(delta > nominal_ns for delta in deltas)
+        gap_indices = [
+            index
+            for index, delta in enumerate(deltas, start=1)
+            if delta > nominal_ns
+        ]
+        gap_count = len(gap_indices)
+        if gap_count and canonical_gap_policy == "reject":
+            raise DataValidationError(
+                f"gap policy reject forbids {gap_count} large time gap(s)"
+            )
+        if canonical_gap_policy == "segment":
+            for index in gap_indices:
+                segment_ids[index:] += 1
 
     data_fingerprint, time_fingerprint, time_ns = _fingerprints(
         frame=result,
         symbol=str(symbol),
         timeframe=canonical_timeframe,
+        gap_policy=canonical_gap_policy,
     )
     identity = DatasetIdentity(
         schema_version=DATA_SCHEMA_VERSION,
+        canonicalization_version=DATA_CANONICALIZATION_VERSION,
+        time_unit="ns",
+        gap_policy=canonical_gap_policy,
         symbol=str(symbol),
         timeframe=canonical_timeframe,
         start_time_ns=int(time_ns[0]),
@@ -598,4 +685,9 @@ def canonicalize_ohlcv(
         data_fingerprint=data_fingerprint,
         time_fingerprint=time_fingerprint,
     )
-    return CanonicalDataset(frame=result, identity=identity, gap_count=gap_count)
+    return CanonicalDataset(
+        frame=result,
+        identity=identity,
+        gap_count=gap_count,
+        segment_ids=segment_ids,
+    )

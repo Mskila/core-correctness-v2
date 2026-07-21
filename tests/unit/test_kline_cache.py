@@ -113,7 +113,7 @@ def test_full_download_requests_only_closed_bars_and_writes_identity_metadata(
     assert metadata["start_time_ns"] == int(actual["time"].iloc[0].value)
     assert metadata["end_time_ns"] == int(actual["time"].iloc[-1].value)
     assert metadata["bars"] == 3
-    assert metadata["schema_version"] == "ohlcv-v2"
+    assert metadata["schema_version"] == "ohlcv-v3"
     assert metadata["gap_count"] == 0
 
 

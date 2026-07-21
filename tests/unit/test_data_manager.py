@@ -251,8 +251,8 @@ def test_parquet_inspect_and_load_use_declared_unix_seconds(tmp_path: Path) -> N
     frame = _make_mt5_seconds_df([0, 1, 3, 4, 8, 11])
     path = _write_parquet(tmp_path / "EURUSD_H1.parquet", frame)
 
-    info = inspect_parquet_file(path)
-    manager = ParquetDataManager(path)
+    info = inspect_parquet_file(path, numeric_time_unit="s")
+    manager = ParquetDataManager(path, numeric_time_unit="s")
     manager.load()
 
     expected_ns = torch.tensor(
@@ -620,7 +620,7 @@ def test_parquet_float32_overflow_fails_closed_after_reload(
             getattr(manager, property_name)
 
 
-def test_float32_underflow_is_rejected_by_inspect_and_managers(
+def test_price_float32_underflow_is_rejected_by_domain_validation(
     tmp_path: Path,
 ) -> None:
     underflow = _make_ohlcv_df(periods=4)
@@ -628,34 +628,34 @@ def test_float32_underflow_is_rejected_by_inspect_and_managers(
         underflow[field] = np.full(4, 1.0e-50, dtype=np.float64)
     path = _write_parquet(tmp_path / "EURUSD_H1.parquet", underflow)
 
-    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+    with pytest.raises(DataValidationError, match=r"prices must be positive"):
         inspect_parquet_file(path)
-    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+    with pytest.raises(DataValidationError, match=r"prices must be positive"):
         ParquetDataManager(path).load()
 
     mt5 = MT5DataManager(_make_mock_fetcher({"EURUSD": underflow}))
-    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
+    with pytest.raises(DataValidationError, match=r"prices must be positive"):
         mt5.load(["EURUSD"])
 
 
-def test_nonzero_volume_float32_underflow_is_rejected_everywhere(
+def test_nonzero_volume_float32_underflow_is_canonically_zero_everywhere(
     tmp_path: Path,
 ) -> None:
     underflow = _make_ohlcv_df(periods=4)
     underflow["tick_volume"] = np.full(4, 1.0e-50, dtype=np.float64)
     path = _write_parquet(tmp_path / "EURUSD_H1.parquet", underflow)
 
-    with pytest.raises(DataValidationError, match=r"float32.*field=volume"):
-        inspect_parquet_file(path)
-    with pytest.raises(DataValidationError, match=r"float32.*field=volume"):
-        ParquetDataManager(path).load()
+    assert inspect_parquet_file(path)["valid"] is True
+    parquet = ParquetDataManager(path)
+    parquet.load()
 
     mt5 = MT5DataManager(_make_mock_fetcher({"EURUSD": underflow}))
-    with pytest.raises(DataValidationError, match=r"float32.*field=volume"):
-        mt5.load(["EURUSD"])
+    mt5.load(["EURUSD"])
+    assert torch.equal(parquet.raw_dict["volume"], torch.zeros((1, 4)))
+    assert torch.equal(mt5.raw_dict["volume"], torch.zeros((1, 4)))
 
 
-def test_lossy_finite_float32_inputs_fail_closed_in_consumer_loads(
+def test_lossy_finite_float32_inputs_share_canonical_consumer_values(
     tmp_path: Path,
 ) -> None:
     frame = _make_float32_round_trip_frame(lossy_open=True)
@@ -663,22 +663,16 @@ def test_lossy_finite_float32_inputs_fail_closed_in_consumer_loads(
     parquet = ParquetDataManager(path)
     mt5 = MT5DataManager(_make_mock_fetcher({"LOSSY": frame}))
 
-    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
-        parquet.load()
-    with pytest.raises(DataValidationError, match=r"float32.*field=open"):
-        mt5.load(["LOSSY"])
+    parquet.load()
+    mt5.load(["LOSSY"])
 
-    for manager in (parquet, mt5):
-        for property_name in (
-            "raw_dict",
-            "feat_tensor",
-            "target_ret",
-            "target_valid",
-            "bar_time",
-            "data_identities",
-        ):
-            with pytest.raises(RuntimeError, match=r"Data not loaded.*load"):
-                getattr(manager, property_name)
+    expected = torch.tensor(
+        [[16_777_216.0, 16_777_216.0, 16_777_218.0, 16_777_220.0]],
+        dtype=torch.float32,
+    )
+    assert torch.equal(parquet.raw_dict["open"], expected)
+    assert torch.equal(mt5.raw_dict["open"], expected)
+    assert parquet.data_identities == mt5.data_identities
 
 
 def test_exact_float32_inputs_reach_consumer_label_paths(tmp_path: Path) -> None:

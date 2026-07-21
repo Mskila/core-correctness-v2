@@ -13,6 +13,7 @@ numpy>=1.24.0         # Numerical operations
 
 # Data Processing
 pandas>=2.0.0         # Data manipulation and analysis
+pyarrow==25.0.0       # Canonical Parquet engine used by training and cache workflows
 
 # MT5 Trading Platform
 MetaTrader5>=5.0.45   # MetaTrader 5 Python API for data and order execution

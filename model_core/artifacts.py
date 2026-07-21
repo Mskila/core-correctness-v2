@@ -17,6 +17,7 @@ from data_pipeline.validation import DatasetIdentity, normalize_timeframe_name
 
 from .semantics import (
     CORE_SEMANTICS_VERSION,
+    DATA_CANONICALIZATION_VERSION,
     DATA_SCHEMA_VERSION,
     EXECUTION_SEMANTICS_VERSION,
     LABEL_LOOKAHEAD_BARS,
@@ -61,6 +62,9 @@ _FOLD_FIELDS = (
 )
 _DATASET_IDENTITY_FIELDS = (
     "schema_version",
+    "canonicalization_version",
+    "time_unit",
+    "gap_policy",
     "symbol",
     "timeframe",
     "start_time_ns",
@@ -910,6 +914,9 @@ def _dataset_identity_from_payload(
     context: str,
 ) -> DatasetIdentity:
     schema_version = payload["schema_version"]
+    canonicalization_version = payload["canonicalization_version"]
+    time_unit = payload["time_unit"]
+    gap_policy = payload["gap_policy"]
     symbol = payload["symbol"]
     timeframe = payload["timeframe"]
     start_time_ns = payload["start_time_ns"]
@@ -927,6 +934,27 @@ def _dataset_identity_from_payload(
             f"{context}.schema_version mismatch: "
             f"expected={DATA_SCHEMA_VERSION!r} "
             f"actual={_safe_diagnostic(schema_version)}"
+        )
+    _validate_exact_string(
+        canonicalization_version,
+        field=f"{context}.canonicalization_version",
+    )
+    if canonicalization_version != DATA_CANONICALIZATION_VERSION:
+        raise ArtifactCompatibilityError(
+            f"{context}.canonicalization_version mismatch: "
+            f"expected={DATA_CANONICALIZATION_VERSION!r} "
+            f"actual={_safe_diagnostic(canonicalization_version)}"
+        )
+    _validate_exact_string(time_unit, field=f"{context}.time_unit")
+    if time_unit != "ns":
+        raise ArtifactCompatibilityError(
+            f"{context}.time_unit mismatch: expected='ns' "
+            f"actual={_safe_diagnostic(time_unit)}"
+        )
+    _validate_exact_string(gap_policy, field=f"{context}.gap_policy")
+    if gap_policy not in {"reject", "segment", "explicitly-allowed"}:
+        raise ArtifactCompatibilityError(
+            f"{context}.gap_policy is invalid: actual={_safe_diagnostic(gap_policy)}"
         )
     if type(symbol) is not str:
         raise ArtifactCompatibilityError(
@@ -990,6 +1018,9 @@ def _dataset_identity_from_payload(
     )
     return DatasetIdentity(
         schema_version=schema_version,  # type: ignore[arg-type]
+        canonicalization_version=canonicalization_version,  # type: ignore[arg-type]
+        time_unit=time_unit,  # type: ignore[arg-type]
+        gap_policy=gap_policy,  # type: ignore[arg-type]
         symbol=symbol,
         timeframe=timeframe,
         start_time_ns=start_time_ns,
@@ -1013,6 +1044,9 @@ def _strict_dataset_identity_from_dict(
 def _dataset_identity_payload(value: DatasetIdentity) -> dict[str, object]:
     return {
         "schema_version": value.schema_version,
+        "canonicalization_version": value.canonicalization_version,
+        "time_unit": value.time_unit,
+        "gap_policy": value.gap_policy,
         "symbol": value.symbol,
         "timeframe": value.timeframe,
         "start_time_ns": value.start_time_ns,

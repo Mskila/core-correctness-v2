@@ -341,7 +341,6 @@ class KlineCache:
             frame,
             symbol=symbol,
             timeframe=self.timeframe,
-            numeric_time_unit="s",
         )
 
     def _read_validated_pair_locked(
@@ -968,6 +967,9 @@ class KlineCache:
                 ~local_frame["time"].isin(remote_frame["time"])
             ]
             combined = pd.concat([retained_local, remote_frame], ignore_index=True)
+            combined = combined.sort_values("time", kind="mergesort").reset_index(
+                drop=True
+            )
             merged = canonicalize_ohlcv(
                 combined,
                 symbol=symbol,
