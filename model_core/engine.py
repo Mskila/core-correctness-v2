@@ -3254,6 +3254,23 @@ class AlphaEngine:
         )
         selection_target = self._select_fold_bars(t_ret, selection_index)
         selection_valid = self._select_fold_bars(t_valid, selection_index)
+        backtest = getattr(self, "bt", None)
+        prepare_fold = getattr(backtest, "prepare_fold", None)
+        evaluate_prepared_fold = getattr(backtest, "evaluate_prepared_fold", None)
+        prepared_folds = None
+        if callable(prepare_fold) and callable(evaluate_prepared_fold):
+            prepared_folds = [
+                prepare_fold(
+                    target_ret=t_ret,
+                    target_valid=t_valid,
+                    bar_time_ns=bar_time_ns,
+                    train_start=fold.train_start,
+                    train_end=fold.train_end,
+                    val_start=fold.val_start,
+                    val_end=fold.val_end,
+                )
+                for fold in folds
+            ]
         bs      = ModelConfig.BATCH_SIZE
         n_elite = max(1, int(bs * ModelConfig.ELITE_REPLAY_FRAC))
         n_new   = bs - n_elite
@@ -3422,6 +3439,7 @@ class AlphaEngine:
             }
             formula_error_samples: list[str] = []
             formula_valid = [True] * tot
+            evaluated_factors: list[torch.Tensor | None] = [None] * tot
             step_max_val = -float('inf');  step_best_f = None
             bic, bis, bsor = [], [], []
 
@@ -3436,6 +3454,7 @@ class AlphaEngine:
                             step=step,
                             index=i,
                         )
+                        evaluated_factors[i] = res
                 except FormulaEvaluationError as failure:
                     formula_valid[i] = False
                     none_cnt += 1
@@ -3446,7 +3465,7 @@ class AlphaEngine:
                 except BaseException as failure:
                     traceback.clear_frames(failure.__traceback__)
                     raise
-                del res
+                res = None
 
             shadow_best_score = self.best_score
             shadow_factor_pool = list(self.factor_pool)
@@ -3459,29 +3478,17 @@ class AlphaEngine:
 
             try:
                 for i, fml in enumerate(all_fmls):
-                    res = None
+                    res = evaluated_factors[i]
+                    evaluated_factors[i] = None
                     selection_factor = None
                     if not formula_valid[i]:
                         rewards[i] = val_scores[i] = -2.0
                         continue
-                    with torch.no_grad():
-                        try:
-                            res = transaction.run_formula(
-                                _evaluate_training_formula,
-                                self.vm,
-                                fml,
-                                feat,
-                                step=step,
-                                index=i,
-                            )
-                        except FormulaEvaluationError as failure:
-                            formula_valid[i] = False
-                            none_cnt += 1
-                            formula_error_counts[failure.error_kind.value] += 1
-                            if len(formula_error_samples) < 5:
-                                formula_error_samples.append(str(failure)[:500])
-                            rewards[i] = val_scores[i] = -2.0
-                            continue
+                    if res is None:
+                        raise RuntimeError(
+                            "validated formula factor was not retained for scoring: "
+                            f"step={step} formula_index={i}"
+                        )
                     selection_factor = self._select_fold_bars(res, selection_index)
                     if not _has_exact_variation(selection_factor):
                         rewards[i] = val_scores[i] = -2.0
@@ -3491,18 +3498,25 @@ class AlphaEngine:
 
                         with torch.no_grad():
                             fold_tr, fold_vl, fold_ic = [], [], []
-                            for fold in folds:
-                                tr_sc, vl_sc = transaction.run(
-                                    self.bt.evaluate_fold,
-                                    factors=res,
-                                    target_ret=t_ret,
-                                    target_valid=t_valid,
-                                    bar_time_ns=bar_time_ns,
-                                    train_start=fold.train_start,
-                                    train_end=fold.train_end,
-                                    val_start=fold.val_start,
-                                    val_end=fold.val_end,
-                                )
+                            for fold_index, fold in enumerate(folds):
+                                if prepared_folds is None:
+                                    tr_sc, vl_sc = transaction.run(
+                                        self.bt.evaluate_fold,
+                                        factors=res,
+                                        target_ret=t_ret,
+                                        target_valid=t_valid,
+                                        bar_time_ns=bar_time_ns,
+                                        train_start=fold.train_start,
+                                        train_end=fold.train_end,
+                                        val_start=fold.val_start,
+                                        val_end=fold.val_end,
+                                    )
+                                else:
+                                    tr_sc, vl_sc = transaction.run(
+                                        evaluate_prepared_fold,
+                                        res,
+                                        prepared_folds[fold_index],
+                                    )
                                 ic_m = AlphaEngine._compute_ic(
                                     res[:, fold.train_start:fold.train_end],
                                     t_ret[:, fold.train_start:fold.train_end],
@@ -3628,10 +3642,12 @@ class AlphaEngine:
                 pending_actions.clear()
                 shadow_factor_pool.clear()
                 shadow_elite_pool.clear()
+                evaluated_factors.clear()
                 selection_factor = res = None
                 del buffered_factor, snapshot, pos_check
                 traceback.clear_frames(failure.__traceback__)
                 raise
+            evaluated_factors.clear()
 
             # ── Part D: REINFORCE gradient update ────────────────────
             # Fix 3: EMA baseline 替代 batch mean，避免全负 batch 的相对优选问题
@@ -3743,24 +3759,30 @@ class AlphaEngine:
             bsor_= sum(bsor) / len(bsor) if bsor else 0.0
 
             self._stagnation_steps = step - self._best_update_step
-            tqdm.write(
-                f"[{step+1}/{end_step}] "
-                f"新公式={n_new} 精英={n_elite} | "
-                f"有效={ok_cnt} 无效={none_cnt} 常数={const_cnt} | "
-                f"公式错误={formula_error_counts} | "
-                f"奖励={avg_rew:.3f} 验证={avg_val:.3f} | "
-                f"IC={bim:.4f} | 熵={ent_val:.3f}(系数={ent_coeff:.3f}) | "
-                f"最优={self.best_score:.3f} 停滞={self._stagnation_steps} "
-                f"精英池={len(self._elite_pool)} 重启={self._restart_count}"
+            emit_detailed_log = (
+                step == start_step
+                or (step + 1) % ModelConfig.TRAIN_LOG_INTERVAL == 0
+                or (step + 1) == end_step
             )
-            tqdm.write(
-                f"   分布: 初始熵={dst['entropy']:.3f} KL均匀={dst['kl_uniform']:.3f} "
-                f"KL上步={dst['kl_prev']:.4f} 最高概率={dst['top1_prob']:.3f} "
-                f"前五概率={dst['top5_prob']:.3f} 有效词汇={dst['eff_vocab']:.2f} "
-                f"标准差={dst['prob_std']:.4f} | "
-                f"本批: 唯一符号={uniq_tokens}/{FORMULA_VOCAB.size} "
-                f"唯一公式={uniq_fmls}/{n_new} 多样性={fml_div:.2f}"
-            )
+            if emit_detailed_log:
+                tqdm.write(
+                    f"[{step+1}/{end_step}] "
+                    f"新公式={n_new} 精英={n_elite} | "
+                    f"有效={ok_cnt} 无效={none_cnt} 常数={const_cnt} | "
+                    f"公式错误={formula_error_counts} | "
+                    f"奖励={avg_rew:.3f} 验证={avg_val:.3f} | "
+                    f"IC={bim:.4f} | 熵={ent_val:.3f}(系数={ent_coeff:.3f}) | "
+                    f"最优={self.best_score:.3f} 停滞={self._stagnation_steps} "
+                    f"精英池={len(self._elite_pool)} 重启={self._restart_count}"
+                )
+                tqdm.write(
+                    f"   分布: 初始熵={dst['entropy']:.3f} KL均匀={dst['kl_uniform']:.3f} "
+                    f"KL上步={dst['kl_prev']:.4f} 最高概率={dst['top1_prob']:.3f} "
+                    f"前五概率={dst['top5_prob']:.3f} 有效词汇={dst['eff_vocab']:.2f} "
+                    f"标准差={dst['prob_std']:.4f} | "
+                    f"本批: 唯一符号={uniq_tokens}/{FORMULA_VOCAB.size} "
+                    f"唯一公式={uniq_fmls}/{n_new} 多样性={fml_div:.2f}"
+                )
             pbar.set_postfix({
                 '验证': f"{avg_val:.3f}", '最优': f"{self.best_score:.3f}",
                 '熵':   f"{ent_val:.2f}", 'IC':   f"{bim:.4f}",

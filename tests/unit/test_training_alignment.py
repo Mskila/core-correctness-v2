@@ -1379,7 +1379,7 @@ def test_training_preflight_exception_traceback_releases_execute_tensor(
     _assert_no_failed_batch_side_effects(engine, calls, before)
 
 
-def test_training_preflight_releases_each_result_before_second_pass(
+def test_training_evaluates_each_formula_once_and_reuses_factor_for_scoring(
     monkeypatch, tmp_path
 ) -> None:
     result_refs = []
@@ -1407,34 +1407,33 @@ def test_training_preflight_releases_each_result_before_second_pass(
 
     engine.train(end_step=1, verbose_header=False)
 
-    assert len(vm_calls) == 6
-    assert live_before_execute == [0] * len(vm_calls)
-    assert peak_live_results == 1
+    assert len(vm_calls) == 3
+    assert live_before_execute == [0, 1, 2]
+    assert peak_live_results == 3
 
 
-def test_training_second_pass_first_none_fails_before_scoring(
+def test_training_never_reexecutes_a_validated_formula(
     monkeypatch, tmp_path
 ) -> None:
     vm_calls = []
 
     def execute(formula, _features):
         vm_calls.append(list(formula))
-        return None if len(vm_calls) == 4 else factor.clone()
+        if len(vm_calls) > ModelConfig.BATCH_SIZE:
+            raise AssertionError("formula was evaluated more than once")
+        return factor.clone()
 
-    engine, factor, calls, before = _failure_training_engine(
+    engine, factor, calls, _before = _failure_training_engine(
         monkeypatch, tmp_path, execute
     )
 
-    with pytest.raises(RuntimeError, match=r"formula_index=0"):
-        engine.train(end_step=1, verbose_header=False)
+    engine.train(end_step=1, verbose_header=False)
 
-    assert len(vm_calls) == 4
-    _assert_no_failed_batch_side_effects(
-        engine, calls, before, scoring_may_have_run=True
-    )
+    assert len(vm_calls) == ModelConfig.BATCH_SIZE
+    assert calls == {"optimizer": 1, "strategy": 1, "history": 1, "checkpoint": 1}
 
 
-def test_training_late_second_pass_none_is_batch_transactional_at_real_batch_size(
+def test_training_real_batch_evaluates_each_formula_once(
     monkeypatch, tmp_path
 ) -> None:
     batch_size = ModelConfig.BATCH_SIZE
@@ -1443,21 +1442,18 @@ def test_training_late_second_pass_none_is_batch_transactional_at_real_batch_siz
     def execute(_formula, _features):
         nonlocal vm_calls
         vm_calls += 1
-        if vm_calls == batch_size + 2:
-            return None
+        if vm_calls > batch_size:
+            raise AssertionError("formula was evaluated more than once")
         return factor.clone()
 
-    engine, factor, calls, before = _failure_training_engine(
+    engine, factor, calls, _before = _failure_training_engine(
         monkeypatch, tmp_path, execute, batch_size=batch_size
     )
 
-    with pytest.raises(RuntimeError, match=r"formula_index=1"):
-        engine.train(end_step=1, verbose_header=False)
+    engine.train(end_step=1, verbose_header=False)
 
-    assert vm_calls == batch_size + 2
-    _assert_no_failed_batch_side_effects(
-        engine, calls, before, scoring_may_have_run=True
-    )
+    assert vm_calls == batch_size
+    assert calls == {"optimizer": 1, "strategy": 1, "history": 1, "checkpoint": 1}
 
 
 @pytest.mark.parametrize(
@@ -1494,7 +1490,7 @@ def test_training_late_scoring_exception_is_batch_transactional(
         engine.train(end_step=1, verbose_header=False)
 
     assert caught.value is failure
-    assert vm_calls == 5
+    assert vm_calls == ModelConfig.BATCH_SIZE
     _assert_no_failed_batch_side_effects(
         engine, calls, before, scoring_may_have_run=True
     )
@@ -1550,7 +1546,7 @@ def test_real_fold_scoring_traceback_does_not_retain_vm_result(
 
     assert caught.value is failure
     assert caught.value.__traceback__ is not None
-    assert vm_calls == batch_size + 2
+    assert vm_calls == batch_size
     assert multi_objective_calls == 5
     assert all(result_ref() is None for result_ref in result_refs)
     assert selection_refs and selection_refs[-1]() is None
@@ -1597,7 +1593,7 @@ def test_successful_batch_commits_buffered_actions_in_formula_order(
     engine._save_strategy_live = record_strategy
     engine.train(end_step=1, verbose_header=False)
 
-    assert vm_calls == 6
+    assert vm_calls == ModelConfig.BATCH_SIZE
     assert scoring_calls == 6
     assert [score for score, _formula, _pool_size in committed] == [3.0]
     assert [pool_size for _score, _formula, pool_size in committed] == [3]
@@ -1865,8 +1861,8 @@ def test_training_preflight_100k_real_batch_has_bounded_factor_retention(
     elapsed = time.perf_counter() - started
 
     assert vm_calls == real_batch_size
-    assert live_before_execute == [0] * vm_calls
-    assert peak_live_results == 1
+    assert live_before_execute == list(range(vm_calls))
+    assert peak_live_results == real_batch_size - 1
     assert elapsed < 30.0
     _assert_no_failed_batch_side_effects(engine, calls, before)
 
@@ -1952,8 +1948,8 @@ def test_exact_constant_factor_keeps_distinct_minus_two_training_path(
     assert engine.bt.fold_inputs == []
     assert engine.factor_pool == []
     assert calls == {"optimizer": 1, "strategy": 0, "history": 1, "checkpoint": 1}
-    assert live_before_execute == [0] * len(live_before_execute)
-    assert peak_live_results == 1
+    assert live_before_execute == list(range(len(live_before_execute)))
+    assert peak_live_results == ModelConfig.BATCH_SIZE
 
 
 def test_training_releases_scoring_result_on_downstream_exception(
@@ -1984,7 +1980,7 @@ def test_training_releases_scoring_result_on_downstream_exception(
         engine.train(end_step=1, verbose_header=False)
 
     assert caught.value is failure
-    assert live_before_execute == [0] * len(live_before_execute)
+    assert live_before_execute == list(range(len(live_before_execute)))
     assert all(result_ref() is None for result_ref in result_refs)
     engine.bt.fold_inputs.clear()
     _assert_no_failed_batch_side_effects(engine, calls, before)

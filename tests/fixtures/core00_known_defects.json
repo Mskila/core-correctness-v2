@@ -20,13 +20,13 @@
   {"id":"F-035","priority":"P1","work_package":"CORE-02","summary":"training configuration has manual mirrors and generalized FTMO defaults","status":"known-defect","characterization_policy":"do-not-goldenize"},
   {"id":"F-036","priority":"P1","work_package":"CORE-02","summary":"min_exposure is not constrained below one","status":"known-defect","characterization_policy":"do-not-goldenize"},
   {"id":"F-038","priority":"P1","work_package":"CORE-07","summary":"tests lack required CI coverage timeout and warning gates","status":"known-defect","characterization_policy":"do-not-goldenize"},
-  {"id":"F-020","priority":"P2","work_package":"PERF-01","summary":"ExecutionResult repeatedly clones tensors","status":"known-defect","characterization_policy":"do-not-goldenize"},
-  {"id":"F-021","priority":"P2","work_package":"PERF-01","summary":"reversal bonus constant tensors are pinned to CPU","status":"known-defect","characterization_policy":"do-not-goldenize"},
+  {"id":"F-020","priority":"P2","work_package":"PERF-01","summary":"ExecutionResult repeatedly clones tensors","status":"resolved-perf01","characterization_policy":"regression-covered"},
+  {"id":"F-021","priority":"P2","work_package":"PERF-01","summary":"reversal bonus constant tensors are pinned to CPU","status":"resolved-perf01","characterization_policy":"regression-covered"},
   {"id":"F-022","priority":"P2","work_package":"CORE-03","summary":"monthly metrics assume a fixed 30-day month","status":"known-defect","characterization_policy":"do-not-goldenize"},
   {"id":"F-025","priority":"P2","work_package":"CORE-03","summary":"same-direction rebalancing is merged into one trade","status":"known-defect","characterization_policy":"do-not-goldenize"},
   {"id":"F-029","priority":"P2","work_package":"CORE-08","summary":"training stop lacks wait kill and process-tree closure","status":"known-defect","characterization_policy":"do-not-goldenize"},
-  {"id":"F-033","priority":"P2","work_package":"PERF-01","summary":"each batch executes formulas through StackVM twice","status":"known-defect","characterization_policy":"do-not-goldenize"},
-  {"id":"F-034","priority":"P2","work_package":"PERF-01","summary":"factor_pool retains complete tensors","status":"known-defect","characterization_policy":"do-not-goldenize"},
+  {"id":"F-033","priority":"P2","work_package":"PERF-01","summary":"each batch executes formulas through StackVM twice","status":"resolved-perf01","characterization_policy":"regression-covered"},
+  {"id":"F-034","priority":"P2","work_package":"PERF-01","summary":"factor_pool retains complete tensors","status":"resolved-perf01","characterization_policy":"regression-covered"},
   {"id":"F-039","priority":"P2","work_package":"CORE-04/CORE-08","summary":"VM failures are hard to diagnose in regression runs","status":"resolved-core04","characterization_policy":"regression-covered"},
   {"id":"F-040","priority":"P3","work_package":"CLEAN-01","summary":"post-migration dead paths remain","status":"known-defect","characterization_policy":"do-not-goldenize"}
 ]

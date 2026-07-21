@@ -19,6 +19,7 @@ symbol_consistency 规则：
 """
 import math
 import sys
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
@@ -34,6 +35,19 @@ _SORTINO_CLIP        = 20.0
 _TURNOVER_EVENT_THRESHOLD = 0.0
 _FOLD_INDEX_MIN = -sys.maxsize - 1
 _FOLD_INDEX_MAX = sys.maxsize
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedFold:
+    source_shape: tuple[int, int]
+    dtype: torch.dtype
+    device: torch.device
+    train_start: int
+    train_end: int
+    val_start: int
+    val_end: int
+    train_static: tuple[Tensor, Tensor, Tensor]
+    val_static: tuple[Tensor, Tensor, Tensor]
 
 
 class _ScaleBoundedPearsonIC(torch.autograd.Function):
@@ -347,10 +361,13 @@ class MT5Backtest:
         total_bars = 0
         event_counts = []
         all_runs = []
-        for symbol in range(result.position.shape[0]):
-            valid = result.target_valid[symbol]
-            positions = result.position[symbol, valid]
-            turnover = result.turnover[symbol, valid]
+        result_position = result._borrow_tensor("position")
+        result_valid = result._borrow_tensor("target_valid")
+        result_turnover = result._borrow_tensor("turnover")
+        for symbol in range(result_position.shape[0]):
+            valid = result_valid[symbol]
+            positions = result_position[symbol, valid]
+            turnover = result_turnover[symbol, valid]
             total_bars += positions.numel()
             event_counts.append(
                 int((turnover > _TURNOVER_EVENT_THRESHOLD).sum().item())
@@ -696,7 +713,9 @@ class MT5Backtest:
         train_score = self._multi_objective(
             *train_values, train_result, eval_bars=train_end - train_start
         ) + self._turnover_penalty(
-            train_result.turnover[train_result.target_valid]
+            train_result._borrow_tensor("turnover")[
+                train_result._borrow_tensor("target_valid")
+            ]
         )
         base_val = self._multi_objective(
             *val_values, val_result, eval_bars=val_end - val_start
@@ -709,6 +728,111 @@ class MT5Backtest:
         )
         val_score = base_val.new_tensor(gate.final)
 
+        return (
+            self._require_finite_public_score(train_score),
+            self._require_finite_public_score(val_score),
+        )
+
+    def prepare_fold(
+        self,
+        *,
+        target_ret: Tensor,
+        target_valid: Tensor,
+        bar_time_ns: Tensor,
+        train_start: int,
+        train_end: int,
+        val_start: int,
+        val_end: int,
+    ) -> PreparedFold:
+        """Precompute formula-independent fold tensors once per training run."""
+        self._validate_fold_request(
+            target_ret,
+            target_ret,
+            target_valid,
+            bar_time_ns,
+            train_start,
+            train_end,
+            val_start,
+            val_end,
+        )
+
+        def prepare_static(start: int, end: int) -> tuple[Tensor, Tensor, Tensor]:
+            segment_target = target_ret[:, start:end]
+            segment_valid = target_valid[:, start:end]
+            return (
+                torch.cat(
+                    [segment_target, torch.zeros_like(segment_target[:, :2])],
+                    dim=1,
+                ),
+                torch.cat(
+                    [segment_valid, torch.zeros_like(segment_valid[:, :2])],
+                    dim=1,
+                ),
+                bar_time_ns[:, start:end + 2].clone(),
+            )
+
+        return PreparedFold(
+            source_shape=tuple(target_ret.shape),
+            dtype=target_ret.dtype,
+            device=target_ret.device,
+            train_start=train_start,
+            train_end=train_end,
+            val_start=val_start,
+            val_end=val_end,
+            train_static=prepare_static(train_start, train_end),
+            val_static=prepare_static(val_start, val_end),
+        )
+
+    def evaluate_prepared_fold(
+        self,
+        factors: Tensor,
+        prepared: PreparedFold,
+    ) -> tuple[Tensor, Tensor]:
+        """Evaluate a factor against immutable, precomputed fold context."""
+        if (
+            not isinstance(factors, Tensor)
+            or tuple(factors.shape) != prepared.source_shape
+            or factors.dtype != prepared.dtype
+            or factors.device != prepared.device
+        ):
+            raise DataValidationError(
+                "prepared fold factor mismatch: expected="
+                f"shape {prepared.source_shape}, dtype {prepared.dtype}, "
+                f"device {prepared.device}"
+            )
+
+        def factor_segment(start: int, end: int) -> Tensor:
+            segment = factors[:, start:end]
+            return torch.cat(
+                [segment, torch.zeros_like(segment[:, :2])],
+                dim=1,
+            )
+
+        train_values = (factor_segment(prepared.train_start, prepared.train_end),) + prepared.train_static
+        val_values = (factor_segment(prepared.val_start, prepared.val_end),) + prepared.val_static
+        train_result = self._run_execution(*train_values)
+        val_result = self._run_execution(*val_values)
+        train_score = self._multi_objective(
+            *train_values,
+            train_result,
+            eval_bars=prepared.train_end - prepared.train_start,
+        ) + self._turnover_penalty(
+            train_result._borrow_tensor("turnover")[
+                train_result._borrow_tensor("target_valid")
+            ]
+        )
+        base_val = self._multi_objective(
+            *val_values,
+            val_result,
+            eval_bars=prepared.val_end - prepared.val_start,
+        )
+        oos_sortino = performance_metrics(val_result).sortino
+        gate = apply_oos_gate(
+            float(base_val.item()),
+            oos_sortino,
+            scale=self.oos_gate_scale,
+        )
+        val_score = base_val.new_tensor(gate.final)
         return (
             self._require_finite_public_score(train_score),
             self._require_finite_public_score(val_score),
@@ -732,7 +856,11 @@ class MT5Backtest:
             y = values[1:]
             xm = x - x.mean(); ym = y - y.mean()
             sx = (xm**2).mean().sqrt(); sy = (ym**2).mean().sqrt()
-            ac1 = (xm*ym).mean() / (sx*sy + 1e-8) if sx > 1e-6 and sy > 1e-6 else torch.tensor(0.0)
+            ac1 = (
+                (xm * ym).mean() / (sx * sy + 1e-8)
+                if sx > 1e-6 and sy > 1e-6
+                else xm.new_zeros(())
+            )
             # 奖励低自相关：bonus = 1 - |ac1|, 负自相关额外加分
             bonus = 1.0 - torch.abs(ac1)
             if ac1 < 0:
@@ -780,8 +908,8 @@ class MT5Backtest:
         """
         N = factors.shape[0]
         metrics = performance_metrics(result)
-        position = result.position
-        pnl = result.net_pnl
+        position = result._borrow_tensor("position")
+        pnl = result._borrow_tensor("net_pnl")
         ann_ret = self._promoted_finite_metric(
             "annualized_return", metrics.annualized_return, factors
         )
@@ -846,14 +974,14 @@ class MT5Backtest:
                 + consist                # 前后一致性奖惩
             )
 
-        result_position = result.position
-        result_turnover = result.turnover
-        result_gross = result.gross_pnl
-        result_cost = result.cost
-        result_net = result.net_pnl
-        result_valid = result.target_valid
-        result_time = result.bar_time_ns
-        result_liquidation = result.final_liquidation_cost
+        result_position = result._borrow_tensor("position")
+        result_turnover = result._borrow_tensor("turnover")
+        result_gross = result._borrow_tensor("gross_pnl")
+        result_cost = result._borrow_tensor("cost")
+        result_net = result._borrow_tensor("net_pnl")
+        result_valid = result._borrow_tensor("target_valid")
+        result_time = result._borrow_tensor("bar_time_ns")
+        result_liquidation = result._borrow_tensor("final_liquidation_cost")
         per_sym_sortino     = []
         per_sym_trade_count = []
         for n in range(N):
@@ -931,5 +1059,9 @@ class MT5Backtest:
             bar_time_ns,
             result,
             eval_bars=int(target_valid.sum(dim=1).max().item()),
-        ) + self._turnover_penalty(result.turnover[result.target_valid])
+        ) + self._turnover_penalty(
+            result._borrow_tensor("turnover")[
+                result._borrow_tensor("target_valid")
+            ]
+        )
         return self._require_finite_public_score(score)
