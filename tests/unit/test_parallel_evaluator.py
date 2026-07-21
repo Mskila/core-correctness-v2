@@ -136,7 +136,8 @@ def test_parallel_evaluator_reuses_workers_and_closes_them(workers: int) -> None
     second = evaluator.evaluate_batch(formulas[2:4], step=2)
 
     assert first and second
-    assert evaluator.worker_pids == first_pids
+    assert set(first_pids).issubset(evaluator.worker_pids)
+    assert len(evaluator.worker_pids) <= workers
     evaluator.close()
     assert evaluator.closed is True
     assert evaluator.worker_pids == ()

@@ -126,16 +126,16 @@ class ParallelCpuEvaluator:
     ) -> list[RawFormulaEvaluation]:
         if self._closed:
             raise RuntimeError("parallel evaluator is closed")
-        futures = [
-            self._executor.submit(
-                _evaluate_in_worker,
-                index,
-                tuple(int(token) for token in formula),
-                step,
-            )
-            for index, formula in enumerate(formulas)
-        ]
         try:
+            futures = [
+                self._executor.submit(
+                    _evaluate_in_worker,
+                    index,
+                    tuple(int(token) for token in formula),
+                    step,
+                )
+                for index, formula in enumerate(formulas)
+            ]
             done, pending = concurrent.futures.wait(
                 futures,
                 timeout=self.timeout_seconds,
@@ -155,7 +155,9 @@ class ParallelCpuEvaluator:
         except BaseException:
             self._abort_pool()
             raise
-        self._worker_pids = tuple(sorted({pid for pid, _ in completed}))
+        self._worker_pids = tuple(sorted(
+            set(self._worker_pids) | {pid for pid, _ in completed}
+        ))
         results = sorted((result for _, result in completed), key=lambda item: item.formula_index)
         if [item.formula_index for item in results] != list(range(len(formulas))):
             self._abort_pool()
