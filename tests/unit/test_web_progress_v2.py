@@ -7,6 +7,7 @@ import torch
 import web.progress as progress
 from model_core.artifacts import StrategyArtifact, TrainingRunIdentity
 from model_core.vocab import FORMULA_VOCAB
+from model_core.vm import FormulaErrorKind
 from tests.unit.test_artifacts import (
     artifact_identity_with_config,
     current_strategy_artifact as strategy_artifact,
@@ -64,9 +65,14 @@ def _layout(monkeypatch, tmp_path, *, train_steps=20):
 
 
 def _history_value(artifact, steps, *, stable_rank=None, include_identity=True):
+    step_list = list(steps)
     values = {
-        "step": list(steps),
-        **{name: [float(index + 1) for index in range(len(steps))] for name in METRICS},
+        "step": step_list,
+        **{name: [float(index + 1) for index in range(len(step_list))] for name in METRICS},
+        "formula_error_counts": [
+            {kind.value: 0 for kind in FormulaErrorKind} for _ in step_list
+        ],
+        "formula_error_samples": [[] for _ in step_list],
         "stable_rank": ([] if stable_rank is None else list(stable_rank)),
     }
     if include_identity:

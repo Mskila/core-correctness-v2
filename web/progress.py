@@ -19,6 +19,7 @@ from model_core.artifacts import StrategyArtifact, TrainingRunIdentity
 from model_core.config import ModelConfig
 from model_core.semantics import CHECKPOINT_SCHEMA_VERSION, STRATEGY_SCHEMA_VERSION
 from model_core.vocab import FORMULA_VOCAB
+from model_core.vm import FormulaErrorKind
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
@@ -110,6 +111,7 @@ _HISTORY_METRICS = (
     "kl_uniform", "kl_prev", "top1_prob", "eff_vocab",
     "batch_uniq_tokens", "batch_uniq_fmls", "batch_fml_div",
 )
+_HISTORY_STRUCTURED_METRICS = ("formula_error_counts", "formula_error_samples")
 
 
 def invalidate_checkpoint_cache() -> None:
@@ -203,7 +205,11 @@ def _validate_history(
 ) -> None:
     if type(value) is not dict:
         raise ValueError("history must be an object")
-    expected_fields = set(_HISTORY_METRICS) | {"step", "stable_rank"}
+    expected_fields = (
+        set(_HISTORY_METRICS)
+        | set(_HISTORY_STRUCTURED_METRICS)
+        | {"step", "stable_rank"}
+    )
     if require_run_identity:
         expected_fields.add("run_identity")
     actual_fields = set(value)
@@ -235,6 +241,23 @@ def _validate_history(
                 raise ValueError(f"history field {name} must contain numeric values")
             if not math.isfinite(float(item)):
                 raise ValueError(f"history field {name} contains a non-finite value")
+    error_counts = value["formula_error_counts"]
+    error_samples = value["formula_error_samples"]
+    if type(error_counts) is not list or len(error_counts) != len(steps):
+        raise ValueError("history field formula_error_counts length does not match step")
+    if type(error_samples) is not list or len(error_samples) != len(steps):
+        raise ValueError("history field formula_error_samples length does not match step")
+    expected_error_kinds = {kind.value for kind in FormulaErrorKind}
+    for counts in error_counts:
+        if type(counts) is not dict or set(counts) != expected_error_kinds:
+            raise ValueError("history formula_error_counts keys are invalid")
+        if any(type(count) is not int or count < 0 for count in counts.values()):
+            raise ValueError("history formula_error_counts values are invalid")
+    for samples in error_samples:
+        if type(samples) is not list or len(samples) > 5:
+            raise ValueError("history formula_error_samples entry is invalid")
+        if any(type(sample) is not str or len(sample) > 500 for sample in samples):
+            raise ValueError("history formula_error_samples values are invalid")
     stable_rank = value["stable_rank"]
     if type(stable_rank) is not list:
         raise ValueError("history stable_rank must be a list")
