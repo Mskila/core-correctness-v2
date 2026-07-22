@@ -42,6 +42,7 @@ class TrainingJob:
     symbol: str
     timeframe: str
     mode: str
+    numeric_time_unit: str = "s"
     state: JobState = JobState.RUNNING
     pid: int | None = None
     log_path: str = ""
@@ -56,6 +57,7 @@ class TrainingJob:
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "mode": self.mode,
+            "numeric_time_unit": self.numeric_time_unit,
             "state": self.state.value,
             "pid": self.pid,
             "log_path": self.log_path,
@@ -93,6 +95,7 @@ class TrainingManager:
         mode: str = "ftmo",
         *,
         from_scratch: bool = False,
+        numeric_time_unit: str = "s",
     ) -> TrainingJob:
         with self._lock:
             self._refresh_state()
@@ -110,6 +113,8 @@ class TrainingManager:
                 "train_file.py",
                 "--data-file",
                 data_file,
+                "--numeric-time-unit",
+                numeric_time_unit,
             ]
             if from_scratch:
                 cmd.append("--from-scratch")
@@ -135,6 +140,7 @@ class TrainingManager:
                 symbol=symbol,
                 timeframe=timeframe,
                 mode=mode,
+                numeric_time_unit=numeric_time_unit,
                 pid=self._proc.pid,
                 log_path=str(log_path.relative_to(PROJECT_ROOT)).replace("\\", "/"),
                 started_at=datetime.now(timezone.utc).isoformat(),

@@ -62,6 +62,11 @@ function createBacktestController() {
 const backtestController = createBacktestController();
 const $ = (id) => document.getElementById(id);
 
+function numericTimeUnit(selectId = "numericTimeUnitSelect") {
+  const unit = $(selectId)?.value || "s";
+  return ["s", "ms", "us", "ns"].includes(unit) ? unit : "s";
+}
+
 const CPU_TRAINING_NOTE = `暂无报错
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -716,6 +721,8 @@ async function loadConfig() {
   }
 
   const cfg = await fetchJSON("/api/config");
+  if ($("numericTimeUnitSelect")) $("numericTimeUnitSelect").value = cfg.numeric_time_unit || "s";
+  if ($("btNumericTimeUnitSelect")) $("btNumericTimeUnitSelect").value = cfg.numeric_time_unit || "s";
   debugMode = !!cfg.debug_mode;
   $("debugModeCheck").checked = debugMode;
   $("deviceMeta").textContent = `${cfg.train_steps} steps · batch ${cfg.batch_size} · ${cfg.device}`;
@@ -951,7 +958,8 @@ async function loadBacktestStrategyContext() {
 
 async function browseDataFile() {
   try {
-    const res = await fetchJSON("/api/data-file/browse", { method: "POST" });
+    const unit = numericTimeUnit();
+    const res = await fetchJSON(`/api/data-file/browse?numeric_time_unit=${encodeURIComponent(unit)}`, { method: "POST" });
     if (res.cancelled) return;
     renderDataFileCard(res);
     selectedSymbol = res.symbol;
@@ -970,7 +978,11 @@ async function startTraining() {
     const res = await fetchJSON("/api/training/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: false }),
+      body: JSON.stringify({
+        data_file: selectedDataFile,
+        from_scratch: false,
+        numeric_time_unit: numericTimeUnit(),
+      }),
     });
     selectedSymbol = res.data_file?.symbol || res.job?.symbol;
     renderDataFileCard(res.data_file);
@@ -996,7 +1008,11 @@ async function retrainFromScratch() {
     const res = await fetchJSON("/api/training/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: true }),
+      body: JSON.stringify({
+        data_file: selectedDataFile,
+        from_scratch: true,
+        numeric_time_unit: numericTimeUnit(),
+      }),
     });
     selectedSymbol = res.data_file?.symbol || res.job?.symbol;
     renderDataFileCard(res.data_file);
@@ -1805,6 +1821,7 @@ async function startBacktest() {
   try {
     const costs = readBacktestCosts();
     const payload = backtestController.payload(costs);
+    payload.numeric_time_unit = numericTimeUnit("btNumericTimeUnitSelect");
     const res = await fetchJSON("/api/backtest/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1820,7 +1837,8 @@ async function startBacktest() {
 
 async function browseBacktestDataFile() {
   try {
-    const res = await fetchJSON("/api/data-file/browse", { method: "POST" });
+    const unit = numericTimeUnit("btNumericTimeUnitSelect");
+    const res = await fetchJSON(`/api/data-file/browse?numeric_time_unit=${encodeURIComponent(unit)}`, { method: "POST" });
     if (res.cancelled) return;
     selectedBacktestDataFile = res.data_file;
     backtestController.selectData(res.data_file);

@@ -75,6 +75,14 @@
       <h2>启动训练</h2>
       <div class="launch-form launch-form-file">
         <div class="launch-row launch-row-main">
+          <label>时间戳单位
+            <select id="numericTimeUnitSelect">
+              <option value="s" selected>秒（MT5 / Unix）</option>
+              <option value="ms">毫秒</option>
+              <option value="us">微秒</option>
+              <option value="ns">纳秒</option>
+            </select>
+          </label>
           <button type="button" class="btn btn-secondary btn-browse" id="browseBtn">选择数据文件</button>
           <div class="data-file-card" id="dataFileCard">
             <div class="data-file-empty">尚未选择数据文件</div>
@@ -270,6 +278,14 @@
               </select>
             </label>
             <button type="button" class="btn btn-secondary btn-browse" id="btBrowseDataBtn">选择回测数据</button>
+            <label>时间戳单位
+              <select id="btNumericTimeUnitSelect">
+                <option value="s" selected>秒（MT5 / Unix）</option>
+                <option value="ms">毫秒</option>
+                <option value="us">微秒</option>
+                <option value="ns">纳秒</option>
+              </select>
+            </label>
             <div class="data-file-card" id="btDataCard"><div class="data-file-empty">尚未选择回测数据</div></div>
             <div class="launch-actions">
               <button class="btn btn-primary" id="btStartBtn" disabled>开始回测</button>

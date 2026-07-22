@@ -9,6 +9,7 @@ SETTINGS_PATH = PROJECT_ROOT / "web_settings.json"
 
 _DEFAULT = {
     "last_data_file": "",
+    "numeric_time_unit": "s",
     "last_strategy_file": "",
     "debug_mode": False,
     "ai_provider": "deepseek",
@@ -35,6 +36,11 @@ def _as_pct(value, default: float) -> float:
     return v
 
 
+def _as_numeric_time_unit(value) -> str:
+    unit = str(value or "s").strip().lower()
+    return unit if unit in {"s", "ms", "us", "ns"} else "s"
+
+
 def load_settings() -> dict:
     if not SETTINGS_PATH.exists():
         return dict(_DEFAULT)
@@ -46,6 +52,7 @@ def load_settings() -> dict:
     out.update({k: v for k, v in data.items() if k in _DEFAULT})
     out["debug_mode"] = bool(out.get("debug_mode", False))
     out["last_strategy_file"] = str(out.get("last_strategy_file") or "").strip()
+    out["numeric_time_unit"] = _as_numeric_time_unit(out.get("numeric_time_unit"))
     out["ai_provider"] = str(out.get("ai_provider") or "deepseek").strip().lower()
     if out["ai_provider"] not in ("deepseek", "openclaw", "openclaw_wb"):
         out["ai_provider"] = "deepseek"
@@ -84,6 +91,8 @@ def save_settings(data: dict) -> dict:
         current["last_data_file"] = str(data["last_data_file"] or "").strip()
     if "last_strategy_file" in data:
         current["last_strategy_file"] = str(data["last_strategy_file"] or "").strip()
+    if "numeric_time_unit" in data:
+        current["numeric_time_unit"] = _as_numeric_time_unit(data["numeric_time_unit"])
     if "debug_mode" in data:
         current["debug_mode"] = bool(data["debug_mode"])
     if "ai_provider" in data:

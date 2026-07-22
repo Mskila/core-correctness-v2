@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 
 from data_pipeline.parquet_manager import inspect_parquet_file
 from model_core.config import ModelConfig
+from model_core.semantics import DataValidationError
 from web.file_dialog import pick_parquet_file, pick_strategy_file
 from web.progress import (
     generated_at_utc,
@@ -70,6 +71,7 @@ app.add_middleware(
 class StartTrainingRequest(BaseModel):
     data_file: str
     from_scratch: bool = False
+    numeric_time_unit: Literal["s", "ms", "us", "ns"] = "s"
 
 
 class ClientLogRequest(BaseModel):
@@ -81,6 +83,7 @@ class ClientLogRequest(BaseModel):
 class SettingsRequest(BaseModel):
     last_data_file: str | None = None
     last_strategy_file: str | None = None
+    numeric_time_unit: Literal["s", "ms", "us", "ns"] | None = None
     debug_mode: bool | None = None
     ai_provider: str | None = None
     ai_api_key: str | None = None
@@ -100,6 +103,7 @@ class StartBacktestRequest(BaseModel):
     mode: Literal["in_sample_replay", "out_of_sample_backtest"]
     commission_pct: float | None = None
     slippage_pct: float | None = None
+    numeric_time_unit: Literal["s", "ms", "us", "ns"] = "s"
 
 
 class AddWatchRequest(BaseModel):
@@ -164,16 +168,16 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
-def _inspect_or_http(path: str) -> dict[str, Any]:
+def _inspect_or_http(path: str, numeric_time_unit: str) -> dict[str, Any]:
     try:
-        return inspect_parquet_file(path)
+        return inspect_parquet_file(path, numeric_time_unit=numeric_time_unit)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e)) from e
-    except ValueError as e:
+    except (ValueError, DataValidationError) as e:
         raise HTTPException(400, str(e)) from e
 
 
-def _browse_data_file() -> dict[str, Any]:
+def _browse_data_file(numeric_time_unit: str = "s") -> dict[str, Any]:
     if is_debug_mode():
         logger.info("Opening native file picker")
     try:
@@ -189,8 +193,11 @@ def _browse_data_file() -> dict[str, Any]:
 
     if is_debug_mode():
         logger.info("Selected file: %s", path)
-    info = _inspect_or_http(path)
-    save_settings({"last_data_file": info["data_file"]})
+    info = _inspect_or_http(path, numeric_time_unit)
+    save_settings({
+        "last_data_file": info["data_file"],
+        "numeric_time_unit": numeric_time_unit,
+    })
     return {"ok": True, "cancelled": False, **info}
 
 
@@ -200,7 +207,9 @@ def _strategy_context() -> dict[str, Any]:
     train_symbol = None
     if data_file:
         try:
-            train_symbol = inspect_parquet_file(data_file).get("symbol")
+            train_symbol = inspect_parquet_file(
+                data_file, numeric_time_unit=settings.get("numeric_time_unit", "s")
+            ).get("symbol")
         except Exception:
             pass
 
@@ -263,7 +272,9 @@ def _resolve_train_symbol(symbol: str | None = None) -> str | None:
     if not data_file:
         return None
     try:
-        return inspect_parquet_file(data_file).get("symbol")
+        return inspect_parquet_file(
+            data_file, numeric_time_unit=settings.get("numeric_time_unit", "s")
+        ).get("symbol")
     except Exception:
         return None
 
@@ -332,6 +343,8 @@ def api_put_settings(req: SettingsRequest) -> dict[str, Any]:
         payload["last_data_file"] = req.last_data_file
     if req.last_strategy_file is not None:
         payload["last_strategy_file"] = req.last_strategy_file
+    if req.numeric_time_unit is not None:
+        payload["numeric_time_unit"] = req.numeric_time_unit
     if req.debug_mode is not None:
         payload["debug_mode"] = req.debug_mode
     if req.ai_provider is not None:
@@ -355,7 +368,9 @@ def api_config() -> dict[str, Any]:
     file_info = None
     if data_file:
         try:
-            file_info = inspect_parquet_file(data_file)
+            file_info = inspect_parquet_file(
+                data_file, numeric_time_unit=settings.get("numeric_time_unit", "s")
+            )
         except Exception as e:
             file_info = {
                 "data_file": data_file,
@@ -371,6 +386,7 @@ def api_config() -> dict[str, Any]:
         "max_formula_len": ModelConfig.MAX_FORMULA_LEN,
         "device": str(ModelConfig.DEVICE),
         "last_data_file": data_file,
+        "numeric_time_unit": settings.get("numeric_time_unit", "s"),
         "data_file": file_info,
         "last_strategy_file": strat_ctx["last_strategy_file"],
         "strategy_file": strat_ctx["strategy_file"],
@@ -442,8 +458,10 @@ def api_ai_analyze_training(req: AnalyzeTrainingRequest):
 
 @app.post("/api/data-file/browse")
 @app.get("/api/data-file/browse")
-def api_browse_data_file() -> dict[str, Any]:
-    return _browse_data_file()
+def api_browse_data_file(
+    numeric_time_unit: Literal["s", "ms", "us", "ns"] = Query("s"),
+) -> dict[str, Any]:
+    return _browse_data_file(numeric_time_unit)
 
 
 @app.post("/api/strategy-file/browse")
@@ -525,7 +543,9 @@ def api_overview() -> dict[str, Any]:
 
     if data_file:
         try:
-            file_info = inspect_parquet_file(data_file)
+            file_info = inspect_parquet_file(
+                data_file, numeric_time_unit=settings.get("numeric_time_unit", "s")
+            )
             sym = file_info.get("symbol")
             row = _progress_with_live_step(sym, active=False)
             progress = {
@@ -660,8 +680,11 @@ def api_training_status() -> dict[str, Any]:
 
 @app.post("/api/training/start")
 def api_training_start(req: StartTrainingRequest) -> dict[str, Any]:
-    info = _inspect_or_http(req.data_file)
-    save_settings({"last_data_file": info["data_file"]})
+    info = _inspect_or_http(req.data_file, req.numeric_time_unit)
+    save_settings({
+        "last_data_file": info["data_file"],
+        "numeric_time_unit": req.numeric_time_unit,
+    })
     try:
         job = training_manager.start(
             data_file=info["data_file"],
@@ -669,6 +692,7 @@ def api_training_start(req: StartTrainingRequest) -> dict[str, Any]:
             timeframe=info["timeframe"],
             mode="ftmo",
             from_scratch=bool(req.from_scratch),
+            numeric_time_unit=req.numeric_time_unit,
         )
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
@@ -812,12 +836,15 @@ def api_backtest_start(req: StartBacktestRequest) -> dict[str, Any]:
 
     save_settings({
         "last_strategy_file": info["strategy_file"],
+        "numeric_time_unit": req.numeric_time_unit,
         "bt_commission_pct": commission,
         "bt_slippage_pct": slippage,
     })
 
     try:
-        pf = inspect_parquet_file(req.data_file)
+        pf = inspect_parquet_file(
+            req.data_file, numeric_time_unit=req.numeric_time_unit
+        )
         if pf.get("valid") is False:
             raise HTTPException(400, pf.get("message") or "回测数据文件无效")
         data_file = pf["data_file"]
@@ -833,6 +860,7 @@ def api_backtest_start(req: StartBacktestRequest) -> dict[str, Any]:
             mode=req.mode,
             commission_pct=commission,
             slippage_pct=slippage,
+            numeric_time_unit=req.numeric_time_unit,
         )
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e

@@ -16,8 +16,9 @@ def train_from_file(
     *,
     from_scratch: bool = False,
     random_seed: int = ModelConfig.RANDOM_SEED,
+    numeric_time_unit: str = "s",
 ) -> AlphaEngine:
-    manager = ParquetDataManager(data_file)
+    manager = ParquetDataManager(data_file, numeric_time_unit=numeric_time_unit)
     manager.load()
     return run_training_session(
         manager,
@@ -32,6 +33,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-file", required=True)
     parser.add_argument("--from-scratch", action="store_true")
     parser.add_argument("--random-seed", type=int, default=ModelConfig.RANDOM_SEED)
+    parser.add_argument(
+        "--numeric-time-unit",
+        choices=("s", "ms", "us", "ns"),
+        default="s",
+        help="Unit of numeric timestamps in the Parquet time column (default: s)",
+    )
     return parser
 
 
@@ -41,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         args.data_file,
         from_scratch=args.from_scratch,
         random_seed=args.random_seed,
+        numeric_time_unit=args.numeric_time_unit,
     )
     return 0
 
