@@ -478,8 +478,13 @@ def api_sync_best_strategy(symbol: str | None = None) -> dict[str, Any]:
         raise HTTPException(400, "请先选择训练数据文件或指定品种")
     info = _sync_and_persist_best_strategy(sym)
     if not info:
-        raise HTTPException(404, f"未找到 {sym} 的可用策略")
-    return {"ok": True, **info}
+        return {
+            "ok": True,
+            "available": False,
+            "symbol": sym,
+            "strategy_file": None,
+        }
+    return {"ok": True, "available": True, **info}
 
 
 def _progress_with_live_step(symbol: str, active: bool) -> dict[str, Any]:

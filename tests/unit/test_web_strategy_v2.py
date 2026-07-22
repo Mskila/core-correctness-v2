@@ -1,5 +1,6 @@
 import json
 import hashlib
+import re
 from dataclasses import replace
 
 import pytest
@@ -18,6 +19,33 @@ from model_core.reward import target_bars_per_trade
 from model_core.vocab import FORMULA_VOCAB
 from tests.unit.test_artifacts import strategy_artifact
 from web.strategy_file import inspect_strategy_file
+
+
+def test_sync_best_reports_expected_empty_state_without_404(monkeypatch) -> None:
+    monkeypatch.setattr(web_app, "_sync_and_persist_best_strategy", lambda _symbol: None)
+    response = TestClient(web_app.app).post(
+        "/api/strategy-file/sync-best?symbol=XAUUSD"
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "available": False,
+        "symbol": "XAUUSD",
+        "strategy_file": None,
+    }
+
+
+def test_sync_best_frontend_failure_path_does_not_recurse() -> None:
+    source = (web_app.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    match = re.search(
+        r"async function applyBestStrategyForBacktest\(.*?\n}\n\n"
+        r"async function loadBacktestStrategyContext",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    body = match.group(0).split("async function loadBacktestStrategyContext", 1)[0]
+    assert "loadBacktestStrategyContext" not in body
 
 
 @pytest.mark.parametrize("payload", [[0], {"formula": [0]}, {"schema_version": "strategy-v2"}])

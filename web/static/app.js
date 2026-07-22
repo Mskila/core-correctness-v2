@@ -934,11 +934,11 @@ async function applyBestStrategyForBacktest(symbol, strategyFile) {
   try {
     const res = await fetchJSON(
       `/api/strategy-file/sync-best?symbol=${encodeURIComponent(symbol)}`,
-      { method: "POST" }
+      { method: "POST", silent: true }
     );
-    renderStrategyFileCard(res);
+    if (res.available !== false) renderStrategyFileCard(res);
   } catch (_) {
-    await loadBacktestStrategyContext();
+    /* Strategy auto-sync is optional; keep the current empty/manual state. */
   }
 }
 
