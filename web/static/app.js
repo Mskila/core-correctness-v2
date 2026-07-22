@@ -21,6 +21,8 @@ let lastTrainingActive = false;
 let btLastAlertKey = "";
 let lastErrorPopupText = "";
 let lastErrorPopupAt = 0;
+let cpuTuningActive = false;
+let configuredEvaluationWorkers = 8;
 
 const BACKTEST_MODES = new Set(["in_sample_replay", "out_of_sample_backtest"]);
 
@@ -308,14 +310,14 @@ function renderDataFileCard(info) {
     </div>
     <div class="path" title="${info.data_file}">${info.filename || info.data_file}</div>
   `;
-  startBtn.disabled = false;
-  if ($("retrainBtn")) $("retrainBtn").disabled = false;
+  startBtn.disabled = cpuTuningActive;
+  if ($("retrainBtn")) $("retrainBtn").disabled = cpuTuningActive;
 }
 
 function updateBtStartBtn() {
   const startBtn = $("btStartBtn");
   if (!startBtn) return;
-  startBtn.disabled = btActive || !selectedStrategyFile || !selectedBacktestDataFile;
+  startBtn.disabled = cpuTuningActive || btActive || !selectedStrategyFile || !selectedBacktestDataFile;
   ["btCommissionInput", "btSlippageInput"].forEach((id) => {
     const el = $(id);
     if (el) el.disabled = btActive;
@@ -642,8 +644,8 @@ function updateTrainingUI(training, progress) {
   if (!job || job.state === "idle") {
     pill.innerHTML = '<i class="pill-dot"></i>空闲';
     pill.className = "pill";
-    startBtn.disabled = !selectedDataFile;
-    if (retrainBtn) retrainBtn.disabled = !selectedDataFile;
+    startBtn.disabled = cpuTuningActive || !selectedDataFile;
+    if (retrainBtn) retrainBtn.disabled = cpuTuningActive || !selectedDataFile;
     stopBtn.disabled = true;
     $("logHint").textContent = "—";
     updateTrainingTimeFields(progress, training);
@@ -661,8 +663,8 @@ function updateTrainingUI(training, progress) {
   pill.innerHTML = `<i class="pill-dot"></i>${stateText} · ${label}`;
   pill.className = "pill " + (job.state === "running" ? "running" : job.state);
 
-  startBtn.disabled = active;
-  if (retrainBtn) retrainBtn.disabled = active;
+  startBtn.disabled = cpuTuningActive || active;
+  if (retrainBtn) retrainBtn.disabled = cpuTuningActive || active;
   stopBtn.disabled = !active;
   $("logHint").textContent = job.log_path || "—";
   updateTrainingTimeFields(progress, training);
@@ -677,6 +679,7 @@ async function refreshOverview() {
   let overview = { data_file: null, progress: null };
   let strategies = { strategies: [] };
   let training = { active: false, job: null, log_tail: [] };
+  let cpuTuning = { active: false, job: null };
 
   try {
     overview = await fetchJSON("/api/overview", { silent: true });
@@ -689,6 +692,12 @@ async function refreshOverview() {
   try {
     training = await fetchJSON("/api/training/status", { silent: true });
   } catch (_) {}
+
+  try {
+    cpuTuning = await fetchJSON("/api/cpu-tuning/status", { silent: true });
+  } catch (_) {}
+
+  cpuTuningActive = !!cpuTuning?.active;
 
   if (overview.data_file) renderDataFileCard(overview.data_file);
   updateFileProgress(overview.progress);
@@ -703,6 +712,7 @@ async function refreshOverview() {
     await applyBestStrategyForBacktest(sym, null);
   }
   lastTrainingActive = trainingActive;
+  renderCpuTuningStatus(cpuTuning, trainingActive);
 
   if (sym && (training?.active || overview.progress)) {
     await loadSymbolChart(sym, overview.progress);
@@ -725,7 +735,10 @@ async function loadConfig() {
   if ($("btNumericTimeUnitSelect")) $("btNumericTimeUnitSelect").value = cfg.numeric_time_unit || "s";
   debugMode = !!cfg.debug_mode;
   $("debugModeCheck").checked = debugMode;
-  $("deviceMeta").textContent = `${cfg.train_steps} steps · batch ${cfg.batch_size} · ${cfg.device}`;
+  configuredEvaluationWorkers = Number(cfg.evaluation_workers) || 8;
+  populateEvaluationWorkerOptions(cfg.worker_candidates, configuredEvaluationWorkers);
+  renderWorkerHardware(cfg.cpu_hardware);
+  $("deviceMeta").textContent = `${cfg.train_steps} steps · batch ${cfg.batch_size} · ${cfg.device} · workers ${configuredEvaluationWorkers}`;
   if (cfg.error_log) {
     $("debugLogPaths").textContent = `本地: ${cfg.error_log}`;
   }
@@ -733,6 +746,131 @@ async function loadConfig() {
   if (cfg.strategy_file) renderStrategyFileCard(cfg.strategy_file);
   applyBacktestCostDefaults(cfg);
   await initAiPanel(cfg);
+}
+
+function populateEvaluationWorkerOptions(candidates, selected) {
+  const select = $("evaluationWorkersSelect");
+  if (!select) return;
+  const values = [...new Set([...(candidates || []), Number(selected)])]
+    .filter((value) => Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= 64)
+    .map(Number)
+    .sort((a, b) => a - b);
+  select.innerHTML = values
+    .map((value) => `<option value="${value}">${value} workers</option>`)
+    .join("");
+  select.value = String(selected);
+}
+
+function renderWorkerHardware(hardware) {
+  const hint = $("workersHardwareHint");
+  if (!hint || !hardware) return;
+  const cpu = hardware.cpu ? ` · ${hardware.cpu}` : "";
+  const memory = hardware.total_memory_gib == null ? "" : ` · ${hardware.total_memory_gib} GiB RAM`;
+  hint.textContent = `${hardware.logical_processors || "—"} 逻辑处理器${memory}${cpu}。自动调优会先筛选，再用当前训练文件验证结果一致性和实际训练速度。`;
+}
+
+function selectedEvaluationWorkers() {
+  const value = Number($("evaluationWorkersSelect")?.value);
+  return Number.isInteger(value) && value >= 1 && value <= 64
+    ? value
+    : configuredEvaluationWorkers;
+}
+
+async function saveEvaluationWorkers() {
+  const workers = selectedEvaluationWorkers();
+  const status = $("cpuTuneStatus");
+  try {
+    const saved = await fetchJSON("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ evaluation_workers: workers }),
+    });
+    configuredEvaluationWorkers = Number(saved.evaluation_workers) || workers;
+    if (status) {
+      status.dataset.state = "completed";
+      status.textContent = `已保存 ${configuredEvaluationWorkers} workers`;
+    }
+  } catch (_) {
+    populateEvaluationWorkerOptions([], configuredEvaluationWorkers);
+  }
+}
+
+function renderCpuTuningStatus(payload, trainingActive = false) {
+  const status = $("cpuTuneStatus");
+  const results = $("cpuTuneResults");
+  const select = $("evaluationWorkersSelect");
+  const button = $("autoTuneWorkersBtn");
+  if (!status || !results || !select || !button) return;
+
+  const job = payload?.job;
+  const state = job?.state || "idle";
+  cpuTuningActive = !!payload?.active;
+  select.disabled = trainingActive || cpuTuningActive;
+  button.disabled = trainingActive || cpuTuningActive;
+  button.textContent = cpuTuningActive ? "正在自动调优…" : "自动调优";
+  status.dataset.state = state;
+
+  if (!job) {
+    status.textContent = trainingActive ? "训练中，调优暂不可用" : "尚未运行调优";
+    results.hidden = true;
+    return;
+  }
+  if (state === "running") {
+    status.textContent = `测试中 · PID ${job.pid || "—"}`;
+    results.hidden = false;
+    results.innerHTML = `<p class="worker-tuning-summary">正在筛选 <strong>${(job.candidates || []).join(", ")}</strong> workers${job.data_file ? "，随后用当前训练文件复测候选" : ""}；完成后会自动应用最快结果。</p>`;
+    return;
+  }
+  if (state === "failed") {
+    status.textContent = "自动调优失败";
+    results.hidden = false;
+    results.innerHTML = `<p class="worker-tuning-summary">${escHtml(job.error || "未生成有效调优结果")}</p>`;
+    return;
+  }
+  if (state === "completed") {
+    const recommended = Number(job.recommended_workers);
+    const current = Number(payload.configured_workers);
+    if (Number.isInteger(current)) {
+      configuredEvaluationWorkers = current;
+      populateEvaluationWorkerOptions(payload.candidates || job.candidates, current);
+      select.disabled = trainingActive;
+    }
+    const isApplied = current === recommended;
+    status.textContent = isApplied
+      ? `已应用 ${recommended} workers`
+      : `推荐 ${recommended} · 当前 ${current}`;
+    const rows = (job.results || [])
+      .map((row) => `<tr class="${row.recommended ? "recommended" : ""}">
+        <td>${row.workers}${row.recommended ? " ★" : ""}</td>
+        <td>${Number(row.median_seconds).toFixed(4)} s</td>
+        <td>${row.raw_evaluation_seconds == null ? "—" : `${Number(row.raw_evaluation_seconds).toFixed(4)} s`}</td>
+      </tr>`)
+      .join("");
+    results.hidden = false;
+    results.innerHTML = `<p class="worker-tuning-summary">最适合本机的是 <strong>${recommended} workers</strong>，${isApplied ? "已保存并直接用于下一次训练。" : `当前手动设置为 ${current} workers。`}</p>
+      <table class="worker-tuning-table">
+        <thead><tr><th>Workers</th><th>训练计算</th><th>原始评估</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+}
+
+async function startCpuAutoTuning() {
+  const button = $("autoTuneWorkersBtn");
+  if (button) button.disabled = true;
+  try {
+    await fetchJSON("/api/cpu-tuning/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        data_file: selectedDataFile,
+        numeric_time_unit: numericTimeUnit(),
+      }),
+    });
+    await refreshOverview();
+  } catch (_) {
+    if (button) button.disabled = false;
+  }
 }
 
 function applyBacktestCostDefaults(cfg) {
@@ -982,6 +1120,7 @@ async function startTraining() {
         data_file: selectedDataFile,
         from_scratch: false,
         numeric_time_unit: numericTimeUnit(),
+        evaluation_workers: selectedEvaluationWorkers(),
       }),
     });
     selectedSymbol = res.data_file?.symbol || res.job?.symbol;
@@ -1012,6 +1151,7 @@ async function retrainFromScratch() {
         data_file: selectedDataFile,
         from_scratch: true,
         numeric_time_unit: numericTimeUnit(),
+        evaluation_workers: selectedEvaluationWorkers(),
       }),
     });
     selectedSymbol = res.data_file?.symbol || res.job?.symbol;
@@ -2417,6 +2557,12 @@ async function init() {
     await logClientError("初始化失败: " + e.message);
   }
   $("browseBtn").addEventListener("click", browseDataFile);
+  if ($("evaluationWorkersSelect")) {
+    $("evaluationWorkersSelect").addEventListener("change", saveEvaluationWorkers);
+  }
+  if ($("autoTuneWorkersBtn")) {
+    $("autoTuneWorkersBtn").addEventListener("click", startCpuAutoTuning);
+  }
   $("startBtn").addEventListener("click", startTraining);
   if ($("retrainBtn")) $("retrainBtn").addEventListener("click", retrainFromScratch);
   $("stopBtn").addEventListener("click", stopTraining);
@@ -2486,7 +2632,11 @@ async function init() {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { createBacktestController };
+  module.exports = {
+    createBacktestController,
+    populateEvaluationWorkerOptions,
+    renderCpuTuningStatus,
+  };
 } else {
   init();
 }

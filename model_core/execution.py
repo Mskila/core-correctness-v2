@@ -704,45 +704,63 @@ def _equal_weight_portfolio_log_returns(
     )
     if not bool(torch.isfinite(net_pnl_by_symbol[target_valid]).all()):
         raise DataValidationError("valid net_pnl values must be finite")
-    portfolio_returns: list[Tensor] = []
-    exit_times: list[int] = []
-    entry_times: list[int] = []
     active_time_indices = torch.nonzero(
         target_valid.any(dim=0), as_tuple=False
-    ).flatten().detach().cpu().tolist()
-    for time_index in active_time_indices:
-        active = target_valid[:, time_index]
-        active_entry_times = bar_time_ns[active, time_index + 1]
-        active_exit_times = bar_time_ns[active, time_index + 2]
-        if not bool((active_entry_times == active_entry_times[0]).all()):
-            raise DataValidationError(
-                "multi-symbol portfolio requires synchronized entry timestamps"
-            )
-        if not bool((active_exit_times == active_exit_times[0]).all()):
-            raise DataValidationError(
-                "multi-symbol portfolio requires synchronized exit timestamps"
-            )
-        symbol_simple_returns = torch.expm1(
-            net_pnl_by_symbol[active, time_index].to(torch.float64)
+    ).flatten()
+    active = torch.index_select(target_valid, 1, active_time_indices)
+    active_entry_times = torch.index_select(
+        bar_time_ns, 1, active_time_indices + 1
+    )
+    active_exit_times = torch.index_select(
+        bar_time_ns, 1, active_time_indices + 2
+    )
+    column_indices = torch.arange(
+        active_time_indices.numel(), device=target_valid.device
+    )
+    first_active_symbols = active.to(torch.int64).argmax(dim=0)
+    portfolio_entry_times = active_entry_times[
+        first_active_symbols, column_indices
+    ]
+    portfolio_exit_times = active_exit_times[
+        first_active_symbols, column_indices
+    ]
+    if not bool(
+        ((~active) | (active_entry_times == portfolio_entry_times.unsqueeze(0))).all()
+    ):
+        raise DataValidationError(
+            "multi-symbol portfolio requires synchronized entry timestamps"
         )
-        portfolio_simple_return = symbol_simple_returns.mean()
-        if bool(portfolio_simple_return <= -1.0):
-            raise DataValidationError(
-                "equal-weight portfolio reached the insolvency boundary"
-            )
-        portfolio_returns.append(torch.log1p(portfolio_simple_return))
-        entry_times.append(int(active_entry_times[0].detach().cpu()))
-        exit_times.append(int(active_exit_times[0].detach().cpu()))
-    if any(current <= previous for previous, current in zip(exit_times, exit_times[1:])):
+    if not bool(
+        ((~active) | (active_exit_times == portfolio_exit_times.unsqueeze(0))).all()
+    ):
+        raise DataValidationError(
+            "multi-symbol portfolio requires synchronized exit timestamps"
+        )
+    if bool((portfolio_exit_times[1:] <= portfolio_exit_times[:-1]).any()):
         raise DataValidationError("portfolio exit timestamps must be strictly increasing")
 
-    net_pnl = torch.stack(portfolio_returns)
-    first_entry_ns = entry_times[0]
+    selected_net_pnl = torch.index_select(
+        net_pnl_by_symbol, 1, active_time_indices
+    ).to(torch.float64)
+    symbol_simple_returns = torch.where(
+        active,
+        torch.expm1(selected_net_pnl),
+        torch.zeros_like(selected_net_pnl),
+    )
+    active_counts = active.sum(dim=0)
+    portfolio_simple_returns = symbol_simple_returns.sum(dim=0) / active_counts
+    if bool((portfolio_simple_returns <= -1.0).any()):
+        raise DataValidationError(
+            "equal-weight portfolio reached the insolvency boundary"
+        )
+    net_pnl = torch.log1p(portfolio_simple_returns)
+    first_entry_ns = int(portfolio_entry_times[0].detach().cpu())
+    final_exit_ns = int(portfolio_exit_times[-1].detach().cpu())
     elapsed_seconds = (
-        exit_times[-1] - first_entry_ns
+        final_exit_ns - first_entry_ns
     ) / _NANOSECONDS_PER_SECOND
     elapsed_years = elapsed_seconds / _SECONDS_PER_YEAR
-    periods_per_year = len(portfolio_returns) / elapsed_years
+    periods_per_year = net_pnl.numel() / elapsed_years
     if not math.isfinite(periods_per_year) or periods_per_year <= 0.0:
         raise DataValidationError("portfolio periods_per_year must be finite and positive")
     return net_pnl, elapsed_years, periods_per_year

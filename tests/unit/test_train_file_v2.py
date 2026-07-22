@@ -128,25 +128,33 @@ def test_train_file_loads_parquet_then_delegates(monkeypatch, tmp_path) -> None:
     )
     data_file = tmp_path / "EURUSD_H1.parquet"
     result = train_file.train_from_file(
-        str(data_file), from_scratch=True, random_seed=123, numeric_time_unit="ms"
+        str(data_file), from_scratch=True, random_seed=123, numeric_time_unit="ms",
+        evaluation_workers=12,
     )
     assert result is sentinel
     assert events[0] == ("init", str(data_file), "ms")
     assert events[1] == ("load",)
     assert events[2][2]["from_scratch"] is True
     assert events[2][2]["random_seed"] == 123
+    assert events[2][2]["evaluation_workers"] == 12
 
 
 def test_train_file_parser_accepts_only_supported_numeric_time_units() -> None:
+    import pytest
+
     parser = train_file._parser()
     args = parser.parse_args(
         ["--data-file", "XAUUSD_M15.parquet", "--numeric-time-unit", "us"]
     )
     assert args.numeric_time_unit == "us"
-
-    import pytest
-
     with pytest.raises(SystemExit):
         parser.parse_args(
             ["--data-file", "XAUUSD_M15.parquet", "--numeric-time-unit", "minutes"]
         )
+
+
+def test_train_file_parser_accepts_evaluation_workers() -> None:
+    args = train_file._parser().parse_args(
+        ["--data-file", "XAUUSD_M15.parquet", "--evaluation-workers", "16"]
+    )
+    assert args.evaluation_workers == 16

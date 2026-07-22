@@ -80,23 +80,83 @@ class ConstrainedSampler:
         prev_tokens: list[int | None] | None = None,
         infected_chain_lens: list[int] | None = None,
     ) -> torch.Tensor:
-        masked = logits.clone()
+        del prev_tokens
+        if logits.ndim != 2 or logits.shape[1] != self.vocab_size:
+            raise ValueError("logits must have shape [batch, vocab_size]")
+        if len(stack_depths) != logits.shape[0]:
+            raise ValueError("stack_depths must match logits batch size")
+        if (
+            infected_chain_lens is not None
+            and len(infected_chain_lens) != logits.shape[0]
+        ):
+            raise ValueError("infected_chain_lens must match logits batch size")
+
         device = logits.device
-        for batch_index, depth in enumerate(stack_depths):
-            previous = prev_tokens[batch_index] if prev_tokens else None
-            infection = (
-                infected_chain_lens[batch_index] if infected_chain_lens else 0
+        depths = torch.tensor(stack_depths, dtype=torch.int64, device=device)[:, None]
+        deltas = torch.tensor(
+            tuple(self.delta[token_id] for token_id in range(self.vocab_size)),
+            dtype=torch.int64,
+            device=device,
+        )[None, :]
+        new_depths = depths + deltas
+        remaining = total_steps - step_idx
+        valid = new_depths >= 1
+        valid &= new_depths + (remaining - 1) * -2 <= 1
+        valid &= new_depths + (remaining - 1) >= 1
+
+        infections = torch.tensor(
+            infected_chain_lens or [0] * logits.shape[0],
+            dtype=torch.int64,
+            device=device,
+        )[:, None]
+        propagating = torch.tensor(
+            tuple(
+                token_id in self.infected_propagating_ids
+                for token_id in range(self.vocab_size)
+            ),
+            dtype=torch.bool,
+            device=device,
+        )[None, :]
+        positive_only = torch.tensor(
+            tuple(
+                token_id in self.positive_only_ids
+                for token_id in range(self.vocab_size)
+            ),
+            dtype=torch.bool,
+            device=device,
+        )[None, :]
+        valid &= ~((infections >= 2) & propagating)
+        valid &= ~((infections >= 3) & (propagating | positive_only))
+
+        fallback_rows = ~valid.any(dim=1)
+        fallback = new_depths >= 1
+        valid = torch.where(fallback_rows[:, None], fallback, valid)
+        return logits.masked_fill(~valid, -1e9)
+
+    def advance_batch_state(
+        self,
+        tokens: torch.Tensor,
+        stack_depths: list[int],
+        prev_tokens: list[int | None],
+        infected_chain_lens: list[int],
+    ) -> None:
+        """Advance Python grammar state after one bulk token transfer."""
+        if tokens.ndim != 1:
+            raise ValueError("tokens must have rank 1")
+        batch_size = tokens.shape[0]
+        if not (
+            len(stack_depths)
+            == len(prev_tokens)
+            == len(infected_chain_lens)
+            == batch_size
+        ):
+            raise ValueError("sampling state must match token batch size")
+        for index, token in enumerate(tokens.detach().cpu().tolist()):
+            stack_depths[index] += self.delta[token]
+            prev_tokens[index] = token
+            infected_chain_lens[index] = self.update_infection(
+                token, infected_chain_lens[index]
             )
-            valid = self.valid_mask(
-                depth,
-                step_idx,
-                total_steps,
-                device,
-                prev_token=previous,
-                infected_chain_len=infection,
-            )
-            masked[batch_index][~valid] = -1e9
-        return masked
 
     def update_infection(self, token: int, infected_chain_len: int) -> int:
         if token in self.positive_only_ids:

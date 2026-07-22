@@ -12,6 +12,7 @@ from model_core.execution import (
     ExecutionResult,
     LedgerEntry,
     PerformanceMetrics,
+    _equal_weight_portfolio_log_returns,
     build_execution_ledger,
     derive_periods_per_year,
     factor_to_position,
@@ -2445,6 +2446,27 @@ def test_performance_metrics_local_scalar_syncs_are_constant_per_call() -> None:
 
     assert len(set(local_scalar_counts)) == 1, local_scalar_counts
     assert local_scalar_counts[0] <= 36, local_scalar_counts
+
+
+def test_portfolio_aggregation_local_scalar_syncs_do_not_scale_with_time() -> None:
+    local_scalar_counts: list[int] = []
+    for valid_count in (64, 128, 256):
+        result = _ledger_scale_result(valid_count)
+        stats = _CloneStatsMode()
+
+        with stats:
+            net_pnl, _, _ = _equal_weight_portfolio_log_returns(result)
+
+        assert net_pnl.numel() == valid_count
+        local_scalar_counts.append(stats.local_scalar_calls)
+
+    assert len(set(local_scalar_counts)) == 1, local_scalar_counts
+
+
+def test_portfolio_aggregation_has_no_python_time_loop() -> None:
+    tree = ast.parse(inspect.getsource(_equal_weight_portfolio_log_returns))
+
+    assert not any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(tree))
 
 
 def test_execution_ledger_inner_loop_uses_bulk_materialized_values() -> None:

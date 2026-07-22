@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -46,6 +46,7 @@ from web.strategy_file import (
     sync_best_strategy_for_symbol,
 )
 from web.training_manager import training_manager
+from web.cpu_tuner import cpu_tuning_manager
 from web.training_time import get_training_time_summary
 from web.training_package import build_training_export_zip, import_training_package
 from web.backtest_manager import backtest_manager
@@ -59,7 +60,7 @@ BACKTEST_OUTPUT_DIR = ROOT / "backtest_output"
 setup_logging()
 logger = get_logger()
 
-app = FastAPI(title="AlphaMaster Training", version="1.1.0")
+app = FastAPI(title="AlphaMaster Training", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,6 +73,12 @@ class StartTrainingRequest(BaseModel):
     data_file: str
     from_scratch: bool = False
     numeric_time_unit: Literal["s", "ms", "us", "ns"] = "s"
+    evaluation_workers: int | None = Field(default=None, ge=1, le=64)
+
+
+class CpuTuningRequest(BaseModel):
+    data_file: str | None = None
+    numeric_time_unit: Literal["s", "ms", "us", "ns"] | None = None
 
 
 class ClientLogRequest(BaseModel):
@@ -84,6 +91,7 @@ class SettingsRequest(BaseModel):
     last_data_file: str | None = None
     last_strategy_file: str | None = None
     numeric_time_unit: Literal["s", "ms", "us", "ns"] | None = None
+    evaluation_workers: int | None = Field(default=None, ge=1, le=64)
     debug_mode: bool | None = None
     ai_provider: str | None = None
     ai_api_key: str | None = None
@@ -300,7 +308,7 @@ def _sync_and_persist_best_strategy(symbol: str) -> dict[str, Any] | None:
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "version": "1.1.0"}
+    return {"status": "ok", "version": app.version}
 
 
 @app.get("/api/routes")
@@ -345,6 +353,8 @@ def api_put_settings(req: SettingsRequest) -> dict[str, Any]:
         payload["last_strategy_file"] = req.last_strategy_file
     if req.numeric_time_unit is not None:
         payload["numeric_time_unit"] = req.numeric_time_unit
+    if req.evaluation_workers is not None:
+        payload["evaluation_workers"] = req.evaluation_workers
     if req.debug_mode is not None:
         payload["debug_mode"] = req.debug_mode
     if req.ai_provider is not None:
@@ -364,6 +374,7 @@ def api_put_settings(req: SettingsRequest) -> dict[str, Any]:
 @app.get("/api/config")
 def api_config() -> dict[str, Any]:
     settings = load_settings()
+    cpu_config = cpu_tuning_manager.configuration()
     data_file = settings.get("last_data_file") or ""
     file_info = None
     if data_file:
@@ -387,6 +398,11 @@ def api_config() -> dict[str, Any]:
         "device": str(ModelConfig.DEVICE),
         "last_data_file": data_file,
         "numeric_time_unit": settings.get("numeric_time_unit", "s"),
+        "evaluation_workers": settings.get(
+            "evaluation_workers", ModelConfig.EVALUATION_WORKERS
+        ),
+        "worker_candidates": cpu_config["candidates"],
+        "cpu_hardware": cpu_config["hardware"],
         "data_file": file_info,
         "last_strategy_file": strat_ctx["last_strategy_file"],
         "strategy_file": strat_ctx["strategy_file"],
@@ -683,12 +699,59 @@ def api_training_status() -> dict[str, Any]:
     return status
 
 
+@app.get("/api/cpu-tuning/status")
+def api_cpu_tuning_status() -> dict[str, Any]:
+    status = cpu_tuning_manager.status()
+    status["log_tail"] = cpu_tuning_manager.tail_log(80)
+    return status
+
+
+@app.post("/api/cpu-tuning/start")
+def api_cpu_tuning_start(req: CpuTuningRequest | None = None) -> dict[str, Any]:
+    if training_manager.status().get("active"):
+        raise HTTPException(409, "训练进行中，请先停止再自动调优")
+    if backtest_manager.status().get("active"):
+        raise HTTPException(409, "回测进行中，请先停止再自动调优")
+    if realtime_manager.status().get("running"):
+        raise HTTPException(409, "实时分析进行中，请先停止再自动调优")
+    settings = load_settings()
+    data_file = (req.data_file if req else None) or settings.get("last_data_file") or None
+    numeric_time_unit = (
+        (req.numeric_time_unit if req else None)
+        or settings.get("numeric_time_unit")
+        or "s"
+    )
+    if data_file:
+        data_file = _inspect_or_http(data_file, numeric_time_unit)["data_file"]
+    current_workers = int(
+        settings.get("evaluation_workers", ModelConfig.EVALUATION_WORKERS)
+    )
+    try:
+        job = cpu_tuning_manager.start(
+            data_file=data_file,
+            numeric_time_unit=numeric_time_unit,
+            current_workers=current_workers,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"ok": True, "job": job.to_dict()}
+
+
 @app.post("/api/training/start")
 def api_training_start(req: StartTrainingRequest) -> dict[str, Any]:
+    if cpu_tuning_manager.status().get("active"):
+        raise HTTPException(409, "CPU 自动调优进行中，请等待完成后再训练")
     info = _inspect_or_http(req.data_file, req.numeric_time_unit)
+    settings = load_settings()
+    evaluation_workers = (
+        req.evaluation_workers
+        if req.evaluation_workers is not None
+        else int(settings.get("evaluation_workers", ModelConfig.EVALUATION_WORKERS))
+    )
     save_settings({
         "last_data_file": info["data_file"],
         "numeric_time_unit": req.numeric_time_unit,
+        "evaluation_workers": evaluation_workers,
     })
     try:
         job = training_manager.start(
@@ -698,6 +761,7 @@ def api_training_start(req: StartTrainingRequest) -> dict[str, Any]:
             mode="ftmo",
             from_scratch=bool(req.from_scratch),
             numeric_time_unit=req.numeric_time_unit,
+            evaluation_workers=evaluation_workers,
         )
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
@@ -824,6 +888,8 @@ def api_backtest_status() -> dict[str, Any]:
 
 @app.post("/api/backtest/start")
 def api_backtest_start(req: StartBacktestRequest) -> dict[str, Any]:
+    if cpu_tuning_manager.status().get("active"):
+        raise HTTPException(409, "CPU 自动调优进行中，请等待完成后再回测")
     info = _inspect_strategy_or_http(req.strategy_file)
     settings = load_settings()
     commission = (
@@ -1010,6 +1076,8 @@ def api_realtime_unwatch(req: RemoveWatchRequest) -> dict[str, Any]:
 
 @app.post("/api/realtime/start")
 def api_realtime_start() -> dict[str, Any]:
+    if cpu_tuning_manager.status().get("active"):
+        raise HTTPException(409, "CPU 自动调优进行中，请等待完成后再启动实时分析")
     realtime_manager.start()
     return {"ok": True, **realtime_manager.status()}
 

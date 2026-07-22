@@ -88,6 +88,22 @@
             <div class="data-file-empty">尚未选择数据文件</div>
           </div>
         </div>
+        <div class="worker-tuning-panel" id="workerTuningPanel">
+          <div class="worker-tuning-controls">
+            <label class="worker-count-field" for="evaluationWorkersSelect">
+              <span>CPU Workers</span>
+              <select id="evaluationWorkersSelect" aria-describedby="workersHardwareHint"></select>
+            </label>
+            <button type="button" class="btn btn-secondary btn-auto-tune" id="autoTuneWorkersBtn">
+              自动调优
+            </button>
+            <span class="worker-tuning-status" id="cpuTuneStatus" data-state="idle">尚未运行调优</span>
+          </div>
+          <p class="field-hint worker-hardware-hint" id="workersHardwareHint">
+            自动调优会先快速筛选，再用当前训练文件隔离复测，并把真实训练最快且结果一致的值直接设为后续 workers 数。
+          </p>
+          <div class="worker-tuning-results" id="cpuTuneResults" hidden></div>
+        </div>
         <div class="launch-actions" role="group" aria-label="训练操作">
           <button class="btn btn-primary" id="startBtn" disabled>开始训练</button>
           <button class="btn btn-secondary" id="retrainBtn" disabled title="创建新 run；旧 checkpoint、策略和分数保持不变">重新训练</button>

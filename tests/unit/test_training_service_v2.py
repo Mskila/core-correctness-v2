@@ -170,6 +170,15 @@ def test_service_passes_exact_identity_lord_controls_to_engine(
     }
 
 
+def test_service_forwards_explicit_evaluation_workers(monkeypatch) -> None:
+    monkeypatch.setattr(training_service, "AlphaEngine", DummyEngine)
+    engine = run_training_session(
+        OneManager(), source_path="fake", from_scratch=True, random_seed=42,
+        evaluation_workers=12,
+    )
+    assert engine.engine_options["evaluation_workers"] == 12
+
+
 def test_from_scratch_never_scans_or_changes_old_artifacts(monkeypatch, tmp_path) -> None:
     checkpoint_dir = tmp_path / "checkpoints"
     strategy_dir = tmp_path / "strategies"

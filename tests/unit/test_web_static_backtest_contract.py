@@ -97,12 +97,38 @@ Promise.resolve(vm.runInContext('retrainFromScratch()', context)).then(() => {
     return json.loads(completed.stdout)
 
 
+def _run_cpu_tuning_renderer(payload):
+    script = """
+const elements = {};
+for (const id of ['cpuTuneStatus', 'cpuTuneResults', 'evaluationWorkersSelect', 'autoTuneWorkersBtn']) {
+  elements[id] = {id, dataset: {}, hidden: false, disabled: false, innerHTML: '', textContent: '', value: ''};
+}
+global.window = {};
+global.document = {getElementById(id) { return elements[id] || null; }};
+const api = require('./web/static/app.js');
+api.populateEvaluationWorkerOptions([1, 2, 4, 8, 12], 8);
+api.renderCpuTuningStatus(JSON.parse(process.argv[1]), false);
+console.log(JSON.stringify({
+  status: elements.cpuTuneStatus.textContent,
+  state: elements.cpuTuneStatus.dataset.state,
+  selected: elements.evaluationWorkersSelect.value,
+  results: elements.cpuTuneResults.innerHTML,
+}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script, json.dumps(payload)], cwd=ROOT,
+        check=True, capture_output=True, encoding="utf-8",
+    )
+    return json.loads(completed.stdout)
+
+
 def test_html_exposes_exact_modes_and_independent_data_controls() -> None:
     parser = _ContractParser()
     parser.feed((ROOT / "web/static/index.html").read_text(encoding="utf-8"))
     assert {
         "btBrowseDataBtn", "btDataCard", "btModeSelect", "numericTimeUnitSelect",
-        "btNumericTimeUnitSelect",
+        "btNumericTimeUnitSelect", "evaluationWorkersSelect", "autoTuneWorkersBtn",
+        "cpuTuneStatus", "cpuTuneResults",
     }.issubset(parser.ids)
     assert len(parser.mode_values) == 2
     assert set(parser.mode_values) == {
@@ -155,6 +181,31 @@ def test_actual_from_scratch_handler_confirms_immutable_independent_run() -> Non
     }
 
 
+def test_cpu_tuning_renderer_shows_recommendation_and_respects_manual_override() -> None:
+    result = _run_cpu_tuning_renderer({
+        "active": False,
+        "configured_workers": 12,
+        "candidates": [1, 2, 4, 8, 12],
+        "job": {
+            "state": "completed",
+            "recommended_workers": 8,
+            "results": [
+                {
+                    "workers": 8,
+                    "median_seconds": 21.83,
+                    "raw_evaluation_seconds": 16.79,
+                    "recommended": True,
+                }
+            ],
+        },
+    })
+    assert result["state"] == "completed"
+    assert result["status"] == "推荐 8 · 当前 12"
+    assert result["selected"] == "12"
+    assert "21.8300 s" in result["results"]
+    assert "16.7900 s" in result["results"]
+
+
 @pytest.mark.parametrize("from_scratch", [False, True])
 def test_training_start_preserves_legacy_history_and_forwards_mode(
     monkeypatch, tmp_path, from_scratch
@@ -184,7 +235,7 @@ def test_training_start_preserves_legacy_history_and_forwards_mode(
     try:
         manager.start(
             "input.parquet", "EURUSD", "H1", from_scratch=from_scratch,
-            numeric_time_unit="ns",
+            numeric_time_unit="ns", evaluation_workers=12,
         )
     finally:
         if manager._log_fp is not None:
@@ -202,4 +253,7 @@ def test_training_start_preserves_legacy_history_and_forwards_mode(
     assert command.count("--numeric-time-unit") == 1
     unit_flag = command.index("--numeric-time-unit")
     assert command[unit_flag + 1] == "ns"
+    assert command.count("--evaluation-workers") == 1
+    worker_flag = command.index("--evaluation-workers")
+    assert command[worker_flag + 1] == "12"
     assert kwargs["cwd"] == project

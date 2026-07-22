@@ -143,6 +143,31 @@ def test_parallel_evaluator_reuses_workers_and_closes_them(workers: int) -> None
     assert evaluator.worker_pids == ()
 
 
+def test_chunked_parallel_evaluation_is_exact_and_ordered() -> None:
+    context, formulas = _context()
+    formulas = formulas * 3
+    expected = ReferenceCpuEvaluator(context).evaluate_batch(formulas, step=9)
+
+    with ParallelCpuEvaluator(
+        context,
+        workers=2,
+        timeout_seconds=30.0,
+        chunk_size=4,
+    ) as evaluator:
+        actual = evaluator.evaluate_batch(formulas, step=9)
+
+    assert [item.formula_index for item in actual] == list(range(len(formulas)))
+    for left, right in zip(expected, actual):
+        _assert_raw_equal(left, right)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True])
+def test_parallel_evaluator_rejects_invalid_chunk_size(chunk_size: object) -> None:
+    context, _ = _context()
+    with pytest.raises(ValueError, match="chunk_size"):
+        ParallelCpuEvaluator(context, workers=2, chunk_size=chunk_size)  # type: ignore[arg-type]
+
+
 def test_parallel_evaluator_rejects_non_context_object() -> None:
     with pytest.raises(TypeError, match="exact RawEvaluationContext"):
         ParallelCpuEvaluator(object(), workers=2)
@@ -244,7 +269,14 @@ def test_forkserver_matches_spawn_when_platform_supports_it() -> None:
         _assert_raw_equal(left, right)
 
 
-def _run_engine_trace(monkeypatch, tmp_path, workers: int | None) -> dict:
+def _run_engine_trace(
+    monkeypatch,
+    tmp_path,
+    workers: int | None,
+    *,
+    torch_threads: int = 1,
+    chunk_size: int = 1,
+) -> dict:
     context, _ = _context()
     folds = (
         WalkForwardFold(0, 0, 10, 12, 20, 2),
@@ -263,6 +295,8 @@ def _run_engine_trace(monkeypatch, tmp_path, workers: int | None) -> dict:
     monkeypatch.setattr(ModelConfig, "MAX_FORMULA_LEN", 1)
     monkeypatch.setattr(ModelConfig, "WF_N_BLOCKS", len(folds))
     monkeypatch.setattr(ModelConfig, "ENTROPY_COLLAPSE_THRESH", -1.0)
+    monkeypatch.setattr(ModelConfig, "EVALUATION_TORCH_THREADS", torch_threads)
+    monkeypatch.setattr(ModelConfig, "EVALUATION_CHUNK_SIZE", chunk_size)
     history_path = tmp_path / f"history-{workers}.json"
     monkeypatch.setattr(
         TrainingRunIdentity,
@@ -408,6 +442,22 @@ def test_engine_trace_is_exact_across_reference_and_worker_counts(
 ) -> None:
     reference = _run_engine_trace(monkeypatch, tmp_path / "reference", None)
     actual = _run_engine_trace(monkeypatch, tmp_path / f"workers-{workers}", workers)
+
+    _assert_engine_trace_exact(reference, actual)
+
+
+def test_engine_trace_is_exact_with_worker_threads_and_chunking(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    reference = _run_engine_trace(monkeypatch, tmp_path / "reference-mixed", None)
+    actual = _run_engine_trace(
+        monkeypatch,
+        tmp_path / "workers-mixed",
+        4,
+        torch_threads=2,
+        chunk_size=2,
+    )
 
     _assert_engine_trace_exact(reference, actual)
 

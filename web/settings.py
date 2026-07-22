@@ -10,6 +10,7 @@ SETTINGS_PATH = PROJECT_ROOT / "web_settings.json"
 _DEFAULT = {
     "last_data_file": "",
     "numeric_time_unit": "s",
+    "evaluation_workers": 8,
     "last_strategy_file": "",
     "debug_mode": False,
     "ai_provider": "deepseek",
@@ -41,6 +42,16 @@ def _as_numeric_time_unit(value) -> str:
     return unit if unit in {"s", "ms", "us", "ns"} else "s"
 
 
+def _as_evaluation_workers(value, default: int = 8) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        workers = int(value)
+    except (TypeError, ValueError):
+        return default
+    return workers if 1 <= workers <= 64 else default
+
+
 def load_settings() -> dict:
     if not SETTINGS_PATH.exists():
         return dict(_DEFAULT)
@@ -53,6 +64,9 @@ def load_settings() -> dict:
     out["debug_mode"] = bool(out.get("debug_mode", False))
     out["last_strategy_file"] = str(out.get("last_strategy_file") or "").strip()
     out["numeric_time_unit"] = _as_numeric_time_unit(out.get("numeric_time_unit"))
+    out["evaluation_workers"] = _as_evaluation_workers(
+        out.get("evaluation_workers"), _DEFAULT["evaluation_workers"]
+    )
     out["ai_provider"] = str(out.get("ai_provider") or "deepseek").strip().lower()
     if out["ai_provider"] not in ("deepseek", "openclaw", "openclaw_wb"):
         out["ai_provider"] = "deepseek"
@@ -93,6 +107,10 @@ def save_settings(data: dict) -> dict:
         current["last_strategy_file"] = str(data["last_strategy_file"] or "").strip()
     if "numeric_time_unit" in data:
         current["numeric_time_unit"] = _as_numeric_time_unit(data["numeric_time_unit"])
+    if "evaluation_workers" in data:
+        current["evaluation_workers"] = _as_evaluation_workers(
+            data["evaluation_workers"], _DEFAULT["evaluation_workers"]
+        )
     if "debug_mode" in data:
         current["debug_mode"] = bool(data["debug_mode"])
     if "ai_provider" in data:

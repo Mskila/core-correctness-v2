@@ -16,6 +16,7 @@ if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.train_logging import strip_ansi
+from model_core.config import ModelConfig
 from model_core.error_telemetry import ErrorTelemetry
 from web.process_lifecycle import (
     ProcessLifecycleError,
@@ -43,6 +44,7 @@ class TrainingJob:
     timeframe: str
     mode: str
     numeric_time_unit: str = "s"
+    evaluation_workers: int = ModelConfig.EVALUATION_WORKERS
     state: JobState = JobState.RUNNING
     pid: int | None = None
     log_path: str = ""
@@ -58,6 +60,7 @@ class TrainingJob:
             "timeframe": self.timeframe,
             "mode": self.mode,
             "numeric_time_unit": self.numeric_time_unit,
+            "evaluation_workers": self.evaluation_workers,
             "state": self.state.value,
             "pid": self.pid,
             "log_path": self.log_path,
@@ -96,6 +99,7 @@ class TrainingManager:
         *,
         from_scratch: bool = False,
         numeric_time_unit: str = "s",
+        evaluation_workers: int = ModelConfig.EVALUATION_WORKERS,
     ) -> TrainingJob:
         with self._lock:
             self._refresh_state()
@@ -115,6 +119,8 @@ class TrainingManager:
                 data_file,
                 "--numeric-time-unit",
                 numeric_time_unit,
+                "--evaluation-workers",
+                str(evaluation_workers),
             ]
             if from_scratch:
                 cmd.append("--from-scratch")
@@ -141,6 +147,7 @@ class TrainingManager:
                 timeframe=timeframe,
                 mode=mode,
                 numeric_time_unit=numeric_time_unit,
+                evaluation_workers=evaluation_workers,
                 pid=self._proc.pid,
                 log_path=str(log_path.relative_to(PROJECT_ROOT)).replace("\\", "/"),
                 started_at=datetime.now(timezone.utc).isoformat(),

@@ -43,13 +43,16 @@ def test_browse_and_training_forward_and_persist_numeric_time_unit(monkeypatch) 
 
     response = web_app.api_training_start(
         web_app.StartTrainingRequest(
-            data_file="XAUUSD_M15.parquet", numeric_time_unit="us"
+            data_file="XAUUSD_M15.parquet", numeric_time_unit="us",
+            evaluation_workers=12,
         )
     )
     assert response["ok"] is True
     assert inspected[-1] == ("XAUUSD_M15.parquet", "us")
     assert started["numeric_time_unit"] == "us"
+    assert started["evaluation_workers"] == 12
     assert saved[-1]["numeric_time_unit"] == "us"
+    assert saved[-1]["evaluation_workers"] == 12
 
 
 def test_settings_default_and_round_trip_numeric_time_unit(monkeypatch, tmp_path) -> None:
@@ -63,3 +66,16 @@ def test_settings_default_and_round_trip_numeric_time_unit(monkeypatch, tmp_path
     assert settings_module.save_settings({"numeric_time_unit": "minutes"})[
         "numeric_time_unit"
     ] == "s"
+
+
+def test_settings_default_and_round_trip_evaluation_workers(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "web_settings.json"
+    monkeypatch.setattr(settings_module, "SETTINGS_PATH", path)
+    assert settings_module.load_settings()["evaluation_workers"] == 8
+    assert settings_module.save_settings({"evaluation_workers": 12})[
+        "evaluation_workers"
+    ] == 12
+    assert settings_module.load_settings()["evaluation_workers"] == 12
+    assert settings_module.save_settings({"evaluation_workers": 0})[
+        "evaluation_workers"
+    ] == 8

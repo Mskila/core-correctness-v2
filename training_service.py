@@ -405,6 +405,7 @@ def run_training_session(
     source_path: str | pathlib.Path | None,
     from_scratch: bool,
     random_seed: int,
+    evaluation_workers: int | None = None,
 ) -> AlphaEngine:
     """Train or exactly resume one normalized symbol; domain errors propagate."""
     require_search_layer(data_manager, ProtocolConsumer.TRAINING)
@@ -438,7 +439,11 @@ def run_training_session(
         use_lord_regularization=ModelConfig.USE_LORD_REGULARIZATION,
         lord_decay_rate=ModelConfig.LORD_DECAY_RATE,
         lord_num_iterations=ModelConfig.LORD_NUM_ITERATIONS,
-        evaluation_workers=ModelConfig.EVALUATION_WORKERS,
+        evaluation_workers=(
+            ModelConfig.EVALUATION_WORKERS
+            if evaluation_workers is None
+            else evaluation_workers
+        ),
     )
     engine.source_path = None if source_path is None else str(source_path)
     start_step = 0

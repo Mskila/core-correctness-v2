@@ -33,25 +33,44 @@ def _evaluate_in_worker(
     formula: tuple[int, ...],
     step: int,
 ) -> tuple[int, RawFormulaEvaluation]:
+    pid, results = _evaluate_chunk_in_worker(
+        ((formula_index, formula),),
+        step,
+    )
+    return pid, results[0]
+
+
+def _evaluate_chunk_in_worker(
+    indexed_formulas: tuple[tuple[int, tuple[int, ...]], ...],
+    step: int,
+) -> tuple[int, tuple[RawFormulaEvaluation, ...]]:
     evaluator = _WORKER_EVALUATOR
     if evaluator is None:
         raise RuntimeError("parallel evaluator worker was not initialized")
-    result = evaluator.evaluate_batch((formula,), step=step)[0]
-    if result.formula_index != 0:
-        raise RuntimeError("worker-local formula index contract was violated")
-    return os.getpid(), RawFormulaEvaluation(
-        formula_index=formula_index,
-        formula=result.formula,
-        factor=result.factor,
-        fold_train_scores=result.fold_train_scores,
-        fold_val_scores=result.fold_val_scores,
-        fold_ics=result.fold_ics,
-        selection_ic=result.selection_ic,
-        selection_ic_stability=result.selection_ic_stability,
-        exposure=result.exposure,
-        constant=result.constant,
-        error=result.error,
-    )
+    formulas = tuple(formula for _, formula in indexed_formulas)
+    local_results = evaluator.evaluate_batch(formulas, step=step)
+    if len(local_results) != len(indexed_formulas):
+        raise RuntimeError("worker-local formula batch was incomplete")
+    remapped = []
+    for local_index, ((formula_index, _), result) in enumerate(
+        zip(indexed_formulas, local_results)
+    ):
+        if result.formula_index != local_index:
+            raise RuntimeError("worker-local formula index contract was violated")
+        remapped.append(RawFormulaEvaluation(
+            formula_index=formula_index,
+            formula=result.formula,
+            factor=result.factor,
+            fold_train_scores=result.fold_train_scores,
+            fold_val_scores=result.fold_val_scores,
+            fold_ics=result.fold_ics,
+            selection_ic=result.selection_ic,
+            selection_ic_stability=result.selection_ic_stability,
+            exposure=result.exposure,
+            constant=result.constant,
+            error=result.error,
+        ))
+    return os.getpid(), tuple(remapped)
 
 
 def _shared_context(context: RawEvaluationContext) -> RawEvaluationContext:
@@ -84,6 +103,7 @@ class ParallelCpuEvaluator:
         workers: int,
         timeout_seconds: float = 300.0,
         torch_threads: int = 1,
+        chunk_size: int = 1,
         start_method: str = "spawn",
     ) -> None:
         if type(context) is not RawEvaluationContext:
@@ -93,6 +113,8 @@ class ParallelCpuEvaluator:
             raise ValueError("workers must be a positive built-in int")
         if type(torch_threads) is not int or torch_threads < 1:
             raise ValueError("torch_threads must be a positive built-in int")
+        if type(chunk_size) is not int or chunk_size < 1:
+            raise ValueError("chunk_size must be a positive built-in int")
         if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if start_method not in ("spawn", "forkserver"):
@@ -100,6 +122,7 @@ class ParallelCpuEvaluator:
         if start_method not in multiprocessing.get_all_start_methods():
             raise ValueError(f"start_method is unavailable: {start_method}")
         self.workers = workers
+        self.chunk_size = chunk_size
         self.timeout_seconds = float(timeout_seconds)
         self._worker_pids: tuple[int, ...] = ()
         self._closed = False
@@ -127,14 +150,21 @@ class ParallelCpuEvaluator:
         if self._closed:
             raise RuntimeError("parallel evaluator is closed")
         try:
+            indexed_formulas = tuple(
+                (index, tuple(int(token) for token in formula))
+                for index, formula in enumerate(formulas)
+            )
+            chunks = tuple(
+                indexed_formulas[start : start + self.chunk_size]
+                for start in range(0, len(indexed_formulas), self.chunk_size)
+            )
             futures = [
                 self._executor.submit(
-                    _evaluate_in_worker,
-                    index,
-                    tuple(int(token) for token in formula),
+                    _evaluate_chunk_in_worker,
+                    chunk,
                     step,
                 )
-                for index, formula in enumerate(formulas)
+                for chunk in chunks
             ]
             done, pending = concurrent.futures.wait(
                 futures,
@@ -151,14 +181,21 @@ class ParallelCpuEvaluator:
                 f"completed={len(done)} pending={len(pending)}"
             )
         try:
-            completed = [future.result() for future in futures]
+            completed_chunks = [future.result() for future in futures]
         except BaseException:
             self._abort_pool()
             raise
         self._worker_pids = tuple(sorted(
-            set(self._worker_pids) | {pid for pid, _ in completed}
+            set(self._worker_pids) | {pid for pid, _ in completed_chunks}
         ))
-        results = sorted((result for _, result in completed), key=lambda item: item.formula_index)
+        results = sorted(
+            (
+                result
+                for _, chunk_results in completed_chunks
+                for result in chunk_results
+            ),
+            key=lambda item: item.formula_index,
+        )
         if [item.formula_index for item in results] != list(range(len(formulas))):
             self._abort_pool()
             raise RuntimeError("parallel raw evaluation returned an incomplete batch")

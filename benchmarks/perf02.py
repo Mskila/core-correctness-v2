@@ -80,6 +80,8 @@ def run_benchmark(
     *,
     worker_counts: tuple[int, ...] = (1, 2, 4, 8),
     iterations: int = 3,
+    torch_threads: int = 1,
+    chunk_size: int = 1,
     output_path: Path | None = None,
 ) -> dict:
     if type(iterations) is not int or iterations < 1:
@@ -91,6 +93,10 @@ def run_benchmark(
         or len(set(worker_counts)) != len(worker_counts)
     ):
         raise ValueError("worker_counts must be unique positive built-in ints")
+    if type(torch_threads) is not int or torch_threads < 1:
+        raise ValueError("torch_threads must be a positive built-in int")
+    if type(chunk_size) is not int or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive built-in int")
     context, formulas = _context()
     reference = ReferenceCpuEvaluator(context)
     expected = reference.evaluate_batch(formulas, step=0)
@@ -103,7 +109,13 @@ def run_benchmark(
         evaluator = (
             ReferenceCpuEvaluator(context)
             if workers == 1
-            else ParallelCpuEvaluator(context, workers=workers, timeout_seconds=120.0)
+            else ParallelCpuEvaluator(
+                context,
+                workers=workers,
+                timeout_seconds=120.0,
+                torch_threads=torch_threads,
+                chunk_size=chunk_size,
+            )
         )
         executor_construction_ns = time.perf_counter_ns() - started
         samples = []
@@ -149,6 +161,8 @@ def run_benchmark(
             "dataset_fingerprint": CORE00_FIXTURE_SHA256,
             "formula_count": len(formulas),
             "iterations": iterations,
+            "worker_torch_threads": torch_threads,
+            "chunk_size": chunk_size,
         },
         "parity": {"exact": True, "raw_digest": expected_digest},
         "variants": variants,
@@ -167,11 +181,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--workers", type=int, nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--torch-threads", type=int, default=1)
+    parser.add_argument("--chunk-size", type=int, default=1)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     report = run_benchmark(
         worker_counts=tuple(args.workers),
         iterations=args.iterations,
+        torch_threads=args.torch_threads,
+        chunk_size=args.chunk_size,
         output_path=args.output,
     )
     print(json.dumps(report, indent=2, sort_keys=True))

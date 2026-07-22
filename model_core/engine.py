@@ -12,6 +12,7 @@ import pathlib
 import random
 import sys
 import tempfile
+import time
 import traceback
 from ctypes import wintypes
 
@@ -62,6 +63,27 @@ _ACTIVE_ARTIFACT_PUBLICATION = contextvars.ContextVar(
 _ARTIFACT_IO_CHUNK_SIZE = 1024 * 1024
 _ABSENT_ARTIFACT_VERSION = (False, 0, None)
 _MISSING_RUN_IDENTITY = object()
+
+
+def _advance_sampler_batch_state(
+    sampler: object,
+    tokens: torch.Tensor,
+    stack_depths: list[int],
+    prev_tokens: list[int | None],
+    infected_chain_lens: list[int],
+) -> None:
+    bulk_advance = getattr(sampler, "advance_batch_state", None)
+    if callable(bulk_advance):
+        bulk_advance(tokens, stack_depths, prev_tokens, infected_chain_lens)
+        return
+    delta = getattr(sampler, "delta")
+    update_infection = getattr(sampler, "update_infection")
+    for index, token in enumerate(tokens.detach().cpu().tolist()):
+        stack_depths[index] += delta[token]
+        prev_tokens[index] = token
+        infected_chain_lens[index] = update_infection(
+            token, infected_chain_lens[index]
+        )
 
 
 def _safe_value_category(value: object) -> str:
@@ -3323,6 +3345,7 @@ class AlphaEngine:
                     workers=evaluation_workers,
                     timeout_seconds=ModelConfig.EVALUATION_TIMEOUT_SECONDS,
                     torch_threads=ModelConfig.EVALUATION_TORCH_THREADS,
+                    chunk_size=ModelConfig.EVALUATION_CHUNK_SIZE,
                 )
             self._active_formula_evaluator = raw_evaluator
         bs      = ModelConfig.BATCH_SIZE
@@ -3352,6 +3375,7 @@ class AlphaEngine:
                 setattr(self, field, default)
 
         for step in pbar:
+            step_started = time.perf_counter()
             # The transaction starts before every stochastic draw belonging to
             # this batch, so a failed attempt can be retried deterministically.
             transaction = self._begin_batch_transaction(step + 1, run_identity)
@@ -3379,13 +3403,14 @@ class AlphaEngine:
                     transaction.run(self._stable_categorical_entropy, lg)
                 )
                 inp_new = torch.cat([inp_new, a.unsqueeze(1)], dim=1)
-                for b in range(n_new):
-                    sd_new[b] += self.sampler.delta[a[b].item()]
-                    prev_tokens_new[b] = a[b].item()
-                    infected_chain_new[b] = transaction.run(
-                        self.sampler.update_infection,
-                        a[b].item(), infected_chain_new[b],
-                    )
+                transaction.run(
+                    _advance_sampler_batch_state,
+                    self.sampler,
+                    a,
+                    sd_new,
+                    prev_tokens_new,
+                    infected_chain_new,
+                )
 
             seqs_new = torch.stack(tok_new, dim=1)
 
@@ -3464,17 +3489,19 @@ class AlphaEngine:
                         transaction.run(self._stable_categorical_entropy, lg_e)
                     )
                     inp_e = torch.cat([inp_e, tk.unsqueeze(1)], dim=1)
-                    for b in range(ne):
-                        sd_e[b] += self.sampler.delta[tk[b].item()]
-                        prev_tokens_elite[b] = tk[b].item()
-                        infected_chain_elite[b] = transaction.run(
-                            self.sampler.update_infection,
-                            tk[b].item(), infected_chain_elite[b],
-                        )
+                    transaction.run(
+                        _advance_sampler_batch_state,
+                        self.sampler,
+                        tk,
+                        sd_e,
+                        prev_tokens_elite,
+                        infected_chain_elite,
+                    )
 
 
             # ── Part C: Evaluate all formulas ────────────────────────
             all_fmls = seqs_new.tolist() + elite_formulas
+            sampling_seconds = time.perf_counter() - step_started
             tot      = len(all_fmls)
             # Fold scorers intentionally return promoted metrics independently
             # of the training tensor dtype.  Accumulate in float64 so every
@@ -3498,6 +3525,7 @@ class AlphaEngine:
             step_max_val = -float('inf');  step_best_f = None
             bic, bis, bsor = [], [], []
 
+            raw_evaluation_started = time.perf_counter()
             if raw_evaluator is None:
                 for i, fml in enumerate(all_fmls):
                     try:
@@ -3552,7 +3580,9 @@ class AlphaEngine:
                             formula_error_samples.append(error_sample[:500])
                     else:
                         evaluated_factors[i] = raw.factor
+            raw_evaluation_seconds = time.perf_counter() - raw_evaluation_started
 
+            serial_decision_started = time.perf_counter()
             shadow_best_score = self.best_score
             shadow_factor_pool = list(self.factor_pool)
             shadow_factor_counter = self._factor_pool_counter
@@ -3767,8 +3797,10 @@ class AlphaEngine:
             evaluated_factors.clear()
             if raw_evaluations is not None:
                 raw_evaluations.clear()
+            serial_decision_seconds = time.perf_counter() - serial_decision_started
 
             # ── Part D: REINFORCE gradient update ────────────────────
+            update_started = time.perf_counter()
             # Fix 3: EMA baseline 替代 batch mean，避免全负 batch 的相对优选问题
             batch_mean = rewards.mean().item()
             batch_std = rewards.std().clamp(min=rewards.new_tensor(0.1))
@@ -3841,8 +3873,10 @@ class AlphaEngine:
             transaction.run(self.opt.step)
             if self.use_lord_regularization:
                 transaction.run(self.lord_opt.step)
+            update_seconds = time.perf_counter() - update_started
 
             # ── Part D2: 分布细化指标 ────────────────────────────────
+            publication_started = time.perf_counter()
             dst = transaction.run(
                 self._distribution_stats, self._previous_initial_distribution
             )
@@ -3869,6 +3903,7 @@ class AlphaEngine:
             # training service.
             if has_winner:
                 transaction.run(self._save_strategy_live, run_identity)
+            publication_seconds = time.perf_counter() - publication_started
 
             # ── Part E: Logging & history ────────────────────────────
             avg_rew = rewards.mean().item()
@@ -3901,6 +3936,24 @@ class AlphaEngine:
                     f"标准差={dst['prob_std']:.4f} | "
                     f"本批: 唯一符号={uniq_tokens}/{FORMULA_VOCAB.size} "
                     f"唯一公式={uniq_fmls}/{n_new} 多样性={fml_div:.2f}"
+                )
+                measured_seconds = time.perf_counter() - step_started
+                accounted_seconds = (
+                    sampling_seconds
+                    + raw_evaluation_seconds
+                    + serial_decision_seconds
+                    + update_seconds
+                    + publication_seconds
+                )
+                tqdm.write(
+                    "   性能: "
+                    f"采样={sampling_seconds:.2f}s "
+                    f"原始评估={raw_evaluation_seconds:.2f}s "
+                    f"串行决策={serial_decision_seconds:.2f}s "
+                    f"更新={update_seconds:.2f}s "
+                    f"发布={publication_seconds:.2f}s "
+                    f"其他={max(0.0, measured_seconds - accounted_seconds):.2f}s "
+                    f"计算合计={measured_seconds:.2f}s"
                 )
             pbar.set_postfix({
                 '验证': f"{avg_val:.3f}", '最优': f"{self.best_score:.3f}",
@@ -3980,6 +4033,11 @@ class AlphaEngine:
                 transaction.run(migration_hook, self, step + 1)
 
             transaction.commit()
+            if not emit_detailed_log:
+                tqdm.write(
+                    f"[{step+1}/{end_step}] 进度 | "
+                    f"本步={time.perf_counter() - step_started:.2f}s"
+                )
 
         # ── End of training ──────────────────────────────────────────
         self._close_active_formula_evaluator()
