@@ -339,10 +339,8 @@ def test_checkpoint_filename_and_internal_step_must_agree(monkeypatch, tmp_path)
     [
         ("stale", 6, [0, 1, 2, 3, 4]),
         ("trailing-truncated", 6, [2, 3, 4]),
-        ("ahead", 6, [0, 1, 2, 3, 4, 5, 6]),
         ("empty", 6, []),
         ("off-by-one", 6, [1, 2, 3]),
-        ("zero-with-history", 0, [0]),
     ],
 )
 def test_checkpoint_history_requires_exact_next_step_relationship(
@@ -358,6 +356,40 @@ def test_checkpoint_history_requires_exact_next_step_relationship(
     result = progress.get_symbol_progress("EURUSD")
     assert result.status == "incompatible", label
     assert result.current_step == 0
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_step", "history_steps", "completed_steps"),
+    [
+        (6, [0, 1, 2, 3, 4, 5], 6),
+        (5, [0, 1, 2, 3, 4, 5], 6),
+        (0, [], 0),
+        (0, [0], 1),
+    ],
+)
+def test_checkpoint_history_accepts_both_supported_step_conventions(
+    monkeypatch, tmp_path, checkpoint_step, history_steps, completed_steps
+) -> None:
+    checkpoints, strategies = _layout(monkeypatch, tmp_path)
+    artifact = strategy_artifact()
+    embedded = _history_value(artifact, history_steps, include_identity=False)
+    _checkpoint(
+        checkpoints / artifact.run_identity.checkpoint_filename(checkpoint_step),
+        artifact,
+        step=checkpoint_step,
+        history=embedded,
+    )
+    _history(
+        tmp_path / artifact.run_identity.history_filename(),
+        artifact,
+        steps=history_steps,
+    )
+    _strategy(strategies, artifact)
+
+    result = progress.get_symbol_progress("EURUSD")
+
+    assert result.status != "incompatible"
+    assert result.current_step == completed_steps
 
 
 @pytest.mark.parametrize(

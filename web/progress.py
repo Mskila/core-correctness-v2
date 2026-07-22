@@ -275,12 +275,17 @@ def _validate_history(
 
 def _validate_history_checkpoint_relationship(value: dict[str, Any], step: int) -> None:
     steps = value["step"]
-    if step == 0:
-        if steps:
-            raise ValueError("checkpoint step zero requires empty persisted history")
+    if not steps:
+        if step == 0:
+            return
+        raise ValueError("checkpoint with positive step requires persisted history")
+    if steps[-1] + 1 == step:
         return
-    if not steps or steps[-1] + 1 != step:
-        raise ValueError("history last persisted step does not match checkpoint next-step")
+    if steps[-1] == step:
+        return
+    raise ValueError(
+        "history last persisted step matches neither supported checkpoint convention"
+    )
 
 
 def _history_body(value: dict[str, Any]) -> dict[str, Any]:

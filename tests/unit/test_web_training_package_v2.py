@@ -273,7 +273,7 @@ def test_import_requires_exact_manifest_checkpoint_step_agreement(
 
 @pytest.mark.parametrize(
     ("step", "history_steps"),
-    [(7, []), (7, [0, 1, 2]), (7, list(range(8))), (0, [0])],
+    [(7, []), (7, [0, 1, 2])],
 )
 def test_import_rejects_inconsistent_checkpoint_histories_before_writes(
     monkeypatch, tmp_path, step, history_steps
@@ -288,6 +288,26 @@ def test_import_rejects_inconsistent_checkpoint_histories_before_writes(
     with pytest.raises(ValueError):
         packages.import_training_package(content, "run.zip")
     assert _tree(tmp_path) == {}
+
+
+@pytest.mark.parametrize(
+    ("step", "history_steps"),
+    [(7, list(range(8))), (0, [0])],
+)
+def test_import_accepts_completed_step_checkpoint_history_convention(
+    monkeypatch, tmp_path, step, history_steps
+) -> None:
+    artifact = strategy_artifact()
+    embedded = _history_value(artifact, history_steps, include_identity=False)
+    standalone = _history_value(artifact, history_steps, include_identity=True)
+    content, files = _package(
+        artifact, step=step, embedded=embedded, standalone=standalone
+    )
+    _layout(monkeypatch, tmp_path)
+
+    result = packages.import_training_package(content, "run.zip")
+
+    assert sorted(result["installed"]) == sorted(files)
 
 
 def test_import_rejects_malformed_embedded_or_standalone_history_before_writes(
