@@ -481,16 +481,34 @@ def test_execution_rejects_mismatched_tensor_devices() -> None:
         )
 
 
-def test_execution_rejects_non_prefix_valid_mask() -> None:
-    with pytest.raises(DataValidationError, match="continuous prefix"):
-        run_execution(
-            factors=torch.zeros((1, 4)),
-            target_ret=torch.zeros((1, 4)),
-            target_valid=torch.tensor([[True, False, True, False]]),
-            bar_time_ns=_hourly_times(4),
-            cost_rate=0.1,
-            min_exposure=0.05,
-        )
+def test_execution_supports_segmented_valid_mask_without_cross_gap_positions() -> None:
+    factors = torch.atanh(
+        torch.tensor([[0.5, 0.9, 0.5, 0.5, 0.0, 0.0]])
+    )
+    valid = torch.tensor([[True, False, True, True, False, False]])
+    result = run_execution(
+        factors=factors,
+        target_ret=torch.zeros((1, 6)),
+        target_valid=valid,
+        bar_time_ns=_hourly_times(6),
+        cost_rate=0.1,
+        min_exposure=0.05,
+    )
+
+    torch.testing.assert_close(
+        result.position,
+        torch.tensor([[0.5, 0.0, 0.5, 0.5, 0.0, 0.0]]),
+    )
+    torch.testing.assert_close(
+        result.turnover,
+        torch.tensor([[0.5, 0.0, 0.5, 0.0, 0.0, 0.0]]),
+    )
+    torch.testing.assert_close(
+        result.cost,
+        torch.tensor([[0.1, 0.0, 0.05, 0.05, 0.0, 0.0]], dtype=torch.float64),
+    )
+    assert result.final_liquidation_cost.item() == pytest.approx(0.1)
+    assert performance_metrics(result).observations == 3
 
 
 def test_execution_rejects_finite_cost_that_causes_insolvency() -> None:
@@ -2040,15 +2058,16 @@ def test_execution_consumers_ignore_non_increasing_unread_timestamp_tail(
         ]
 
 
-def test_execution_ledger_rejects_non_prefix_result_mask() -> None:
+def test_execution_ledger_emits_each_segment_and_marks_each_liquidation() -> None:
     result = replace(
         _consumer_result(),
         target_valid=torch.tensor([[True, False, True, False, False]]),
-        net_pnl=torch.tensor([[1.0, 100.0, 2.0, 0.0, 0.0]]),
+        net_pnl=torch.zeros((1, 5), dtype=torch.float64),
     )
 
-    with pytest.raises(DataValidationError, match="continuous prefix"):
-        build_execution_ledger(result, ["EURUSD"])
+    ledger = build_execution_ledger(result, ["EURUSD"])
+    assert [row.signal_time_ns for row in ledger] == [0, 7_200_000_000_000]
+    assert [row.is_final_liquidation for row in ledger] == [True, True]
 
 
 def test_performance_metrics_rejects_result_shape_mismatch_before_indexing() -> None:

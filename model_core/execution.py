@@ -325,10 +325,9 @@ def _validate_execution_inputs(
     if bool((target_valid.sum(dim=1) == 0).any()):
         raise DataValidationError("each symbol must have at least one valid label")
 
-    invalid_seen = (~target_valid).cumsum(dim=1) > 0
-    if bool((invalid_seen & target_valid).any()):
+    if target_valid.shape[1] < 3 or bool(target_valid[:, -2:].any()):
         raise DataValidationError(
-            "target_valid must be one continuous prefix per symbol"
+            "final exit timestamp is missing for a valid label"
         )
     if not bool(torch.isfinite(target_ret[target_valid]).all()):
         raise DataValidationError("valid target_ret values must be finite")
@@ -483,31 +482,38 @@ def _validate_time_mask(
             raise DataValidationError("at least two valid observations are required")
         raise DataValidationError("not enough valid observations")
 
-    invalid_seen = (~target_valid).cumsum(dim=1) > 0
-    if bool((invalid_seen & target_valid).any()):
+    if target_valid.shape[1] < 3 or bool(target_valid[:, -2:].any()):
         raise DataValidationError(
-            "target_valid must be one continuous prefix per symbol"
+            "final exit timestamp is missing for a valid label"
         )
     return valid_counts
 
 
 def _validate_relevant_timestamps(
     bar_time_ns: Tensor,
-    valid_counts: Tensor,
+    target_valid: Tensor,
     *,
     start_index: int,
     missing_exit_message: str,
-) -> Tensor:
-    """Validate only the timestamp prefix read by an execution consumer."""
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Validate the timestamp span read by a possibly segmented mask."""
     time_length = bar_time_ns.shape[1]
     if time_length <= 1:
         raise DataValidationError("first entry timestamp is missing")
 
-    final_exit_indices = valid_counts + 1
+    indices = torch.arange(time_length, device=target_valid.device).unsqueeze(0)
+    first_signal_indices = torch.where(
+        target_valid, indices, torch.full_like(indices, time_length)
+    ).min(dim=1).values
+    last_signal_indices = torch.where(
+        target_valid, indices, torch.full_like(indices, -1)
+    ).max(dim=1).values
+    final_exit_indices = last_signal_indices + 2
     if bool((final_exit_indices >= time_length).any()):
         raise DataValidationError(missing_exit_message)
 
-    first_entry_ns = bar_time_ns[:, 1]
+    first_entry_indices = first_signal_indices + 1
+    first_entry_ns = bar_time_ns.gather(1, first_entry_indices[:, None]).squeeze(1)
     final_exit_ns = bar_time_ns.gather(
         1,
         final_exit_indices[:, None],
@@ -523,7 +529,7 @@ def _validate_relevant_timestamps(
         device=bar_time_ns.device,
     ).unsqueeze(0)
     relevant_transitions = (
-        (transition_end_indices > start_index)
+        (transition_end_indices > first_signal_indices[:, None] + start_index)
         & (transition_end_indices <= final_exit_indices[:, None])
     )
     increasing = bar_time_ns[:, 1:] > bar_time_ns[:, :-1]
@@ -531,20 +537,22 @@ def _validate_relevant_timestamps(
         raise DataValidationError(
             "bar_time_ns must be strictly increasing within each relevant prefix"
         )
-    return final_exit_indices
+    return first_signal_indices, last_signal_indices, final_exit_indices
 
 
 def derive_periods_per_year(bar_time_ns: Tensor, target_valid: Tensor) -> float:
     """Derive annualization from each symbol's first entry and final exit."""
     valid_counts = _validate_time_mask(bar_time_ns, target_valid)
-    final_exit_indices = _validate_relevant_timestamps(
+    first_signal_indices, _, final_exit_indices = _validate_relevant_timestamps(
         bar_time_ns,
-        valid_counts,
+        target_valid,
         start_index=1,
         missing_exit_message="final exit timestamp is missing",
     )
 
-    first_entry_ns = bar_time_ns[:, 1]
+    first_entry_ns = bar_time_ns.gather(
+        1, (first_signal_indices + 1)[:, None]
+    ).squeeze(1)
     final_exit_ns = bar_time_ns.gather(1, final_exit_indices[:, None]).squeeze(1)
 
     first_entries = first_entry_ns.detach().cpu().tolist()
@@ -593,10 +601,10 @@ def _validate_performance_result(
         raise DataValidationError(
             "net_pnl, target_valid, and bar_time_ns must use the same device"
         )
-    valid_counts = _validate_time_mask(bar_time_ns, target_valid)
+    _validate_time_mask(bar_time_ns, target_valid)
     _validate_relevant_timestamps(
         bar_time_ns,
-        valid_counts,
+        target_valid,
         start_index=1,
         missing_exit_message="final exit timestamp is missing",
     )
@@ -618,7 +626,7 @@ def _validate_ledger_result(
     )
     _validate_relevant_timestamps(
         bar_time_ns,
-        valid_counts,
+        target_valid,
         start_index=0,
         missing_exit_message="final exit timestamp is missing for ledger",
     )
@@ -696,19 +704,20 @@ def _equal_weight_portfolio_log_returns(
     )
     if not bool(torch.isfinite(net_pnl_by_symbol[target_valid]).all()):
         raise DataValidationError("valid net_pnl values must be finite")
-    valid_counts = target_valid.sum(dim=1)
-    max_count = int(valid_counts.max().detach().cpu())
-    first_entries = bar_time_ns[:, 1]
-    if not bool((first_entries == first_entries[0]).all()):
-        raise DataValidationError(
-            "multi-symbol portfolio requires one synchronized entry timeline"
-        )
-
     portfolio_returns: list[Tensor] = []
     exit_times: list[int] = []
-    for time_index in range(max_count):
-        active = valid_counts > time_index
+    entry_times: list[int] = []
+    active_time_indices = torch.nonzero(
+        target_valid.any(dim=0), as_tuple=False
+    ).flatten().detach().cpu().tolist()
+    for time_index in active_time_indices:
+        active = target_valid[:, time_index]
+        active_entry_times = bar_time_ns[active, time_index + 1]
         active_exit_times = bar_time_ns[active, time_index + 2]
+        if not bool((active_entry_times == active_entry_times[0]).all()):
+            raise DataValidationError(
+                "multi-symbol portfolio requires synchronized entry timestamps"
+            )
         if not bool((active_exit_times == active_exit_times[0]).all()):
             raise DataValidationError(
                 "multi-symbol portfolio requires synchronized exit timestamps"
@@ -722,12 +731,13 @@ def _equal_weight_portfolio_log_returns(
                 "equal-weight portfolio reached the insolvency boundary"
             )
         portfolio_returns.append(torch.log1p(portfolio_simple_return))
+        entry_times.append(int(active_entry_times[0].detach().cpu()))
         exit_times.append(int(active_exit_times[0].detach().cpu()))
     if any(current <= previous for previous, current in zip(exit_times, exit_times[1:])):
         raise DataValidationError("portfolio exit timestamps must be strictly increasing")
 
     net_pnl = torch.stack(portfolio_returns)
-    first_entry_ns = int(first_entries[0].detach().cpu())
+    first_entry_ns = entry_times[0]
     elapsed_seconds = (
         exit_times[-1] - first_entry_ns
     ) / _NANOSECONDS_PER_SECOND
@@ -869,7 +879,7 @@ def build_execution_ledger(
     gross_pnl = result._borrow_tensor("gross_pnl")
     cost = result._borrow_tensor("cost")
     net_pnl = result._borrow_tensor("net_pnl")
-    valid_counts = _validate_ledger_result(
+    _validate_ledger_result(
         bar_time_ns=bar_time_ns,
         target_valid=target_valid,
         position=position,
@@ -890,26 +900,25 @@ def build_execution_ledger(
     if any(not isinstance(symbol, str) or symbol == "" for symbol in symbols):
         raise DataValidationError("symbols must contain only non-empty strings")
 
-    if bool((valid_counts + 1 >= time_length).any()):
-        raise DataValidationError("final exit timestamp is missing for ledger")
-
-    valid_count_values = [
-        int(valid_count)
-        for valid_count in valid_counts.detach().cpu().tolist()
+    valid_index_values = [
+        torch.nonzero(target_valid[symbol_index], as_tuple=False)
+        .flatten().detach().cpu().tolist()
+        for symbol_index in range(symbol_count)
     ]
     bar_time_values = bar_time_ns.detach().cpu().tolist()
     position_values = position.detach().cpu().tolist()
     gross_pnl_values = gross_pnl.detach().cpu().tolist()
     cost_values = cost.detach().cpu().tolist()
     net_pnl_values = net_pnl.detach().cpu().tolist()
+    target_valid_values = target_valid.detach().cpu().tolist()
 
     # Ledger rows are Python floats in symbol-major order.  The shared result
     # rule promotes valid published values to float64 before reduction, matching
     # Python's working precision without changing any published row value.
     ledger_net_total = sum(
         float(net_pnl_values[symbol_index][time_index])
-        for symbol_index, valid_count in enumerate(valid_count_values)
-        for time_index in range(valid_count)
+        for symbol_index, valid_indices in enumerate(valid_index_values)
+        for time_index in valid_indices
     )
     result_net_total = float(
         net_pnl[target_valid].to(torch.float64).sum().detach().cpu()
@@ -926,8 +935,12 @@ def build_execution_ledger(
 
     ledger: list[LedgerEntry] = []
     for symbol_index, symbol in enumerate(symbols):
-        valid_count = valid_count_values[symbol_index]
-        for time_index in range(valid_count):
+        valid_indices = valid_index_values[symbol_index]
+        for time_index in valid_indices:
+            next_is_valid = (
+                time_index + 1 < time_length
+                and bool(target_valid_values[symbol_index][time_index + 1])
+            )
             ledger.append(
                 LedgerEntry(
                     symbol=symbol,
@@ -942,7 +955,7 @@ def build_execution_ledger(
                     gross_pnl=float(gross_pnl_values[symbol_index][time_index]),
                     cost=float(cost_values[symbol_index][time_index]),
                     net_pnl=float(net_pnl_values[symbol_index][time_index]),
-                    is_final_liquidation=time_index == valid_count - 1,
+                    is_final_liquidation=not next_is_valid,
                 )
             )
     return ledger
