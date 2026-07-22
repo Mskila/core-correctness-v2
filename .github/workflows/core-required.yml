@@ -40,7 +40,7 @@ jobs:
           model_core.ops, model_core.vm, model_core.execution, run_backtest;
           print('linux-core-import-ok')"
       - run: >-
-          pytest tests/core tests/property
+          pytest tests/core tests/property tests/unit/test_clean01_hygiene.py
           --cov=model_core --cov=data_pipeline --cov-report=term-missing
           --cov-fail-under=45
 
