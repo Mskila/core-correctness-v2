@@ -58,6 +58,7 @@ class BacktestJob:
     data_file: str
     mode: str
     symbol: str
+    numeric_time_unit: str = "s"
     commission_pct: float = 0.02
     slippage_pct: float = 0.01
     state: JobState = JobState.RUNNING
@@ -74,6 +75,7 @@ class BacktestJob:
             "data_file": self.data_file,
             "mode": self.mode,
             "symbol": self.symbol,
+            "numeric_time_unit": self.numeric_time_unit,
             "commission_pct": self.commission_pct,
             "slippage_pct": self.slippage_pct,
             "state": self.state.value,
@@ -117,6 +119,7 @@ class BacktestManager:
         mode: str,
         commission_pct: float = 0.02,
         slippage_pct: float = 0.01,
+        numeric_time_unit: str = "s",
     ) -> BacktestJob:
         with self._lock:
             self._refresh_state()
@@ -143,6 +146,8 @@ class BacktestManager:
                 str(commission_pct),
                 "--slippage",
                 str(slippage_pct),
+                "--numeric-time-unit",
+                numeric_time_unit,
             ]
             self._log_fp = open(log_path, "w", encoding="utf-8", buffering=1)
             env = os.environ.copy()
@@ -165,6 +170,7 @@ class BacktestManager:
                 data_file=data_file,
                 mode=mode,
                 symbol=symbol,
+                numeric_time_unit=numeric_time_unit,
                 commission_pct=float(commission_pct),
                 slippage_pct=float(slippage_pct),
                 pid=self._proc.pid,

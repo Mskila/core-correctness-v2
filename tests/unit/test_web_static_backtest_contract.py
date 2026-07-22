@@ -16,18 +16,30 @@ class _ContractParser(HTMLParser):
         super().__init__()
         self.ids = set()
         self.mode_values = []
+        self.numeric_unit_values = []
+        self.backtest_numeric_unit_values = []
         self.text_by_id = {}
         self._active_id = None
+        self._active_select = None
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
         if "id" in values:
             self.ids.add(values["id"])
             self._active_id = values["id"]
+        if tag == "select":
+            self._active_select = values.get("id")
         if tag == "option" and values.get("value"):
-            self.mode_values.append(values["value"])
+            if self._active_select == "numericTimeUnitSelect":
+                self.numeric_unit_values.append(values["value"])
+            elif self._active_select == "btNumericTimeUnitSelect":
+                self.backtest_numeric_unit_values.append(values["value"])
+            elif self._active_select == "btModeSelect":
+                self.mode_values.append(values["value"])
 
     def handle_endtag(self, tag):
+        if tag == "select":
+            self._active_select = None
         self._active_id = None
 
     def handle_data(self, data):
@@ -88,11 +100,16 @@ Promise.resolve(vm.runInContext('retrainFromScratch()', context)).then(() => {
 def test_html_exposes_exact_modes_and_independent_data_controls() -> None:
     parser = _ContractParser()
     parser.feed((ROOT / "web/static/index.html").read_text(encoding="utf-8"))
-    assert {"btBrowseDataBtn", "btDataCard", "btModeSelect"}.issubset(parser.ids)
+    assert {
+        "btBrowseDataBtn", "btDataCard", "btModeSelect", "numericTimeUnitSelect",
+        "btNumericTimeUnitSelect",
+    }.issubset(parser.ids)
     assert len(parser.mode_values) == 2
     assert set(parser.mode_values) == {
         "in_sample_replay", "out_of_sample_backtest",
     }
+    assert parser.numeric_unit_values == ["s", "ms", "us", "ns"]
+    assert parser.backtest_numeric_unit_values == ["s", "ms", "us", "ns"]
     assert parser.text_by_id["fromScratchHelp"] == (
         "重新训练会创建全新的 run；所有既有 checkpoint、策略、history 和分数均原样保留；"
         "新 run 不从旧产物播种，也不受旧分数约束。"
@@ -166,7 +183,8 @@ def test_training_start_preserves_legacy_history_and_forwards_mode(
     manager = training.TrainingManager()
     try:
         manager.start(
-            "input.parquet", "EURUSD", "H1", from_scratch=from_scratch
+            "input.parquet", "EURUSD", "H1", from_scratch=from_scratch,
+            numeric_time_unit="ns",
         )
     finally:
         if manager._log_fp is not None:
@@ -181,4 +199,7 @@ def test_training_start_preserves_legacy_history_and_forwards_mode(
     assert command.count("--data-file") == 1
     data_flag = command.index("--data-file")
     assert command[data_flag + 1] == "input.parquet"
+    assert command.count("--numeric-time-unit") == 1
+    unit_flag = command.index("--numeric-time-unit")
+    assert command[unit_flag + 1] == "ns"
     assert kwargs["cwd"] == project

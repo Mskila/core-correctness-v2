@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--commission", type=_nonnegative_float, default=DEFAULT_COMMISSION_PCT)
     parser.add_argument("--slippage", type=_nonnegative_float, default=DEFAULT_SLIPPAGE_PCT)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--numeric-time-unit",
+        choices=("s", "ms", "us", "ns"),
+        default="s",
+        help="Unit of numeric timestamps in the Parquet time column (default: s)",
+    )
     return parser
 
 
@@ -1409,6 +1415,7 @@ def run_backtest(
     commission: float = DEFAULT_COMMISSION_PCT,
     slippage: float = DEFAULT_SLIPPAGE_PCT,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    numeric_time_unit: str = "s",
 ) -> Path:
     if not math.isfinite(commission) or commission < 0:
         raise ValueError("commission must be finite and non-negative")
@@ -1420,7 +1427,7 @@ def run_backtest(
     data_path = Path(data_file)
     if not data_path.is_file():
         raise FileNotFoundError(f"data file does not exist: {data_path}")
-    manager = ParquetDataManager(data_path)
+    manager = ParquetDataManager(data_path, numeric_time_unit=numeric_time_unit)
     manager.load()
     test_identity = manager.data_identities[0]
     validate_backtest_dataset(strategy, test_identity, selected_mode)
@@ -1573,6 +1580,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             commission=args.commission,
             slippage=args.slippage,
             output_dir=args.output_dir,
+            numeric_time_unit=args.numeric_time_unit,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))

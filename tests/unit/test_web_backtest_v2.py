@@ -19,6 +19,7 @@ def test_request_requires_explicit_data_and_exact_mode() -> None:
     )
     assert req.data_file == "d.parquet"
     assert req.mode == "in_sample_replay"
+    assert req.numeric_time_unit == "s"
 
 
 def test_manager_forwards_explicit_mode_data_and_costs(monkeypatch, tmp_path) -> None:
@@ -44,6 +45,7 @@ def test_manager_forwards_explicit_mode_data_and_costs(monkeypatch, tmp_path) ->
     job = manager.start(
         strategy_file=str(strategy), data_file=str(data),
         mode="out_of_sample_backtest", commission_pct=0.12, slippage_pct=0.34,
+        numeric_time_unit="ms",
     )
     try:
         assert job.data_file == str(data)
@@ -55,6 +57,7 @@ def test_manager_forwards_explicit_mode_data_and_costs(monkeypatch, tmp_path) ->
             "--mode": "out_of_sample_backtest",
             "--commission": "0.12",
             "--slippage": "0.34",
+            "--numeric-time-unit": "ms",
         }
         for flag, expected_value in expected_options.items():
             assert command.count(flag) == 1
@@ -71,16 +74,24 @@ def test_api_uses_only_request_dataset_and_mode(monkeypatch, tmp_path) -> None:
     })
     monkeypatch.setattr(web_app, "load_settings", lambda: {"last_data_file": "forbidden-last.parquet"})
     monkeypatch.setattr(web_app, "save_settings", lambda value: None)
-    monkeypatch.setattr(web_app, "inspect_parquet_file", lambda path: {
-        "valid": True, "data_file": path
-    })
+    monkeypatch.setattr(
+        web_app,
+        "inspect_parquet_file",
+        lambda path, *, numeric_time_unit=None: (
+            captured.update(inspected_unit=numeric_time_unit)
+            or {"valid": True, "data_file": path}
+        ),
+    )
     monkeypatch.setattr(web_app.backtest_manager, "start", lambda **kwargs: (
         captured.update(kwargs) or SimpleNamespace(to_dict=lambda: kwargs)
     ))
     request = web_app.StartBacktestRequest(
         strategy_file="strategy.json", data_file=explicit,
         mode="out_of_sample_backtest", commission_pct=0.1, slippage_pct=0.2,
+        numeric_time_unit="us",
     )
     web_app.api_backtest_start(request)
     assert captured["data_file"] == explicit
     assert captured["mode"] == "out_of_sample_backtest"
+    assert captured["numeric_time_unit"] == "us"
+    assert captured["inspected_unit"] == "us"

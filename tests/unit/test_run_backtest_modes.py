@@ -30,11 +30,21 @@ def test_parser_accepts_only_explicit_v2_contract() -> None:
             "--commission", "0.01",
             "--slippage", "0.02",
             "--output-dir", "reports",
+            "--numeric-time-unit", "ms",
         ]
     )
     assert args.strategy_file == "s.json"
     assert args.data_file == "d.parquet"
     assert args.mode == "in_sample_replay"
+    assert args.numeric_time_unit == "ms"
+
+    with pytest.raises(SystemExit):
+        run_backtest.build_parser().parse_args(
+            [
+                "--strategy-file", "s.json", "--data-file", "d.parquet",
+                "--mode", "in_sample_replay", "--numeric-time-unit", "minutes",
+            ]
+        )
 
 
 @pytest.mark.parametrize("payload", [[], {"formula": [0]}, {"symbol": "EURUSD", "formula": [0]}])

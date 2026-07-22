@@ -26,8 +26,8 @@ def test_train_file_default_seed_and_from_scratch_ignore_old_strategy(
     events = []
 
     class Manager:
-        def __init__(self, path):
-            events.append(("init", path))
+        def __init__(self, path, *, numeric_time_unit=None):
+            events.append(("init", path, numeric_time_unit))
 
         def load(self):
             events.append(("load",))
@@ -87,7 +87,9 @@ def test_train_file_default_seed_and_from_scratch_ignore_old_strategy(
     monkeypatch.setattr(train_file, "ParquetDataManager", Manager)
     monkeypatch.setattr(train_file, "run_training_session", service)
     data_file = tmp_path / "EURUSD_H1.parquet"
-    result = train_file.train_from_file(str(data_file), from_scratch=True)
+    result = train_file.train_from_file(
+        str(data_file), from_scratch=True, numeric_time_unit="s"
+    )
 
     descriptor = os.open(old_strategy, os.O_RDONLY)
     try:
@@ -96,7 +98,7 @@ def test_train_file_default_seed_and_from_scratch_ignore_old_strategy(
         os.close(descriptor)
     after_stat = os.stat(old_strategy)
     assert result is sentinel
-    assert events[0] == ("init", str(data_file))
+    assert events[0] == ("init", str(data_file), "s")
     assert events[1] == ("load",)
     assert events[2][2]["from_scratch"] is True
     assert events[2][2]["random_seed"] == ModelConfig.RANDOM_SEED
@@ -111,8 +113,8 @@ def test_train_file_loads_parquet_then_delegates(monkeypatch, tmp_path) -> None:
     events = []
 
     class Manager:
-        def __init__(self, path):
-            events.append(("init", path))
+        def __init__(self, path, *, numeric_time_unit=None):
+            events.append(("init", path, numeric_time_unit))
 
         def load(self):
             events.append(("load",))
@@ -126,10 +128,25 @@ def test_train_file_loads_parquet_then_delegates(monkeypatch, tmp_path) -> None:
     )
     data_file = tmp_path / "EURUSD_H1.parquet"
     result = train_file.train_from_file(
-        str(data_file), from_scratch=True, random_seed=123
+        str(data_file), from_scratch=True, random_seed=123, numeric_time_unit="ms"
     )
     assert result is sentinel
-    assert events[0] == ("init", str(data_file))
+    assert events[0] == ("init", str(data_file), "ms")
     assert events[1] == ("load",)
     assert events[2][2]["from_scratch"] is True
     assert events[2][2]["random_seed"] == 123
+
+
+def test_train_file_parser_accepts_only_supported_numeric_time_units() -> None:
+    parser = train_file._parser()
+    args = parser.parse_args(
+        ["--data-file", "XAUUSD_M15.parquet", "--numeric-time-unit", "us"]
+    )
+    assert args.numeric_time_unit == "us"
+
+    import pytest
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--data-file", "XAUUSD_M15.parquet", "--numeric-time-unit", "minutes"]
+        )
