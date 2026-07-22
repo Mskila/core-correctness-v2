@@ -11,6 +11,7 @@ python-dotenv
 loguru
 tqdm
 fastapi
+python-multipart
 uvicorn[standard]
 
 # Windows trading adapter dependencies are isolated in their own extra file.

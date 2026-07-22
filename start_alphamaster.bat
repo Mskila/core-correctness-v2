@@ -16,6 +16,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 if not errorlevel 1 (
   echo [AlphaMaster] 服务已经运行，正在打开页面...
   if not defined ALPHAMASTER_NO_BROWSER start "" "http://127.0.0.1:8765/"
+  call :wait_before_close
   exit /b 0
 )
 
@@ -54,7 +55,7 @@ if errorlevel 1 goto venv_failed
 if not exist "%VENV_PY%" goto venv_failed
 
 rem 仅在依赖缺失时安装；正常启动不会重复联网或安装。
-"%VENV_PY%" -c "import fastapi, uvicorn, torch, numpy, pandas, pyarrow, matplotlib, loguru" >nul 2>&1
+"%VENV_PY%" -c "import fastapi, multipart, uvicorn, torch, numpy, pandas, pyarrow, matplotlib, loguru" >nul 2>&1
 if errorlevel 1 (
   echo [AlphaMaster] 首次运行：正在安装核心依赖，可能需要几分钟...
   "%VENV_PY%" -m pip install --upgrade pip
@@ -65,7 +66,7 @@ if errorlevel 1 (
 
 rem 不占用其他程序的 8765 端口。
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "if (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue) { exit 1 }; exit 0"
+  "$occupied = $false; foreach ($netLine in @(& netstat.exe -ano -p TCP)) { if ($netLine -match '^\s*TCP\s+\S+:8765\s+\S+\s+LISTENING\s+\d+\s*$') { $occupied = $true; break } }; if ($occupied) { exit 1 }; exit 0"
 if errorlevel 1 goto port_in_use
 
 if not exist "%~dp0logs" mkdir "%~dp0logs"
@@ -82,32 +83,54 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$p = Start-Process -FilePath $python -ArgumentList @('run_web.py', '--port', '8765') -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru;" ^
   "Set-Content -LiteralPath $pidFile -Value @($p.Id, $python) -Encoding Ascii;" ^
   "$ready = $false; for ($i = 0; $i -lt 60; $i++) { try { $h = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/health' -TimeoutSec 2; if ($h.status -eq 'ok') { $ready = $true; break } } catch {}; Start-Sleep -Seconds 1 };" ^
-  "if (-not $ready) { & taskkill.exe /PID $p.Id /T /F 2>$null | Out-Null; Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue; exit 1 }"
+  "if (-not $ready) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue; exit 1 };" ^
+  "$listenerPid = 0; foreach ($netLine in @(& netstat.exe -ano -p TCP)) { if ($netLine -match '^\s*TCP\s+\S+:8765\s+\S+\s+LISTENING\s+(\d+)\s*$') { $listenerPid = [int]$Matches[1]; break } };" ^
+  "Set-Content -LiteralPath $pidFile -Value @($p.Id, $python, $listenerPid) -Encoding Ascii"
 if errorlevel 1 goto start_failed
 
 echo [AlphaMaster] 启动成功: http://127.0.0.1:8765/
 if not defined ALPHAMASTER_NO_BROWSER start "" "http://127.0.0.1:8765/"
+call :wait_before_close
 exit /b 0
 
 :no_python
 echo [AlphaMaster] 启动失败：未找到 Python 3.10、3.11 或 3.12。
 echo 请先从 https://www.python.org/downloads/ 安装 64 位 Python 后重试。
+call :wait_before_close
 exit /b 10
 
 :venv_failed
 echo [AlphaMaster] 启动失败：无法创建 .venv 虚拟环境。
+call :wait_before_close
 exit /b 11
 
 :dependency_failed
 echo [AlphaMaster] 启动失败：依赖安装未完成，请检查网络和 logs 目录。
+call :wait_before_close
 exit /b 12
 
 :port_in_use
 echo [AlphaMaster] 启动失败：端口 8765 已被其他程序占用。
 echo 请先关闭占用该端口的程序，再重新运行本文件。
+call :wait_before_close
 exit /b 13
 
 :start_failed
 echo [AlphaMaster] 启动失败：服务未能在 60 秒内就绪。
 echo 请查看 logs\web_8765.err.log 和 logs\web_8765.out.log。
+if exist "%~dp0logs\web_8765.err.log" (
+  echo.
+  echo ==================== 错误日志末尾 ====================
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath '%~dp0logs\web_8765.err.log' -Tail 40"
+  echo ======================================================
+)
+call :wait_before_close
 exit /b 14
+
+:wait_before_close
+if not defined ALPHAMASTER_NO_PAUSE (
+  echo.
+  echo 按任意键关闭此窗口...
+  pause >nul
+)
+exit /b 0
