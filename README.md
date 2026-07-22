@@ -32,6 +32,8 @@ AlphaMaster 把「挖因子」做成一条可操作的流水线：
 
 ## Web 控制台（推荐入口）
 
+Windows 可直接双击 `start_alphamaster.bat` 启动，双击 `stop_alphamaster.bat` 停止。首次启动会自动创建 `.venv` 并安装核心依赖；需要预先安装 64 位 Python 3.10、3.11 或 3.12。启动成功后服务地址为 [http://127.0.0.1:8765](http://127.0.0.1:8765)。
+
 ```bash
 pip install -r requirements.txt
 python run_web.py --port 8765

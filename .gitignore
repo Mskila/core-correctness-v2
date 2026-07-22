@@ -83,6 +83,7 @@ ai_analysis_history.json
 train_elapsed.json
 STOP_SIGNAL
 train.pid
+.alphamaster_web.pid
 train_stdout.log
 train_stderr.log
 *.log
