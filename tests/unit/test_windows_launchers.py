@@ -17,6 +17,9 @@ def test_start_launcher_bootstraps_and_records_scoped_pid() -> None:
     assert "Start-Process" in text
     assert "netstat.exe" in text
     assert "Get-NetTCPConnection" not in text
+    assert "service_became_ready" in text
+    assert "端口监听详情" in text
+    assert "$serviceReady" in text
     assert "ALPHAMASTER_PYTHON" in text
     assert "ALPHAMASTER_NO_BROWSER" in text
     assert "import fastapi, multipart" in text

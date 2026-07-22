@@ -66,7 +66,11 @@ if errorlevel 1 (
 
 rem 不占用其他程序的 8765 端口。
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$occupied = $false; foreach ($netLine in @(& netstat.exe -ano -p TCP)) { if ($netLine -match '^\s*TCP\s+\S+:8765\s+\S+\s+LISTENING\s+\d+\s*$') { $occupied = $true; break } }; if ($occupied) { exit 1 }; exit 0"
+  "$occupied = $false; foreach ($netLine in @(& netstat.exe -ano -p TCP)) { if ($netLine -match '^\s*TCP\s+\S+:8765\s+\S+\s+LISTENING\s+\d+\s*$') { $occupied = $true; break } };" ^
+  "if (-not $occupied) { exit 0 };" ^
+  "$serviceReady = $false; for ($i = 0; $i -lt 15; $i++) { try { $h = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/health' -TimeoutSec 1; if ($h.status -eq 'ok') { $serviceReady = $true; break } } catch {}; Start-Sleep -Seconds 1 };" ^
+  "if ($serviceReady) { exit 2 }; exit 1"
+if errorlevel 2 goto service_became_ready
 if errorlevel 1 goto port_in_use
 
 if not exist "%~dp0logs" mkdir "%~dp0logs"
@@ -111,9 +115,18 @@ exit /b 12
 
 :port_in_use
 echo [AlphaMaster] 启动失败：端口 8765 已被其他程序占用。
+echo [AlphaMaster] 端口监听详情：
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$found = $false; foreach ($netLine in @(& netstat.exe -ano -p TCP)) { if ($netLine -match '^\s*TCP\s+\S+:8765\s+\S+\s+LISTENING\s+\d+\s*$') { Write-Host $netLine; $found = $true } }; if (-not $found) { Write-Host '当前复查未发现监听者，可能是短暂占用；请重新运行 start_alphamaster.bat。' }"
 echo 请先关闭占用该端口的程序，再重新运行本文件。
 call :wait_before_close
 exit /b 13
+
+:service_became_ready
+echo [AlphaMaster] 检测到正在启动的 AlphaMaster，现已就绪。
+echo [AlphaMaster] 服务地址: http://127.0.0.1:8765/
+if not defined ALPHAMASTER_NO_BROWSER start "" "http://127.0.0.1:8765/"
+call :wait_before_close
+exit /b 0
 
 :start_failed
 echo [AlphaMaster] 启动失败：服务未能在 60 秒内就绪。
