@@ -147,11 +147,23 @@ def build_training_export_zip(symbol: str) -> tuple[bytes, str]:
     if not history_path.is_file():
         raise ValueError("V2 export requires the canonical same-run history")
     history_bytes = history_path.read_bytes()
-    history_run, history_payload = _history_identity(history_bytes)
-    _same_run(run, history_run)
-    _validate_history_checkpoint_relationship(history_payload, step)
-    if _history_body(history_payload) != checkpoint_payload["training_history"]:
-        raise ValueError("standalone and checkpoint histories conflict")
+    standalone_history = json.loads(history_bytes.decode("utf-8"))
+    if type(standalone_history) is dict and "run_identity" not in standalone_history:
+        # Early V2 writers produced a display-only history file without identity.
+        # It cannot be trusted for export, so derive the canonical package member
+        # from the identity-validated checkpoint instead of loading that file.
+        history_payload = {
+            **checkpoint_payload["training_history"],
+            "run_identity": run.to_dict(),
+        }
+        _validate_history(history_payload, run, require_run_identity=True)
+        history_bytes = json.dumps(history_payload, sort_keys=True).encode("utf-8")
+    else:
+        history_run, history_payload = _history_identity(history_bytes)
+        _same_run(run, history_run)
+        _validate_history_checkpoint_relationship(history_payload, step)
+        if _history_body(history_payload) != checkpoint_payload["training_history"]:
+            raise ValueError("standalone and checkpoint histories conflict")
 
     files = {
         f"checkpoints/{checkpoint.name}": ckpt_bytes,

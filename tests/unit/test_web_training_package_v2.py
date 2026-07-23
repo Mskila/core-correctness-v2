@@ -364,6 +364,27 @@ def test_export_validates_complete_history_before_returning_package(monkeypatch,
     assert _tree(tmp_path) == before
 
 
+def test_export_ignores_identityless_standalone_history_and_uses_checkpoint(
+    monkeypatch, tmp_path
+) -> None:
+    artifact = strategy_artifact()
+    checkpoints, strategies = _layout(monkeypatch, tmp_path)
+    _write_export_run(checkpoints, strategies, tmp_path, artifact)
+    history_path = tmp_path / artifact.run_identity.history_filename()
+    identityless = _history_value(artifact, range(7), include_identity=False)
+    identityless["avg_reward"] = [999.0] * 7
+    original = json.dumps(identityless)
+    history_path.write_text(original, encoding="utf-8")
+
+    content, _ = packages.build_training_export_zip("EURUSD")
+
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        exported = json.loads(archive.read(history_path.name))
+    assert exported["run_identity"] == artifact.run_identity.to_dict()
+    assert exported["avg_reward"] != identityless["avg_reward"]
+    assert history_path.read_text(encoding="utf-8") == original
+
+
 def _write_export_run(checkpoints, strategies, root, artifact, *, step=7, payload_step=None):
     embedded = _history_value(artifact, range(step), include_identity=False)
     stream = io.BytesIO()
