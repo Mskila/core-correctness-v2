@@ -1,5 +1,6 @@
 import io
 import json
+import os
 
 import torch
 from fastapi.testclient import TestClient
@@ -81,6 +82,30 @@ def test_sidecar_accepts_next_step_checkpoint_format(monkeypatch, tmp_path) -> N
     assert result.history["step"] == [0, 1]
 
 
+def test_sidecar_loads_only_latest_checkpoint(monkeypatch, tmp_path) -> None:
+    sidecar_progress, checkpoints = _layout(monkeypatch, tmp_path)
+    artifact = strategy_artifact()
+    older = checkpoints / artifact.run_identity.checkpoint_filename(1)
+    latest = checkpoints / artifact.run_identity.checkpoint_filename(2)
+    _checkpoint(older, artifact, step=1, history_steps=[0])
+    _checkpoint(latest, artifact, step=2, history_steps=[0, 1])
+    os.utime(older, ns=(1_700_000_000_000_000_000,) * 2)
+    os.utime(latest, ns=(1_700_000_100_000_000_000,) * 2)
+    loaded = []
+    real_load = sidecar_progress._load_checkpoint
+
+    def recording_load(path):
+        loaded.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(sidecar_progress, "_load_checkpoint", recording_load)
+
+    result = sidecar_progress.get_symbol_progress("EURUSD")
+
+    assert result.current_step == 2
+    assert loaded == [latest]
+
+
 def test_sidecar_rejects_unrelated_checkpoint_history(monkeypatch, tmp_path) -> None:
     sidecar_progress, checkpoints = _layout(monkeypatch, tmp_path)
     artifact = strategy_artifact()
@@ -94,7 +119,7 @@ def test_sidecar_rejects_unrelated_checkpoint_history(monkeypatch, tmp_path) -> 
     assert result.history is None
 
 
-def test_sidecar_mirrors_origin_status_and_blocks_mutations(monkeypatch) -> None:
+def test_sidecar_serves_core_status_locally_and_blocks_mutations(monkeypatch) -> None:
     import web.sidecar_app as sidecar_app
 
     calls = []
@@ -109,15 +134,32 @@ def test_sidecar_mirrors_origin_status_and_blocks_mutations(monkeypatch) -> None
         return 200, {"content-type": "application/json"}, json.dumps(payload).encode()
 
     monkeypatch.setattr(sidecar_app, "_origin_get", fake_origin_get)
+    local_training = {
+        "active": True,
+        "job": {"symbol": "XAUUSD", "pid": None, "state": "running"},
+        "log_tail": ["[31/9000] training"],
+        "errors": {"counts": {}, "messages": []},
+    }
+    monkeypatch.setattr(
+        sidecar_app,
+        "_local_snapshot",
+        lambda: (
+            {"data_file": None, "progress": None, "training": local_training},
+            local_training,
+        ),
+    )
     client = TestClient(sidecar_app.create_app())
 
     mirrored = client.get("/api/training/status")
     assert mirrored.status_code == 200
-    assert mirrored.json()["job"]["pid"] == 4321
-    assert calls == ["/api/training/status"]
+    assert mirrored.json()["job"]["pid"] is None
+    overview = client.get("/api/overview")
+    assert overview.status_code == 200
+    assert overview.json()["training"]["active"] is True
+    assert calls == []
 
     assert client.post("/api/training/stop").status_code == 405
     assert client.put("/api/settings", json={}).status_code == 405
     assert client.delete("/api/example").status_code == 405
     assert client.get("/api/data-file/browse").status_code == 405
-    assert calls == ["/api/training/status"]
+    assert calls == []

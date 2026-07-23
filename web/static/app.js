@@ -7,6 +7,7 @@ let selectedStrategySymbol = null;
 let chart = null;
 let chartSymbol = null;
 let pollTimer = null;
+let overviewInFlight = false;
 let clientErrors = [];
 let debugMode = false;
 let lastDebugViewContent = "";
@@ -676,6 +677,9 @@ function updateTrainingUI(training, progress) {
 }
 
 async function refreshOverview() {
+  if (overviewInFlight) return;
+  overviewInFlight = true;
+  try {
   let overview = { data_file: null, progress: null };
   let strategies = { strategies: [] };
   let training = { active: false, job: null, log_tail: [] };
@@ -719,6 +723,9 @@ async function refreshOverview() {
   }
 
   await refreshDebugLogs();
+  } finally {
+    overviewInFlight = false;
+  }
 }
 
 async function loadConfig() {

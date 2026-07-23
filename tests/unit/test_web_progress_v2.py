@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -171,7 +172,7 @@ def test_checkpoint_cache_reloads_on_subfloat_mtime_ns_change(
     assert second["best_formula"] == [1]
 
 
-def test_checkpoint_cache_reloads_changed_bytes_with_identical_mtime_ns(
+def test_checkpoint_cache_reuses_immutable_file_with_identical_stat(
     monkeypatch, tmp_path
 ) -> None:
     checkpoints, _ = _layout(monkeypatch, tmp_path)
@@ -196,10 +197,39 @@ def test_checkpoint_cache_reloads_changed_bytes_with_identical_mtime_ns(
     assert path.stat().st_size == original_size
     os.utime(path, ns=(fixed_ns, fixed_ns))
     assert path.stat().st_mtime_ns == fixed_ns
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda self: (_ for _ in ()).throw(AssertionError("cached checkpoint reread")),
+    )
     second = progress._load_checkpoint_meta(path)
 
     assert first["best_formula"] == [0]
-    assert second["best_formula"] == [1]
+    assert second["best_formula"] == [0]
+
+
+def test_progress_loads_only_latest_checkpoint(monkeypatch, tmp_path) -> None:
+    checkpoints, _ = _layout(monkeypatch, tmp_path)
+    artifact = _artifact(run_id="3" * 32)
+    older = checkpoints / artifact.run_identity.checkpoint_filename(1)
+    latest = checkpoints / artifact.run_identity.checkpoint_filename(2)
+    _checkpoint(older, artifact, step=1)
+    _checkpoint(latest, artifact, step=2)
+    os.utime(older, ns=(1_700_000_000_000_000_000,) * 2)
+    os.utime(latest, ns=(1_700_000_100_000_000_000,) * 2)
+    loaded = []
+    real_load = progress._load_checkpoint_meta
+
+    def recording_load(path):
+        loaded.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(progress, "_load_checkpoint_meta", recording_load)
+
+    result = progress.get_symbol_progress("EURUSD")
+
+    assert result.current_step == 2
+    assert loaded == [latest]
 
 
 def test_public_progress_mutation_cannot_poison_cached_checkpoint_metadata(

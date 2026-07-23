@@ -56,6 +56,24 @@ from strategy_manager.live_signal import min_exposure
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 BACKTEST_OUTPUT_DIR = ROOT / "backtest_output"
+_data_file_info_cache: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+
+
+def _inspect_parquet_cached(
+    path: str, *, numeric_time_unit: str
+) -> dict[str, Any]:
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    key = (str(resolved), stat.st_mtime_ns, stat.st_size, numeric_time_unit)
+    cached = _data_file_info_cache.get(key)
+    if cached is not None:
+        return dict(cached)
+    inspected = inspect_parquet_file(
+        resolved, numeric_time_unit=numeric_time_unit
+    )
+    _data_file_info_cache.clear()
+    _data_file_info_cache[key] = dict(inspected)
+    return dict(inspected)
 
 setup_logging()
 logger = get_logger()
@@ -379,7 +397,7 @@ def api_config() -> dict[str, Any]:
     file_info = None
     if data_file:
         try:
-            file_info = inspect_parquet_file(
+            file_info = _inspect_parquet_cached(
                 data_file, numeric_time_unit=settings.get("numeric_time_unit", "s")
             )
         except Exception as e:
@@ -561,38 +579,25 @@ def api_overview() -> dict[str, Any]:
     training = training_manager.status()
     job = training.get("job")
     active = bool(training.get("active"))
+    selected_symbol = None
 
     if data_file:
         try:
-            file_info = inspect_parquet_file(
+            file_info = _inspect_parquet_cached(
                 data_file, numeric_time_unit=settings.get("numeric_time_unit", "s")
             )
-            sym = file_info.get("symbol")
-            row = _progress_with_live_step(sym, active=False)
-            progress = {
-                "symbol": row["symbol"],
-                "status": row["status"],
-                "current_step": row["current_step"],
-                "train_steps": row["train_steps"],
-                "progress_pct": row["progress_pct"],
-                "best_score": row["best_score"],
-                "val_score": row.get("val_score"),
-                "formula_decoded": row["formula_decoded"],
-                "has_checkpoint": row.get("has_checkpoint", False),
-                "has_strategy": row.get("has_strategy", False),
-            }
-            progress = _attach_training_time(
-                progress, symbol=sym, job=job, active=active and job and job.get("symbol") == sym
-            )
+            selected_symbol = file_info.get("symbol")
         except Exception as e:
             file_info = {"data_file": data_file, "valid": False, "message": str(e)}
 
-    if job and job.get("symbol") and active:
-        sym = job["symbol"]
-        row = _progress_with_live_step(sym, active=True)
+    active_symbol = job.get("symbol") if job and active else None
+    progress_symbol = active_symbol or selected_symbol
+    if progress_symbol:
+        is_active_symbol = bool(active_symbol == progress_symbol)
+        row = _progress_with_live_step(progress_symbol, active=is_active_symbol)
         progress = {
             "symbol": row["symbol"],
-            "status": "running_job",
+            "status": "running_job" if is_active_symbol else row["status"],
             "current_step": row["current_step"],
             "train_steps": row["train_steps"],
             "progress_pct": row["progress_pct"],
@@ -602,7 +607,12 @@ def api_overview() -> dict[str, Any]:
             "has_checkpoint": row.get("has_checkpoint", False),
             "has_strategy": row.get("has_strategy", False),
         }
-        progress = _attach_training_time(progress, symbol=sym, job=job, active=True)
+        progress = _attach_training_time(
+            progress,
+            symbol=progress_symbol,
+            job=job,
+            active=is_active_symbol,
+        )
 
     return {
         "data_file": file_info,

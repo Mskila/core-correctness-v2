@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import io
 import json
 import math
@@ -103,7 +102,7 @@ class SymbolProgress:
         return "idle"
 
 
-_ckpt_cache: dict[str, tuple[int, str, dict[str, Any]]] = {}
+_ckpt_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
 
 _HISTORY_METRICS = (
     "avg_reward", "best_score", "val_score", "entropy", "ic_mean",
@@ -120,6 +119,14 @@ def invalidate_checkpoint_cache() -> None:
 
 def _load_checkpoint_meta(path: Path) -> dict[str, Any]:
     stat_before = path.stat()
+    key = str(path.resolve())
+    cached = _ckpt_cache.get(key)
+    if (
+        cached
+        and cached[0] == stat_before.st_mtime_ns
+        and cached[1] == stat_before.st_size
+    ):
+        return copy.deepcopy(cached[2])
     checkpoint_bytes = path.read_bytes()
     payload = torch.load(io.BytesIO(checkpoint_bytes), map_location="cpu", weights_only=False)
     stat_after = path.stat()
@@ -150,18 +157,13 @@ def _load_checkpoint_meta(path: Path) -> dict[str, Any]:
     rank_monitor = payload["rank_monitor_history"]
     if type(rank_monitor) is not list or rank_monitor != history["stable_rank"]:
         raise ValueError("checkpoint rank_monitor_history does not match training_history stable_rank")
-    key = f"{path.resolve()}:{run.artifact_identity.fingerprint}"
-    content_hash = hashlib.sha256(checkpoint_bytes).hexdigest()
-    cached = _ckpt_cache.get(key)
-    if cached and cached[0] == mtime_ns and cached[1] == content_hash:
-        return copy.deepcopy(cached[2])
     meta = {
         "run": run, "step": step, "best_score": payload.get("best_score"),
         "best_formula": payload.get("best_formula"),
         "training_history": history,
         "mtime": mtime, "mtime_ns": mtime_ns, "path": path,
     }
-    _ckpt_cache[key] = (mtime_ns, content_hash, meta)
+    _ckpt_cache[key] = (mtime_ns, stat_after.st_size, meta)
     return copy.deepcopy(meta)
 
 
@@ -341,7 +343,22 @@ def _load_strategy(symbol: str) -> dict[str, Any] | None:
 def get_symbol_progress(symbol: str) -> SymbolProgress:
     checkpoint_rows, reasons = [], []
     legacy_history = PROJECT_ROOT / f"training_history_{symbol}.json"
-    for path in checkpoint_glob(symbol):
+    checkpoint_paths = checkpoint_glob(symbol)
+    latest_checkpoint = max(
+        checkpoint_paths,
+        key=lambda path: (
+            path.stat().st_mtime_ns,
+            _step_from_name(path),
+            path.name,
+        ),
+        default=None,
+    )
+    symbol_checkpoint_keys = {str(path.resolve()) for path in checkpoint_paths}
+    latest_key = str(latest_checkpoint.resolve()) if latest_checkpoint else None
+    for cached_key in tuple(_ckpt_cache):
+        if cached_key in symbol_checkpoint_keys and cached_key != latest_key:
+            _ckpt_cache.pop(cached_key, None)
+    for path in (() if latest_checkpoint is None else (latest_checkpoint,)):
         try:
             meta = _load_checkpoint_meta(path)
             if meta["run"].artifact_identity.symbol != symbol:

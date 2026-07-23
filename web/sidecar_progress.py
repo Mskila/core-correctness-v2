@@ -152,7 +152,21 @@ def get_symbol_progress(symbol: str) -> SymbolProgress:
     """
     checkpoint_rows: list[dict[str, Any]] = []
     reasons: list[str] = []
-    for path in _checkpoint_paths(symbol):
+    checkpoint_paths = _checkpoint_paths(symbol)
+    latest_checkpoint = max(
+        checkpoint_paths,
+        key=lambda path: (
+            path.stat().st_mtime_ns,
+            path.name,
+        ),
+        default=None,
+    )
+    symbol_checkpoint_keys = {str(path.resolve()) for path in checkpoint_paths}
+    latest_key = str(latest_checkpoint.resolve()) if latest_checkpoint else None
+    for cached_key in tuple(_checkpoint_cache):
+        if cached_key in symbol_checkpoint_keys and cached_key != latest_key:
+            _checkpoint_cache.pop(cached_key, None)
+    for path in (() if latest_checkpoint is None else (latest_checkpoint,)):
         try:
             row = _load_checkpoint(path)
             if row["run"].artifact_identity.symbol != symbol:
