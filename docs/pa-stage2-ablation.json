@@ -1,0 +1,2248 @@
+{
+  "schema_version": "stage2-ablation-v1",
+  "generated_at": "2026-08-06T15:00:06.711798Z",
+  "symbol": "XAUUSD",
+  "decision_timeframe": "M15",
+  "policy": {
+    "direction_threshold": 0.6,
+    "entry_threshold": 0.65,
+    "holdout_days": 7,
+    "pa_short_closure_seconds": 5400,
+    "holdout_used_for_metrics": false,
+    "strict_independent_oos": false
+  },
+  "datasets": {
+    "H1": {
+      "data_file": "XAUUSD_H1.parquet",
+      "strategy_file": "best_v3_XAUUSD_H1_02d33fbd1243_run_d9b62cbe.json",
+      "bars": 50040,
+      "gap_count": 1623,
+      "data_fingerprint": "02d33fbd124335ce6e3d3368f1c86c4c5eefcdf4d8e3ee0e078c0a7b1a7cf196",
+      "strategy_fingerprint": "91e3b208eeaad728b10973322eeebc46ed78184bd58d52a9004f9a2715953094",
+      "identity_match": true
+    },
+    "M15": {
+      "data_file": "XAUUSD_M15.parquet",
+      "strategy_file": "best_v3_XAUUSD_M15_bbac0e0072f1_run_9b6e9165.json",
+      "bars": 50000,
+      "gap_count": 546,
+      "data_fingerprint": "bbac0e0072f12bd04596122e342b0809a3ffd53f3de9ce6db09a2db13a429751",
+      "strategy_fingerprint": "784c299072d74bafbb2e3b73f78c91c34d5d8b39052494572b85b1fdcb605078",
+      "identity_match": true
+    },
+    "M5": {
+      "data_file": "XAUUSD_M5.parquet",
+      "strategy_file": "best_v3_XAUUSD_M5_5a7bcecf4428_run_d131a704.json",
+      "bars": 50069,
+      "gap_count": 186,
+      "data_fingerprint": "5a7bcecf44283253d3441c7464de49f85aa6543c46ca3a517359ee10e59a9c87",
+      "strategy_fingerprint": "380c085dcdd2c9aa50975f8d7b354d77c3a9be61cd171fe0c14e6aab9ad24508",
+      "identity_match": true
+    }
+  },
+  "window": {
+    "preholdout_start": "2025-10-30T23:30:00Z",
+    "preholdout_end": "2026-07-02T13:15:00Z",
+    "cutoff": "2026-07-02T13:15:00Z",
+    "latest_complete": "2026-07-09T13:15:00Z",
+    "preholdout_decisions": 15541,
+    "holdout_decisions": 440
+  },
+  "alpha_parity": [
+    {
+      "timeframe": "H1",
+      "checked_indices": [
+        45980,
+        46962,
+        47944,
+        48927,
+        49909
+      ],
+      "checked_count": 5,
+      "exact": true,
+      "elapsed_seconds": 1.908
+    },
+    {
+      "timeframe": "M15",
+      "checked_indices": [
+        33849,
+        37774,
+        41700,
+        45628,
+        49554
+      ],
+      "checked_count": 5,
+      "exact": true,
+      "elapsed_seconds": 2.032
+    },
+    {
+      "timeframe": "M5",
+      "checked_indices": [
+        2136,
+        13786,
+        25439,
+        37094,
+        48747
+      ],
+      "checked_count": 5,
+      "exact": true,
+      "elapsed_seconds": 1.867
+    }
+  ],
+  "pa_evaluation": [
+    {
+      "timeframe": "H1",
+      "evaluated_bars": 3930,
+      "valid_observations": 3151,
+      "elapsed_seconds": 4.485
+    },
+    {
+      "timeframe": "M15",
+      "seed_start_index": 33799,
+      "first_index": 33849,
+      "last_index": 49554,
+      "evaluated_bars": 15706,
+      "valid_observations": 14927,
+      "seen_candidate_keys": 6189,
+      "elapsed_seconds": 54.671
+    },
+    {
+      "timeframe": "M5",
+      "seed_start_index": 2084,
+      "first_index": 2134,
+      "last_index": 48747,
+      "evaluated_bars": 46614,
+      "valid_observations": 45835,
+      "seen_candidate_keys": 19672,
+      "elapsed_seconds": 447.942
+    }
+  ],
+  "raw_pa_triggers": {
+    "M5:breakout:long": 6004,
+    "M5:breakout:short": 5536,
+    "M5:trend_continuation:long": 4088,
+    "M5:trend_continuation:short": 3653,
+    "M15:breakout:long": 1929,
+    "M15:breakout:short": 1683,
+    "M15:trend_continuation:long": 1295,
+    "M15:trend_continuation:short": 1135,
+    "M5:range:short": 167,
+    "M5:range:long": 143,
+    "M5:reversal:short": 31,
+    "M15:range:long": 27,
+    "M15:range:short": 14,
+    "M5:reversal:long": 12,
+    "M15:reversal:long": 7,
+    "M15:reversal:short": 7
+  },
+  "variants": [
+    {
+      "name": "default",
+      "selection": {
+        "direction_modules": [
+          "alpha_h1",
+          "alpha_m15",
+          "pa_h1",
+          "pa_m15_context"
+        ],
+        "entry_modules": [
+          "alpha_m15",
+          "pa_m15_pattern",
+          "pa_m5_timing"
+        ]
+      },
+      "weights": {
+        "direction": [
+          [
+            "alpha_h1",
+            0.4
+          ],
+          [
+            "pa_h1",
+            0.25
+          ],
+          [
+            "alpha_m15",
+            0.2
+          ],
+          [
+            "pa_m15_context",
+            0.15
+          ]
+        ],
+        "entry": [
+          [
+            "pa_m15_pattern",
+            0.45
+          ],
+          [
+            "pa_m5_timing",
+            0.3
+          ],
+          [
+            "alpha_m15",
+            0.25
+          ]
+        ]
+      },
+      "overall": {
+        "decisions": 15541,
+        "accepted": 411,
+        "acceptance_rate": 0.026446174634836884,
+        "long": 216,
+        "short": 195,
+        "plans": 710,
+        "direction_labeled": 411,
+        "direction_hit_rate": 0.5279805352798054,
+        "mean_direction_signed_return_bps": 2.3321653465979777,
+        "entry_labeled": 411,
+        "entry_hit_rate": 0.49391727493917276,
+        "mean_entry_signed_return_bps": 0.8915433213819249,
+        "mean_mfe_atr": 0.5955461498219634,
+        "mean_mae_atr": -0.5299620106607837,
+        "reject_counts": {
+          "direction_below_threshold": 10386,
+          "insufficient_data:pa_h1": 3116,
+          "entry_below_threshold": 1479,
+          "ambiguous_pa:M5": 1137,
+          "insufficient_data:pa_m15_context": 779,
+          "insufficient_data:pa_m15_pattern": 779,
+          "insufficient_data:pa_m5_timing": 247,
+          "ambiguous_pa:M15": 61,
+          "plan:no_pullback_anchor": 50,
+          "barbwire:M15": 28,
+          "barbwire:M5": 28,
+          "barbwire:H1": 20,
+          "strong_timeframe_conflict": 13,
+          "plan:low_reward_risk": 6,
+          "extreme_range:M5": 1
+        },
+        "plan_styles": {
+          "pa_primary": 361,
+          "confirmation_breakout": 349
+        },
+        "order_types": {
+          "market": 361,
+          "stop": 349
+        },
+        "families": {
+          "trend_continuation": 480,
+          "breakout": 230
+        }
+      },
+      "blocks": [
+        {
+          "decisions": 3886,
+          "accepted": 105,
+          "acceptance_rate": 0.027020072053525475,
+          "long": 66,
+          "short": 39,
+          "plans": 186,
+          "direction_labeled": 105,
+          "direction_hit_rate": 0.5428571428571428,
+          "mean_direction_signed_return_bps": 0.26622675512929145,
+          "entry_labeled": 105,
+          "entry_hit_rate": 0.5428571428571428,
+          "mean_entry_signed_return_bps": 0.7978869491836645,
+          "mean_mfe_atr": 0.5762549585213691,
+          "mean_mae_atr": -0.49345341707922896,
+          "reject_counts": {
+            "direction_below_threshold": 2494,
+            "insufficient_data:pa_h1": 836,
+            "entry_below_threshold": 405,
+            "ambiguous_pa:M5": 274,
+            "insufficient_data:pa_m15_context": 209,
+            "insufficient_data:pa_m15_pattern": 209,
+            "insufficient_data:pa_m5_timing": 67,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 11,
+            "barbwire:M5": 7,
+            "barbwire:M15": 4,
+            "strong_timeframe_conflict": 3
+          },
+          "plan_styles": {
+            "pa_primary": 94,
+            "confirmation_breakout": 92
+          },
+          "order_types": {
+            "market": 94,
+            "stop": 92
+          },
+          "families": {
+            "trend_continuation": 123,
+            "breakout": 63
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 136,
+          "acceptance_rate": 0.03500643500643501,
+          "long": 92,
+          "short": 44,
+          "plans": 241,
+          "direction_labeled": 136,
+          "direction_hit_rate": 0.5367647058823529,
+          "mean_direction_signed_return_bps": 2.884409649152662,
+          "entry_labeled": 136,
+          "entry_hit_rate": 0.5147058823529411,
+          "mean_entry_signed_return_bps": 1.230604395763255,
+          "mean_mfe_atr": 0.5787878502216046,
+          "mean_mae_atr": -0.4979709245318631,
+          "reject_counts": {
+            "direction_below_threshold": 2273,
+            "insufficient_data:pa_h1": 912,
+            "entry_below_threshold": 520,
+            "ambiguous_pa:M5": 281,
+            "insufficient_data:pa_m15_context": 228,
+            "insufficient_data:pa_m15_pattern": 228,
+            "insufficient_data:pa_m5_timing": 72,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 12,
+            "barbwire:H1": 8,
+            "barbwire:M5": 7,
+            "barbwire:M15": 5,
+            "strong_timeframe_conflict": 1
+          },
+          "plan_styles": {
+            "pa_primary": 124,
+            "confirmation_breakout": 117
+          },
+          "order_types": {
+            "market": 124,
+            "stop": 117
+          },
+          "families": {
+            "trend_continuation": 155,
+            "breakout": 86
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 89,
+          "acceptance_rate": 0.02290862290862291,
+          "long": 14,
+          "short": 75,
+          "plans": 140,
+          "direction_labeled": 89,
+          "direction_hit_rate": 0.4606741573033708,
+          "mean_direction_signed_return_bps": 0.7337505238858509,
+          "entry_labeled": 89,
+          "entry_hit_rate": 0.42696629213483145,
+          "mean_entry_signed_return_bps": -0.10039826292843525,
+          "mean_mfe_atr": 0.6767265932678369,
+          "mean_mae_atr": -0.6698872671881553,
+          "reject_counts": {
+            "direction_below_threshold": 2766,
+            "insufficient_data:pa_h1": 658,
+            "entry_below_threshold": 343,
+            "ambiguous_pa:M5": 300,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "ambiguous_pa:M15": 25,
+            "plan:no_pullback_anchor": 18,
+            "strong_timeframe_conflict": 9,
+            "plan:low_reward_risk": 6,
+            "barbwire:M5": 5,
+            "barbwire:H1": 4,
+            "barbwire:M15": 2
+          },
+          "plan_styles": {
+            "pa_primary": 71,
+            "confirmation_breakout": 69
+          },
+          "order_types": {
+            "market": 71,
+            "stop": 69
+          },
+          "families": {
+            "trend_continuation": 107,
+            "breakout": 33
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 81,
+          "acceptance_rate": 0.02084942084942085,
+          "long": 44,
+          "short": 37,
+          "plans": 143,
+          "direction_labeled": 81,
+          "direction_hit_rate": 0.5679012345679012,
+          "mean_direction_signed_return_bps": 5.839291842624574,
+          "entry_labeled": 81,
+          "entry_hit_rate": 0.4691358024691358,
+          "mean_entry_signed_return_bps": 1.5335731234631416,
+          "mean_mfe_atr": 0.5594923765568824,
+          "mean_mae_atr": -0.4772563589158505,
+          "reject_counts": {
+            "direction_below_threshold": 2853,
+            "insufficient_data:pa_h1": 710,
+            "ambiguous_pa:M5": 282,
+            "entry_below_threshold": 211,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "barbwire:M15": 17,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 9,
+            "barbwire:M5": 9,
+            "barbwire:H1": 8,
+            "extreme_range:M5": 1
+          },
+          "plan_styles": {
+            "pa_primary": 72,
+            "confirmation_breakout": 71
+          },
+          "order_types": {
+            "market": 72,
+            "stop": 71
+          },
+          "families": {
+            "trend_continuation": 95,
+            "breakout": 48
+          }
+        }
+      ]
+    },
+    {
+      "name": "without_h1_alpha",
+      "selection": {
+        "direction_modules": [
+          "alpha_m15",
+          "pa_h1",
+          "pa_m15_context"
+        ],
+        "entry_modules": [
+          "alpha_m15",
+          "pa_m15_pattern",
+          "pa_m5_timing"
+        ]
+      },
+      "weights": {
+        "direction": [
+          [
+            "pa_h1",
+            0.4166666666666667
+          ],
+          [
+            "alpha_m15",
+            0.33333333333333337
+          ],
+          [
+            "pa_m15_context",
+            0.25
+          ]
+        ],
+        "entry": [
+          [
+            "pa_m15_pattern",
+            0.45
+          ],
+          [
+            "pa_m5_timing",
+            0.3
+          ],
+          [
+            "alpha_m15",
+            0.25
+          ]
+        ]
+      },
+      "overall": {
+        "decisions": 15541,
+        "accepted": 717,
+        "acceptance_rate": 0.046136027282671646,
+        "long": 378,
+        "short": 339,
+        "plans": 1229,
+        "direction_labeled": 717,
+        "direction_hit_rate": 0.5062761506276151,
+        "mean_direction_signed_return_bps": 0.09153680249858617,
+        "entry_labeled": 717,
+        "entry_hit_rate": 0.4811715481171548,
+        "mean_entry_signed_return_bps": -0.2733190622398354,
+        "mean_mfe_atr": 0.5460641390016764,
+        "mean_mae_atr": -0.5449288773942385,
+        "reject_counts": {
+          "direction_below_threshold": 10094,
+          "insufficient_data:pa_h1": 3116,
+          "entry_below_threshold": 1463,
+          "ambiguous_pa:M5": 1137,
+          "insufficient_data:pa_m15_context": 779,
+          "insufficient_data:pa_m15_pattern": 779,
+          "insufficient_data:pa_m5_timing": 247,
+          "plan:no_pullback_anchor": 91,
+          "ambiguous_pa:M15": 61,
+          "strong_timeframe_conflict": 37,
+          "barbwire:M15": 28,
+          "barbwire:M5": 28,
+          "barbwire:H1": 20,
+          "plan:low_reward_risk": 9,
+          "extreme_range:M5": 1
+        },
+        "plan_styles": {
+          "pa_primary": 626,
+          "confirmation_breakout": 603
+        },
+        "order_types": {
+          "market": 626,
+          "stop": 603
+        },
+        "families": {
+          "trend_continuation": 871,
+          "breakout": 358
+        }
+      },
+      "blocks": [
+        {
+          "decisions": 3886,
+          "accepted": 147,
+          "acceptance_rate": 0.03782810087493567,
+          "long": 96,
+          "short": 51,
+          "plans": 253,
+          "direction_labeled": 147,
+          "direction_hit_rate": 0.4557823129251701,
+          "mean_direction_signed_return_bps": -3.5988258663727875,
+          "entry_labeled": 147,
+          "entry_hit_rate": 0.4965986394557823,
+          "mean_entry_signed_return_bps": -0.3625337764273764,
+          "mean_mfe_atr": 0.5559487047501563,
+          "mean_mae_atr": -0.5009550683594308,
+          "reject_counts": {
+            "direction_below_threshold": 2528,
+            "insufficient_data:pa_h1": 836,
+            "entry_below_threshold": 333,
+            "ambiguous_pa:M5": 274,
+            "insufficient_data:pa_m15_context": 209,
+            "insufficient_data:pa_m15_pattern": 209,
+            "insufficient_data:pa_m5_timing": 67,
+            "plan:no_pullback_anchor": 18,
+            "strong_timeframe_conflict": 14,
+            "ambiguous_pa:M15": 12,
+            "barbwire:M5": 7,
+            "barbwire:M15": 4
+          },
+          "plan_styles": {
+            "pa_primary": 129,
+            "confirmation_breakout": 124
+          },
+          "order_types": {
+            "market": 129,
+            "stop": 124
+          },
+          "families": {
+            "trend_continuation": 181,
+            "breakout": 72
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 190,
+          "acceptance_rate": 0.0489060489060489,
+          "long": 130,
+          "short": 60,
+          "plans": 332,
+          "direction_labeled": 190,
+          "direction_hit_rate": 0.5368421052631579,
+          "mean_direction_signed_return_bps": 0.6813354954363345,
+          "entry_labeled": 190,
+          "entry_hit_rate": 0.5421052631578948,
+          "mean_entry_signed_return_bps": -0.4036754024993857,
+          "mean_mfe_atr": 0.554153189634274,
+          "mean_mae_atr": -0.527717889601893,
+          "reject_counts": {
+            "direction_below_threshold": 2298,
+            "insufficient_data:pa_h1": 912,
+            "entry_below_threshold": 440,
+            "ambiguous_pa:M5": 281,
+            "insufficient_data:pa_m15_context": 228,
+            "insufficient_data:pa_m15_pattern": 228,
+            "insufficient_data:pa_m5_timing": 72,
+            "plan:no_pullback_anchor": 19,
+            "ambiguous_pa:M15": 12,
+            "strong_timeframe_conflict": 8,
+            "barbwire:H1": 8,
+            "barbwire:M5": 7,
+            "barbwire:M15": 5,
+            "plan:low_reward_risk": 1
+          },
+          "plan_styles": {
+            "pa_primary": 171,
+            "confirmation_breakout": 161
+          },
+          "order_types": {
+            "market": 171,
+            "stop": 161
+          },
+          "families": {
+            "trend_continuation": 221,
+            "breakout": 111
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 164,
+          "acceptance_rate": 0.04221364221364221,
+          "long": 74,
+          "short": 90,
+          "plans": 270,
+          "direction_labeled": 164,
+          "direction_hit_rate": 0.45121951219512196,
+          "mean_direction_signed_return_bps": -1.278719072208685,
+          "entry_labeled": 164,
+          "entry_hit_rate": 0.38414634146341464,
+          "mean_entry_signed_return_bps": -0.30834683390541223,
+          "mean_mfe_atr": 0.5424199239351872,
+          "mean_mae_atr": -0.5981502928539341,
+          "reject_counts": {
+            "direction_below_threshold": 2743,
+            "insufficient_data:pa_h1": 658,
+            "ambiguous_pa:M5": 300,
+            "entry_below_threshold": 290,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "plan:no_pullback_anchor": 28,
+            "ambiguous_pa:M15": 25,
+            "strong_timeframe_conflict": 7,
+            "plan:low_reward_risk": 6,
+            "barbwire:M5": 5,
+            "barbwire:H1": 4,
+            "barbwire:M15": 2
+          },
+          "plan_styles": {
+            "pa_primary": 136,
+            "confirmation_breakout": 134
+          },
+          "order_types": {
+            "market": 136,
+            "stop": 134
+          },
+          "families": {
+            "trend_continuation": 201,
+            "breakout": 69
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 216,
+          "acceptance_rate": 0.055598455598455596,
+          "long": 78,
+          "short": 138,
+          "plans": 374,
+          "direction_labeled": 216,
+          "direction_hit_rate": 0.5555555555555556,
+          "mean_direction_signed_return_bps": 3.1246086734148464,
+          "entry_labeled": 216,
+          "entry_hit_rate": 0.49074074074074076,
+          "mean_entry_signed_return_bps": -0.07134303359151274,
+          "mean_mfe_atr": 0.5349886782872512,
+          "mean_mae_atr": -0.549585939770499,
+          "reject_counts": {
+            "direction_below_threshold": 2525,
+            "insufficient_data:pa_h1": 710,
+            "entry_below_threshold": 400,
+            "ambiguous_pa:M5": 282,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "plan:no_pullback_anchor": 26,
+            "barbwire:M15": 17,
+            "ambiguous_pa:M15": 12,
+            "barbwire:M5": 9,
+            "barbwire:H1": 8,
+            "strong_timeframe_conflict": 8,
+            "plan:low_reward_risk": 2,
+            "extreme_range:M5": 1
+          },
+          "plan_styles": {
+            "pa_primary": 190,
+            "confirmation_breakout": 184
+          },
+          "order_types": {
+            "market": 190,
+            "stop": 184
+          },
+          "families": {
+            "trend_continuation": 268,
+            "breakout": 106
+          }
+        }
+      ]
+    },
+    {
+      "name": "without_h1_pa",
+      "selection": {
+        "direction_modules": [
+          "alpha_h1",
+          "alpha_m15",
+          "pa_m15_context"
+        ],
+        "entry_modules": [
+          "alpha_m15",
+          "pa_m15_pattern",
+          "pa_m5_timing"
+        ]
+      },
+      "weights": {
+        "direction": [
+          [
+            "alpha_h1",
+            0.5333333333333333
+          ],
+          [
+            "alpha_m15",
+            0.26666666666666666
+          ],
+          [
+            "pa_m15_context",
+            0.19999999999999998
+          ]
+        ],
+        "entry": [
+          [
+            "pa_m15_pattern",
+            0.45
+          ],
+          [
+            "pa_m5_timing",
+            0.3
+          ],
+          [
+            "alpha_m15",
+            0.25
+          ]
+        ]
+      },
+      "overall": {
+        "decisions": 15541,
+        "accepted": 597,
+        "acceptance_rate": 0.0384145164403835,
+        "long": 321,
+        "short": 276,
+        "plans": 1025,
+        "direction_labeled": 597,
+        "direction_hit_rate": 0.5108877721943048,
+        "mean_direction_signed_return_bps": 1.0094419404192174,
+        "entry_labeled": 597,
+        "entry_hit_rate": 0.47738693467336685,
+        "mean_entry_signed_return_bps": 0.10987980128667033,
+        "mean_mfe_atr": 0.5566580135039999,
+        "mean_mae_atr": -0.5305653028122168,
+        "reject_counts": {
+          "direction_below_threshold": 11479,
+          "entry_below_threshold": 2654,
+          "ambiguous_pa:M5": 1137,
+          "insufficient_data:pa_m15_context": 779,
+          "insufficient_data:pa_m15_pattern": 779,
+          "insufficient_data:pa_m5_timing": 247,
+          "strong_timeframe_conflict": 206,
+          "plan:no_pullback_anchor": 74,
+          "ambiguous_pa:M15": 61,
+          "barbwire:M15": 28,
+          "barbwire:M5": 28,
+          "plan:low_reward_risk": 8,
+          "extreme_range:M5": 1
+        },
+        "plan_styles": {
+          "pa_primary": 523,
+          "confirmation_breakout": 502
+        },
+        "order_types": {
+          "market": 523,
+          "stop": 502
+        },
+        "families": {
+          "trend_continuation": 649,
+          "breakout": 374,
+          "reversal": 2
+        }
+      },
+      "blocks": [
+        {
+          "decisions": 3886,
+          "accepted": 203,
+          "acceptance_rate": 0.05223880597014925,
+          "long": 127,
+          "short": 76,
+          "plans": 350,
+          "direction_labeled": 203,
+          "direction_hit_rate": 0.541871921182266,
+          "mean_direction_signed_return_bps": 1.247569533862261,
+          "entry_labeled": 203,
+          "entry_hit_rate": 0.5221674876847291,
+          "mean_entry_signed_return_bps": 0.2601760913600214,
+          "mean_mfe_atr": 0.5510052801572248,
+          "mean_mae_atr": -0.5040172300355084,
+          "reject_counts": {
+            "direction_below_threshold": 2552,
+            "entry_below_threshold": 908,
+            "ambiguous_pa:M5": 274,
+            "insufficient_data:pa_m15_context": 209,
+            "insufficient_data:pa_m15_pattern": 209,
+            "insufficient_data:pa_m5_timing": 67,
+            "strong_timeframe_conflict": 41,
+            "plan:no_pullback_anchor": 25,
+            "ambiguous_pa:M15": 12,
+            "barbwire:M5": 7,
+            "barbwire:M15": 4,
+            "plan:low_reward_risk": 1
+          },
+          "plan_styles": {
+            "pa_primary": 178,
+            "confirmation_breakout": 172
+          },
+          "order_types": {
+            "market": 178,
+            "stop": 172
+          },
+          "families": {
+            "trend_continuation": 220,
+            "breakout": 130
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 204,
+          "acceptance_rate": 0.05250965250965251,
+          "long": 134,
+          "short": 70,
+          "plans": 360,
+          "direction_labeled": 204,
+          "direction_hit_rate": 0.5049019607843137,
+          "mean_direction_signed_return_bps": -0.21792245796150642,
+          "entry_labeled": 204,
+          "entry_hit_rate": 0.47549019607843135,
+          "mean_entry_signed_return_bps": 0.20597460337545512,
+          "mean_mfe_atr": 0.5344026404962833,
+          "mean_mae_atr": -0.5003391050619692,
+          "reject_counts": {
+            "direction_below_threshold": 2585,
+            "entry_below_threshold": 856,
+            "ambiguous_pa:M5": 281,
+            "insufficient_data:pa_m15_context": 228,
+            "insufficient_data:pa_m15_pattern": 228,
+            "strong_timeframe_conflict": 77,
+            "insufficient_data:pa_m5_timing": 72,
+            "plan:no_pullback_anchor": 19,
+            "ambiguous_pa:M15": 12,
+            "barbwire:M5": 7,
+            "barbwire:M15": 5,
+            "plan:low_reward_risk": 1
+          },
+          "plan_styles": {
+            "pa_primary": 185,
+            "confirmation_breakout": 175
+          },
+          "order_types": {
+            "market": 185,
+            "stop": 175
+          },
+          "families": {
+            "trend_continuation": 223,
+            "breakout": 135,
+            "reversal": 2
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 100,
+          "acceptance_rate": 0.02574002574002574,
+          "long": 15,
+          "short": 85,
+          "plans": 158,
+          "direction_labeled": 100,
+          "direction_hit_rate": 0.46,
+          "mean_direction_signed_return_bps": 1.8687649965154596,
+          "entry_labeled": 100,
+          "entry_hit_rate": 0.45,
+          "mean_entry_signed_return_bps": -0.09266477157663378,
+          "mean_mfe_atr": 0.6625591811415759,
+          "mean_mae_atr": -0.6453439654821217,
+          "reject_counts": {
+            "direction_below_threshold": 3030,
+            "entry_below_threshold": 581,
+            "ambiguous_pa:M5": 300,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "strong_timeframe_conflict": 74,
+            "insufficient_data:pa_m5_timing": 54,
+            "ambiguous_pa:M15": 25,
+            "plan:no_pullback_anchor": 20,
+            "barbwire:M5": 5,
+            "plan:low_reward_risk": 5,
+            "barbwire:M15": 2
+          },
+          "plan_styles": {
+            "pa_primary": 80,
+            "confirmation_breakout": 78
+          },
+          "order_types": {
+            "market": 80,
+            "stop": 78
+          },
+          "families": {
+            "trend_continuation": 107,
+            "breakout": 51
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 90,
+          "acceptance_rate": 0.023166023166023165,
+          "long": 45,
+          "short": 45,
+          "plans": 157,
+          "direction_labeled": 90,
+          "direction_hit_rate": 0.5111111111111111,
+          "mean_direction_signed_return_bps": 2.2995544980981677,
+          "entry_labeled": 90,
+          "entry_hit_rate": 0.4111111111111111,
+          "mean_entry_signed_return_bps": -0.22188719009857355,
+          "mean_mfe_atr": 0.5021856157174658,
+          "mean_mae_atr": -0.5314268233425709,
+          "reject_counts": {
+            "direction_below_threshold": 3312,
+            "entry_below_threshold": 309,
+            "ambiguous_pa:M5": 282,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "barbwire:M15": 17,
+            "strong_timeframe_conflict": 14,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 10,
+            "barbwire:M5": 9,
+            "plan:low_reward_risk": 1,
+            "extreme_range:M5": 1
+          },
+          "plan_styles": {
+            "pa_primary": 80,
+            "confirmation_breakout": 77
+          },
+          "order_types": {
+            "market": 80,
+            "stop": 77
+          },
+          "families": {
+            "trend_continuation": 99,
+            "breakout": 58
+          }
+        }
+      ]
+    },
+    {
+      "name": "without_m15_alpha",
+      "selection": {
+        "direction_modules": [
+          "alpha_h1",
+          "pa_h1",
+          "pa_m15_context"
+        ],
+        "entry_modules": [
+          "pa_m15_pattern",
+          "pa_m5_timing"
+        ]
+      },
+      "weights": {
+        "direction": [
+          [
+            "alpha_h1",
+            0.5
+          ],
+          [
+            "pa_h1",
+            0.3125
+          ],
+          [
+            "pa_m15_context",
+            0.18749999999999997
+          ]
+        ],
+        "entry": [
+          [
+            "pa_m15_pattern",
+            0.6
+          ],
+          [
+            "pa_m5_timing",
+            0.39999999999999997
+          ]
+        ]
+      },
+      "overall": {
+        "decisions": 15541,
+        "accepted": 387,
+        "acceptance_rate": 0.024901872466379253,
+        "long": 193,
+        "short": 194,
+        "plans": 669,
+        "direction_labeled": 387,
+        "direction_hit_rate": 0.5193798449612403,
+        "mean_direction_signed_return_bps": 1.8963243863671067,
+        "entry_labeled": 387,
+        "entry_hit_rate": 0.4806201550387597,
+        "mean_entry_signed_return_bps": 1.0691418598458906,
+        "mean_mfe_atr": 0.5874281542586554,
+        "mean_mae_atr": -0.5314368105083006,
+        "reject_counts": {
+          "direction_below_threshold": 10405,
+          "insufficient_data:pa_h1": 3116,
+          "entry_below_threshold": 1509,
+          "ambiguous_pa:M5": 1137,
+          "insufficient_data:pa_m15_context": 779,
+          "insufficient_data:pa_m15_pattern": 779,
+          "insufficient_data:pa_m5_timing": 247,
+          "strong_timeframe_conflict": 197,
+          "ambiguous_pa:M15": 61,
+          "plan:no_pullback_anchor": 46,
+          "barbwire:M15": 28,
+          "barbwire:M5": 28,
+          "barbwire:H1": 20,
+          "plan:low_reward_risk": 6,
+          "extreme_range:M5": 1
+        },
+        "plan_styles": {
+          "pa_primary": 341,
+          "confirmation_breakout": 328
+        },
+        "order_types": {
+          "market": 341,
+          "stop": 328
+        },
+        "families": {
+          "trend_continuation": 473,
+          "breakout": 196
+        }
+      },
+      "blocks": [
+        {
+          "decisions": 3886,
+          "accepted": 96,
+          "acceptance_rate": 0.024704065877509007,
+          "long": 55,
+          "short": 41,
+          "plans": 168,
+          "direction_labeled": 96,
+          "direction_hit_rate": 0.4895833333333333,
+          "mean_direction_signed_return_bps": 1.227971856036849,
+          "entry_labeled": 96,
+          "entry_hit_rate": 0.5416666666666666,
+          "mean_entry_signed_return_bps": 0.9188843190977246,
+          "mean_mfe_atr": 0.5116715302392449,
+          "mean_mae_atr": -0.4796211530145369,
+          "reject_counts": {
+            "direction_below_threshold": 2479,
+            "insufficient_data:pa_h1": 836,
+            "entry_below_threshold": 442,
+            "ambiguous_pa:M5": 274,
+            "insufficient_data:pa_m15_context": 209,
+            "insufficient_data:pa_m15_pattern": 209,
+            "insufficient_data:pa_m5_timing": 67,
+            "strong_timeframe_conflict": 66,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 11,
+            "barbwire:M5": 7,
+            "barbwire:M15": 4
+          },
+          "plan_styles": {
+            "pa_primary": 85,
+            "confirmation_breakout": 83
+          },
+          "order_types": {
+            "market": 85,
+            "stop": 83
+          },
+          "families": {
+            "trend_continuation": 113,
+            "breakout": 55
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 122,
+          "acceptance_rate": 0.031402831402831406,
+          "long": 81,
+          "short": 41,
+          "plans": 218,
+          "direction_labeled": 122,
+          "direction_hit_rate": 0.5245901639344263,
+          "mean_direction_signed_return_bps": 0.27699159778629645,
+          "entry_labeled": 122,
+          "entry_hit_rate": 0.5081967213114754,
+          "mean_entry_signed_return_bps": 1.5482315680039846,
+          "mean_mfe_atr": 0.6037329049140724,
+          "mean_mae_atr": -0.49631926491669476,
+          "reject_counts": {
+            "direction_below_threshold": 2280,
+            "insufficient_data:pa_h1": 912,
+            "entry_below_threshold": 534,
+            "ambiguous_pa:M5": 281,
+            "insufficient_data:pa_m15_context": 228,
+            "insufficient_data:pa_m15_pattern": 228,
+            "insufficient_data:pa_m5_timing": 72,
+            "strong_timeframe_conflict": 65,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 9,
+            "barbwire:H1": 8,
+            "barbwire:M5": 7,
+            "barbwire:M15": 5
+          },
+          "plan_styles": {
+            "pa_primary": 113,
+            "confirmation_breakout": 105
+          },
+          "order_types": {
+            "market": 113,
+            "stop": 105
+          },
+          "families": {
+            "trend_continuation": 154,
+            "breakout": 64
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 103,
+          "acceptance_rate": 0.02651222651222651,
+          "long": 22,
+          "short": 81,
+          "plans": 166,
+          "direction_labeled": 103,
+          "direction_hit_rate": 0.49514563106796117,
+          "mean_direction_signed_return_bps": 1.9850044366923085,
+          "entry_labeled": 103,
+          "entry_hit_rate": 0.4174757281553398,
+          "mean_entry_signed_return_bps": 0.9913109499137818,
+          "mean_mfe_atr": 0.6795034100845265,
+          "mean_mae_atr": -0.6383782464459227,
+          "reject_counts": {
+            "direction_below_threshold": 2752,
+            "insufficient_data:pa_h1": 658,
+            "entry_below_threshold": 345,
+            "ambiguous_pa:M5": 300,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "strong_timeframe_conflict": 48,
+            "ambiguous_pa:M15": 25,
+            "plan:no_pullback_anchor": 19,
+            "plan:low_reward_risk": 6,
+            "barbwire:M5": 5,
+            "barbwire:H1": 4,
+            "barbwire:M15": 2
+          },
+          "plan_styles": {
+            "pa_primary": 84,
+            "confirmation_breakout": 82
+          },
+          "order_types": {
+            "market": 84,
+            "stop": 82
+          },
+          "families": {
+            "trend_continuation": 127,
+            "breakout": 39
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 66,
+          "acceptance_rate": 0.01698841698841699,
+          "long": 35,
+          "short": 31,
+          "plans": 117,
+          "direction_labeled": 66,
+          "direction_hit_rate": 0.5909090909090909,
+          "mean_direction_signed_return_bps": 5.723391021746922,
+          "entry_labeled": 66,
+          "entry_hit_rate": 0.4393939393939394,
+          "mean_entry_signed_return_bps": 0.5235716058995835,
+          "mean_mfe_atr": 0.5237873205592276,
+          "mean_mae_atr": -0.5048258374780302,
+          "reject_counts": {
+            "direction_below_threshold": 2894,
+            "insufficient_data:pa_h1": 710,
+            "ambiguous_pa:M5": 282,
+            "entry_below_threshold": 188,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "strong_timeframe_conflict": 18,
+            "barbwire:M15": 17,
+            "ambiguous_pa:M15": 12,
+            "barbwire:M5": 9,
+            "barbwire:H1": 8,
+            "plan:no_pullback_anchor": 7,
+            "extreme_range:M5": 1
+          },
+          "plan_styles": {
+            "pa_primary": 59,
+            "confirmation_breakout": 58
+          },
+          "order_types": {
+            "market": 59,
+            "stop": 58
+          },
+          "families": {
+            "trend_continuation": 79,
+            "breakout": 38
+          }
+        }
+      ]
+    },
+    {
+      "name": "without_m15_pa_context",
+      "selection": {
+        "direction_modules": [
+          "alpha_h1",
+          "alpha_m15",
+          "pa_h1"
+        ],
+        "entry_modules": [
+          "alpha_m15",
+          "pa_m15_pattern",
+          "pa_m5_timing"
+        ]
+      },
+      "weights": {
+        "direction": [
+          [
+            "alpha_h1",
+            0.47058823529411764
+          ],
+          [
+            "pa_h1",
+            0.2941176470588235
+          ],
+          [
+            "alpha_m15",
+            0.23529411764705882
+          ]
+        ],
+        "entry": [
+          [
+            "pa_m15_pattern",
+            0.45
+          ],
+          [
+            "pa_m5_timing",
+            0.3
+          ],
+          [
+            "alpha_m15",
+            0.25
+          ]
+        ]
+      },
+      "overall": {
+        "decisions": 15541,
+        "accepted": 434,
+        "acceptance_rate": 0.027926130879608775,
+        "long": 220,
+        "short": 214,
+        "plans": 753,
+        "direction_labeled": 434,
+        "direction_hit_rate": 0.5230414746543779,
+        "mean_direction_signed_return_bps": 2.0429729341604896,
+        "entry_labeled": 434,
+        "entry_hit_rate": 0.4861751152073733,
+        "mean_entry_signed_return_bps": 0.6087950500414103,
+        "mean_mfe_atr": 0.579989750499501,
+        "mean_mae_atr": -0.5286369500830266,
+        "reject_counts": {
+          "direction_below_threshold": 9613,
+          "insufficient_data:pa_h1": 3116,
+          "entry_below_threshold": 2350,
+          "ambiguous_pa:M5": 1137,
+          "insufficient_data:pa_m15_pattern": 779,
+          "strong_timeframe_conflict": 260,
+          "insufficient_data:pa_m5_timing": 247,
+          "ambiguous_pa:M15": 61,
+          "plan:no_pullback_anchor": 51,
+          "barbwire:M15": 28,
+          "barbwire:M5": 28,
+          "barbwire:H1": 20,
+          "plan:low_reward_risk": 6,
+          "extreme_range:M5": 1
+        },
+        "plan_styles": {
+          "pa_primary": 383,
+          "confirmation_breakout": 370
+        },
+        "order_types": {
+          "market": 383,
+          "stop": 370
+        },
+        "families": {
+          "trend_continuation": 462,
+          "breakout": 289,
+          "reversal": 2
+        }
+      },
+      "blocks": [
+        {
+          "decisions": 3886,
+          "accepted": 111,
+          "acceptance_rate": 0.028564076170869788,
+          "long": 68,
+          "short": 43,
+          "plans": 198,
+          "direction_labeled": 111,
+          "direction_hit_rate": 0.5225225225225225,
+          "mean_direction_signed_return_bps": -1.1043747357103901,
+          "entry_labeled": 111,
+          "entry_hit_rate": 0.5315315315315315,
+          "mean_entry_signed_return_bps": 0.6667652690808248,
+          "mean_mfe_atr": 0.5630710460229529,
+          "mean_mae_atr": -0.4819441824451573,
+          "reject_counts": {
+            "direction_below_threshold": 2248,
+            "insufficient_data:pa_h1": 836,
+            "entry_below_threshold": 678,
+            "ambiguous_pa:M5": 274,
+            "insufficient_data:pa_m15_pattern": 209,
+            "insufficient_data:pa_m5_timing": 67,
+            "strong_timeframe_conflict": 67,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 11,
+            "barbwire:M5": 7,
+            "barbwire:M15": 4
+          },
+          "plan_styles": {
+            "pa_primary": 100,
+            "confirmation_breakout": 98
+          },
+          "order_types": {
+            "market": 100,
+            "stop": 98
+          },
+          "families": {
+            "trend_continuation": 117,
+            "breakout": 81
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 148,
+          "acceptance_rate": 0.0380952380952381,
+          "long": 95,
+          "short": 53,
+          "plans": 264,
+          "direction_labeled": 148,
+          "direction_hit_rate": 0.5472972972972973,
+          "mean_direction_signed_return_bps": 4.4827945592359955,
+          "entry_labeled": 148,
+          "entry_hit_rate": 0.5,
+          "mean_entry_signed_return_bps": 0.8980983523885481,
+          "mean_mfe_atr": 0.5640400580075523,
+          "mean_mae_atr": -0.49774863870485064,
+          "reject_counts": {
+            "direction_below_threshold": 1998,
+            "insufficient_data:pa_h1": 912,
+            "entry_below_threshold": 817,
+            "ambiguous_pa:M5": 281,
+            "insufficient_data:pa_m15_pattern": 228,
+            "strong_timeframe_conflict": 82,
+            "insufficient_data:pa_m5_timing": 72,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 12,
+            "barbwire:H1": 8,
+            "barbwire:M5": 7,
+            "barbwire:M15": 5
+          },
+          "plan_styles": {
+            "pa_primary": 136,
+            "confirmation_breakout": 128
+          },
+          "order_types": {
+            "market": 136,
+            "stop": 128
+          },
+          "families": {
+            "trend_continuation": 155,
+            "breakout": 107,
+            "reversal": 2
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 95,
+          "acceptance_rate": 0.02445302445302445,
+          "long": 14,
+          "short": 81,
+          "plans": 150,
+          "direction_labeled": 95,
+          "direction_hit_rate": 0.45263157894736844,
+          "mean_direction_signed_return_bps": -1.1169777398162215,
+          "entry_labeled": 95,
+          "entry_hit_rate": 0.43157894736842106,
+          "mean_entry_signed_return_bps": -0.28075691620663584,
+          "mean_mfe_atr": 0.6627813801437913,
+          "mean_mae_atr": -0.6585110430931228,
+          "reject_counts": {
+            "direction_below_threshold": 2559,
+            "insufficient_data:pa_h1": 658,
+            "entry_below_threshold": 571,
+            "ambiguous_pa:M5": 300,
+            "insufficient_data:pa_m15_pattern": 171,
+            "strong_timeframe_conflict": 94,
+            "insufficient_data:pa_m5_timing": 54,
+            "ambiguous_pa:M15": 25,
+            "plan:no_pullback_anchor": 19,
+            "plan:low_reward_risk": 6,
+            "barbwire:M5": 5,
+            "barbwire:H1": 4,
+            "barbwire:M15": 2
+          },
+          "plan_styles": {
+            "pa_primary": 76,
+            "confirmation_breakout": 74
+          },
+          "order_types": {
+            "market": 76,
+            "stop": 74
+          },
+          "families": {
+            "trend_continuation": 101,
+            "breakout": 49
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 80,
+          "acceptance_rate": 0.02059202059202059,
+          "long": 43,
+          "short": 37,
+          "plans": 141,
+          "direction_labeled": 80,
+          "direction_hit_rate": 0.5625,
+          "mean_direction_signed_return_bps": 5.648689245063996,
+          "entry_labeled": 80,
+          "entry_hit_rate": 0.4625,
+          "mean_entry_signed_return_bps": 1.0494932217015724,
+          "mean_mfe_atr": 0.5346563238682216,
+          "mean_mae_atr": -0.49634105578070625,
+          "reject_counts": {
+            "direction_below_threshold": 2808,
+            "insufficient_data:pa_h1": 710,
+            "entry_below_threshold": 284,
+            "ambiguous_pa:M5": 282,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "barbwire:M15": 17,
+            "strong_timeframe_conflict": 17,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 9,
+            "barbwire:M5": 9,
+            "barbwire:H1": 8,
+            "extreme_range:M5": 1
+          },
+          "plan_styles": {
+            "pa_primary": 71,
+            "confirmation_breakout": 70
+          },
+          "order_types": {
+            "market": 71,
+            "stop": 70
+          },
+          "families": {
+            "trend_continuation": 89,
+            "breakout": 52
+          }
+        }
+      ]
+    },
+    {
+      "name": "without_m15_pa_pattern",
+      "selection": {
+        "direction_modules": [
+          "alpha_h1",
+          "alpha_m15",
+          "pa_h1",
+          "pa_m15_context"
+        ],
+        "entry_modules": [
+          "alpha_m15",
+          "pa_m5_timing"
+        ]
+      },
+      "weights": {
+        "direction": [
+          [
+            "alpha_h1",
+            0.4
+          ],
+          [
+            "pa_h1",
+            0.25
+          ],
+          [
+            "alpha_m15",
+            0.2
+          ],
+          [
+            "pa_m15_context",
+            0.15
+          ]
+        ],
+        "entry": [
+          [
+            "pa_m5_timing",
+            0.5454545454545454
+          ],
+          [
+            "alpha_m15",
+            0.45454545454545453
+          ]
+        ]
+      },
+      "overall": {
+        "decisions": 15541,
+        "accepted": 775,
+        "acceptance_rate": 0.049868090856444246,
+        "long": 384,
+        "short": 391,
+        "plans": 594,
+        "direction_labeled": 775,
+        "direction_hit_rate": 0.4993548387096774,
+        "mean_direction_signed_return_bps": 1.8584252065947025,
+        "entry_labeled": 775,
+        "entry_hit_rate": 0.48258064516129034,
+        "mean_entry_signed_return_bps": 0.8528582589135333,
+        "mean_mfe_atr": 0.569389719276733,
+        "mean_mae_atr": -0.5336457148995589,
+        "reject_counts": {
+          "direction_below_threshold": 10386,
+          "insufficient_data:pa_h1": 3116,
+          "ambiguous_pa:M5": 1137,
+          "entry_below_threshold": 1133,
+          "insufficient_data:pa_m15_context": 779,
+          "plan:no_fresh_m15_pa_candidate": 432,
+          "insufficient_data:pa_m5_timing": 247,
+          "plan:no_pullback_anchor": 40,
+          "barbwire:M15": 28,
+          "barbwire:M5": 28,
+          "barbwire:H1": 20,
+          "strong_timeframe_conflict": 13,
+          "plan:low_reward_risk": 6,
+          "extreme_range:M5": 1
+        },
+        "plan_styles": {
+          "pa_primary": 303,
+          "confirmation_breakout": 291
+        },
+        "order_types": {
+          "market": 303,
+          "stop": 291
+        },
+        "families": {
+          "trend_continuation": 424,
+          "breakout": 170
+        }
+      },
+      "blocks": [
+        {
+          "decisions": 3886,
+          "accepted": 199,
+          "acceptance_rate": 0.05120946989191971,
+          "long": 106,
+          "short": 93,
+          "plans": 142,
+          "direction_labeled": 199,
+          "direction_hit_rate": 0.5376884422110553,
+          "mean_direction_signed_return_bps": -1.1409076488724423,
+          "entry_labeled": 199,
+          "entry_hit_rate": 0.5226130653266332,
+          "mean_entry_signed_return_bps": -0.015063934683944676,
+          "mean_mfe_atr": 0.5442524475180175,
+          "mean_mae_atr": -0.5356053790697635,
+          "reject_counts": {
+            "direction_below_threshold": 2494,
+            "insufficient_data:pa_h1": 836,
+            "entry_below_threshold": 322,
+            "ambiguous_pa:M5": 274,
+            "insufficient_data:pa_m15_context": 209,
+            "plan:no_fresh_m15_pa_candidate": 118,
+            "insufficient_data:pa_m5_timing": 67,
+            "plan:no_pullback_anchor": 9,
+            "barbwire:M5": 7,
+            "barbwire:M15": 4,
+            "strong_timeframe_conflict": 3
+          },
+          "plan_styles": {
+            "pa_primary": 72,
+            "confirmation_breakout": 70
+          },
+          "order_types": {
+            "market": 72,
+            "stop": 70
+          },
+          "families": {
+            "trend_continuation": 99,
+            "breakout": 43
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 268,
+          "acceptance_rate": 0.06898326898326898,
+          "long": 171,
+          "short": 97,
+          "plans": 197,
+          "direction_labeled": 268,
+          "direction_hit_rate": 0.4626865671641791,
+          "mean_direction_signed_return_bps": 0.4178457235072272,
+          "entry_labeled": 268,
+          "entry_hit_rate": 0.47388059701492535,
+          "mean_entry_signed_return_bps": 0.6304515725561189,
+          "mean_mfe_atr": 0.5418423870496788,
+          "mean_mae_atr": -0.5483946009994299,
+          "reject_counts": {
+            "direction_below_threshold": 2273,
+            "insufficient_data:pa_h1": 912,
+            "entry_below_threshold": 393,
+            "ambiguous_pa:M5": 281,
+            "insufficient_data:pa_m15_context": 228,
+            "plan:no_fresh_m15_pa_candidate": 157,
+            "insufficient_data:pa_m5_timing": 72,
+            "plan:no_pullback_anchor": 9,
+            "barbwire:H1": 8,
+            "barbwire:M5": 7,
+            "barbwire:M15": 5,
+            "strong_timeframe_conflict": 1
+          },
+          "plan_styles": {
+            "pa_primary": 102,
+            "confirmation_breakout": 95
+          },
+          "order_types": {
+            "market": 102,
+            "stop": 95
+          },
+          "families": {
+            "trend_continuation": 135,
+            "breakout": 62
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 180,
+          "acceptance_rate": 0.04633204633204633,
+          "long": 36,
+          "short": 144,
+          "plans": 130,
+          "direction_labeled": 180,
+          "direction_hit_rate": 0.4777777777777778,
+          "mean_direction_signed_return_bps": 5.407477355236531,
+          "entry_labeled": 180,
+          "entry_hit_rate": 0.45555555555555555,
+          "mean_entry_signed_return_bps": 0.902133178741117,
+          "mean_mfe_atr": 0.6169835954081229,
+          "mean_mae_atr": -0.5559230183985958,
+          "reject_counts": {
+            "direction_below_threshold": 2766,
+            "insufficient_data:pa_h1": 658,
+            "ambiguous_pa:M5": 300,
+            "entry_below_threshold": 253,
+            "insufficient_data:pa_m15_context": 171,
+            "plan:no_fresh_m15_pa_candidate": 98,
+            "insufficient_data:pa_m5_timing": 54,
+            "plan:no_pullback_anchor": 16,
+            "strong_timeframe_conflict": 9,
+            "plan:low_reward_risk": 6,
+            "barbwire:M5": 5,
+            "barbwire:H1": 4,
+            "barbwire:M15": 2
+          },
+          "plan_styles": {
+            "pa_primary": 66,
+            "confirmation_breakout": 64
+          },
+          "order_types": {
+            "market": 66,
+            "stop": 64
+          },
+          "families": {
+            "trend_continuation": 105,
+            "breakout": 25
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 128,
+          "acceptance_rate": 0.032947232947232945,
+          "long": 71,
+          "short": 57,
+          "plans": 125,
+          "direction_labeled": 128,
+          "direction_hit_rate": 0.546875,
+          "mean_direction_signed_return_bps": 4.546809214015608,
+          "entry_labeled": 128,
+          "entry_hit_rate": 0.4765625,
+          "mean_entry_signed_return_bps": 2.598577187825409,
+          "mean_mfe_atr": 0.5992186600047384,
+          "mean_mae_atr": -0.4683911111928181,
+          "reject_counts": {
+            "direction_below_threshold": 2853,
+            "insufficient_data:pa_h1": 710,
+            "ambiguous_pa:M5": 282,
+            "insufficient_data:pa_m15_context": 171,
+            "entry_below_threshold": 165,
+            "plan:no_fresh_m15_pa_candidate": 59,
+            "insufficient_data:pa_m5_timing": 54,
+            "barbwire:M15": 17,
+            "barbwire:M5": 9,
+            "barbwire:H1": 8,
+            "plan:no_pullback_anchor": 6,
+            "extreme_range:M5": 1
+          },
+          "plan_styles": {
+            "pa_primary": 63,
+            "confirmation_breakout": 62
+          },
+          "order_types": {
+            "market": 63,
+            "stop": 62
+          },
+          "families": {
+            "trend_continuation": 85,
+            "breakout": 40
+          }
+        }
+      ]
+    },
+    {
+      "name": "without_m5_pa",
+      "selection": {
+        "direction_modules": [
+          "alpha_h1",
+          "alpha_m15",
+          "pa_h1",
+          "pa_m15_context"
+        ],
+        "entry_modules": [
+          "alpha_m15",
+          "pa_m15_pattern"
+        ]
+      },
+      "weights": {
+        "direction": [
+          [
+            "alpha_h1",
+            0.4
+          ],
+          [
+            "pa_h1",
+            0.25
+          ],
+          [
+            "alpha_m15",
+            0.2
+          ],
+          [
+            "pa_m15_context",
+            0.15
+          ]
+        ],
+        "entry": [
+          [
+            "pa_m15_pattern",
+            0.6428571428571429
+          ],
+          [
+            "alpha_m15",
+            0.35714285714285715
+          ]
+        ]
+      },
+      "overall": {
+        "decisions": 15541,
+        "accepted": 601,
+        "acceptance_rate": 0.03867190013512644,
+        "long": 301,
+        "short": 300,
+        "plans": 1055,
+        "direction_labeled": 601,
+        "direction_hit_rate": 0.5174708818635607,
+        "mean_direction_signed_return_bps": 2.337569712364722,
+        "entry_labeled": 601,
+        "entry_hit_rate": 0.5008319467554077,
+        "mean_entry_signed_return_bps": 0.5262180375500798,
+        "mean_mfe_atr": 0.6003500333482866,
+        "mean_mae_atr": -0.5179553221623565,
+        "reject_counts": {
+          "direction_below_threshold": 10386,
+          "insufficient_data:pa_h1": 3116,
+          "entry_below_threshold": 1314,
+          "insufficient_data:pa_m15_context": 779,
+          "insufficient_data:pa_m15_pattern": 779,
+          "plan:no_pullback_anchor": 66,
+          "ambiguous_pa:M15": 61,
+          "barbwire:M15": 28,
+          "barbwire:H1": 20,
+          "strong_timeframe_conflict": 13,
+          "plan:low_reward_risk": 7
+        },
+        "plan_styles": {
+          "pa_primary": 535,
+          "confirmation_breakout": 520
+        },
+        "order_types": {
+          "market": 535,
+          "stop": 520
+        },
+        "families": {
+          "trend_continuation": 632,
+          "breakout": 423
+        }
+      },
+      "blocks": [
+        {
+          "decisions": 3886,
+          "accepted": 158,
+          "acceptance_rate": 0.040658775090066906,
+          "long": 91,
+          "short": 67,
+          "plans": 282,
+          "direction_labeled": 158,
+          "direction_hit_rate": 0.5,
+          "mean_direction_signed_return_bps": -2.741362690574241,
+          "entry_labeled": 158,
+          "entry_hit_rate": 0.5253164556962026,
+          "mean_entry_signed_return_bps": -0.13358040755577416,
+          "mean_mfe_atr": 0.532391305555187,
+          "mean_mae_atr": -0.5004632694308095,
+          "reject_counts": {
+            "direction_below_threshold": 2494,
+            "insufficient_data:pa_h1": 836,
+            "entry_below_threshold": 365,
+            "insufficient_data:pa_m15_context": 209,
+            "insufficient_data:pa_m15_pattern": 209,
+            "plan:no_pullback_anchor": 15,
+            "ambiguous_pa:M15": 12,
+            "barbwire:M15": 4,
+            "strong_timeframe_conflict": 3
+          },
+          "plan_styles": {
+            "pa_primary": 143,
+            "confirmation_breakout": 139
+          },
+          "order_types": {
+            "market": 143,
+            "stop": 139
+          },
+          "families": {
+            "trend_continuation": 161,
+            "breakout": 121
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 199,
+          "acceptance_rate": 0.051222651222651225,
+          "long": 131,
+          "short": 68,
+          "plans": 358,
+          "direction_labeled": 199,
+          "direction_hit_rate": 0.5376884422110553,
+          "mean_direction_signed_return_bps": 3.6168442522776623,
+          "entry_labeled": 199,
+          "entry_hit_rate": 0.5326633165829145,
+          "mean_entry_signed_return_bps": 1.00246573698601,
+          "mean_mfe_atr": 0.6389026633535096,
+          "mean_mae_atr": -0.47580641873476726,
+          "reject_counts": {
+            "direction_below_threshold": 2273,
+            "insufficient_data:pa_h1": 912,
+            "entry_below_threshold": 464,
+            "insufficient_data:pa_m15_context": 228,
+            "insufficient_data:pa_m15_pattern": 228,
+            "plan:no_pullback_anchor": 16,
+            "ambiguous_pa:M15": 12,
+            "barbwire:H1": 8,
+            "barbwire:M15": 5,
+            "strong_timeframe_conflict": 1
+          },
+          "plan_styles": {
+            "pa_primary": 183,
+            "confirmation_breakout": 175
+          },
+          "order_types": {
+            "market": 183,
+            "stop": 175
+          },
+          "families": {
+            "trend_continuation": 207,
+            "breakout": 151
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 134,
+          "acceptance_rate": 0.03449163449163449,
+          "long": 22,
+          "short": 112,
+          "plans": 220,
+          "direction_labeled": 134,
+          "direction_hit_rate": 0.4626865671641791,
+          "mean_direction_signed_return_bps": 2.1571298119957656,
+          "entry_labeled": 134,
+          "entry_hit_rate": 0.44776119402985076,
+          "mean_entry_signed_return_bps": 0.29683054508072265,
+          "mean_mfe_atr": 0.6492749134681639,
+          "mean_mae_atr": -0.6285276738897678,
+          "reject_counts": {
+            "direction_below_threshold": 2766,
+            "insufficient_data:pa_h1": 658,
+            "entry_below_threshold": 300,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "ambiguous_pa:M15": 25,
+            "plan:no_pullback_anchor": 23,
+            "strong_timeframe_conflict": 9,
+            "plan:low_reward_risk": 6,
+            "barbwire:H1": 4,
+            "barbwire:M15": 2
+          },
+          "plan_styles": {
+            "pa_primary": 111,
+            "confirmation_breakout": 109
+          },
+          "order_types": {
+            "market": 111,
+            "stop": 109
+          },
+          "families": {
+            "trend_continuation": 145,
+            "breakout": 75
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 110,
+          "acceptance_rate": 0.028314028314028315,
+          "long": 57,
+          "short": 53,
+          "plans": 195,
+          "direction_labeled": 110,
+          "direction_hit_rate": 0.5727272727272728,
+          "mean_direction_signed_return_bps": 7.538248193011278,
+          "entry_labeled": 110,
+          "entry_hit_rate": 0.4727272727272727,
+          "mean_entry_signed_return_bps": 0.8917888205488858,
+          "mean_mfe_atr": 0.5686188668410758,
+          "mean_mae_atr": -0.4846342401823712,
+          "reject_counts": {
+            "direction_below_threshold": 2853,
+            "insufficient_data:pa_h1": 710,
+            "entry_below_threshold": 185,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "barbwire:M15": 17,
+            "plan:no_pullback_anchor": 12,
+            "ambiguous_pa:M15": 12,
+            "barbwire:H1": 8,
+            "plan:low_reward_risk": 1
+          },
+          "plan_styles": {
+            "pa_primary": 98,
+            "confirmation_breakout": 97
+          },
+          "order_types": {
+            "market": 98,
+            "stop": 97
+          },
+          "families": {
+            "trend_continuation": 119,
+            "breakout": 76
+          }
+        }
+      ]
+    },
+    {
+      "name": "with_m5_alpha",
+      "selection": {
+        "direction_modules": [
+          "alpha_h1",
+          "alpha_m15",
+          "pa_h1",
+          "pa_m15_context"
+        ],
+        "entry_modules": [
+          "alpha_m15",
+          "alpha_m5",
+          "pa_m15_pattern",
+          "pa_m5_timing"
+        ]
+      },
+      "weights": {
+        "direction": [
+          [
+            "alpha_h1",
+            0.4
+          ],
+          [
+            "pa_h1",
+            0.25
+          ],
+          [
+            "alpha_m15",
+            0.2
+          ],
+          [
+            "pa_m15_context",
+            0.15
+          ]
+        ],
+        "entry": [
+          [
+            "pa_m15_pattern",
+            0.405
+          ],
+          [
+            "pa_m5_timing",
+            0.27
+          ],
+          [
+            "alpha_m15",
+            0.225
+          ],
+          [
+            "alpha_m5",
+            0.1
+          ]
+        ]
+      },
+      "overall": {
+        "decisions": 15541,
+        "accepted": 377,
+        "acceptance_rate": 0.02425841322952191,
+        "long": 195,
+        "short": 182,
+        "plans": 654,
+        "direction_labeled": 377,
+        "direction_hit_rate": 0.5305039787798409,
+        "mean_direction_signed_return_bps": 2.0832255620681606,
+        "entry_labeled": 377,
+        "entry_hit_rate": 0.4907161803713528,
+        "mean_entry_signed_return_bps": 0.9622684523759449,
+        "mean_mfe_atr": 0.594183146320525,
+        "mean_mae_atr": -0.5269079114717025,
+        "reject_counts": {
+          "direction_below_threshold": 10386,
+          "insufficient_data:pa_h1": 3116,
+          "entry_below_threshold": 1526,
+          "ambiguous_pa:M5": 1137,
+          "insufficient_data:pa_m15_context": 779,
+          "insufficient_data:pa_m15_pattern": 779,
+          "insufficient_data:pa_m5_timing": 247,
+          "ambiguous_pa:M15": 61,
+          "plan:no_pullback_anchor": 44,
+          "barbwire:M15": 28,
+          "barbwire:M5": 28,
+          "barbwire:H1": 20,
+          "strong_timeframe_conflict": 13,
+          "plan:low_reward_risk": 7,
+          "extreme_range:M5": 1
+        },
+        "plan_styles": {
+          "pa_primary": 333,
+          "confirmation_breakout": 321
+        },
+        "order_types": {
+          "market": 333,
+          "stop": 321
+        },
+        "families": {
+          "trend_continuation": 448,
+          "breakout": 206
+        }
+      },
+      "blocks": [
+        {
+          "decisions": 3886,
+          "accepted": 91,
+          "acceptance_rate": 0.02341739577972208,
+          "long": 55,
+          "short": 36,
+          "plans": 160,
+          "direction_labeled": 91,
+          "direction_hit_rate": 0.5494505494505495,
+          "mean_direction_signed_return_bps": -0.6796285961051908,
+          "entry_labeled": 91,
+          "entry_hit_rate": 0.5604395604395604,
+          "mean_entry_signed_return_bps": 0.5383038865270294,
+          "mean_mfe_atr": 0.5545908114518211,
+          "mean_mae_atr": -0.5034004669761496,
+          "reject_counts": {
+            "direction_below_threshold": 2494,
+            "insufficient_data:pa_h1": 836,
+            "entry_below_threshold": 428,
+            "ambiguous_pa:M5": 274,
+            "insufficient_data:pa_m15_context": 209,
+            "insufficient_data:pa_m15_pattern": 209,
+            "insufficient_data:pa_m5_timing": 67,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 10,
+            "barbwire:M5": 7,
+            "barbwire:M15": 4,
+            "strong_timeframe_conflict": 3
+          },
+          "plan_styles": {
+            "pa_primary": 81,
+            "confirmation_breakout": 79
+          },
+          "order_types": {
+            "market": 81,
+            "stop": 79
+          },
+          "families": {
+            "trend_continuation": 113,
+            "breakout": 47
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 127,
+          "acceptance_rate": 0.03268983268983269,
+          "long": 84,
+          "short": 43,
+          "plans": 227,
+          "direction_labeled": 127,
+          "direction_hit_rate": 0.5275590551181102,
+          "mean_direction_signed_return_bps": 2.238019114684417,
+          "entry_labeled": 127,
+          "entry_hit_rate": 0.5196850393700787,
+          "mean_entry_signed_return_bps": 1.422296758902286,
+          "mean_mfe_atr": 0.5879905590337422,
+          "mean_mae_atr": -0.5095559704312459,
+          "reject_counts": {
+            "direction_below_threshold": 2273,
+            "insufficient_data:pa_h1": 912,
+            "entry_below_threshold": 531,
+            "ambiguous_pa:M5": 281,
+            "insufficient_data:pa_m15_context": 228,
+            "insufficient_data:pa_m15_pattern": 228,
+            "insufficient_data:pa_m5_timing": 72,
+            "ambiguous_pa:M15": 12,
+            "plan:no_pullback_anchor": 10,
+            "barbwire:H1": 8,
+            "barbwire:M5": 7,
+            "barbwire:M15": 5,
+            "strong_timeframe_conflict": 1
+          },
+          "plan_styles": {
+            "pa_primary": 117,
+            "confirmation_breakout": 110
+          },
+          "order_types": {
+            "market": 117,
+            "stop": 110
+          },
+          "families": {
+            "trend_continuation": 143,
+            "breakout": 84
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 83,
+          "acceptance_rate": 0.021364221364221364,
+          "long": 13,
+          "short": 70,
+          "plans": 132,
+          "direction_labeled": 83,
+          "direction_hit_rate": 0.4819277108433735,
+          "mean_direction_signed_return_bps": 2.2453429538580933,
+          "entry_labeled": 83,
+          "entry_hit_rate": 0.43373493975903615,
+          "mean_entry_signed_return_bps": 1.0798167214678867,
+          "mean_mfe_atr": 0.6911821397569822,
+          "mean_mae_atr": -0.6162867183412185,
+          "reject_counts": {
+            "direction_below_threshold": 2766,
+            "insufficient_data:pa_h1": 658,
+            "entry_below_threshold": 350,
+            "ambiguous_pa:M5": 300,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "ambiguous_pa:M15": 25,
+            "plan:no_pullback_anchor": 16,
+            "strong_timeframe_conflict": 9,
+            "plan:low_reward_risk": 6,
+            "barbwire:M5": 5,
+            "barbwire:H1": 4,
+            "barbwire:M15": 2
+          },
+          "plan_styles": {
+            "pa_primary": 67,
+            "confirmation_breakout": 65
+          },
+          "order_types": {
+            "market": 67,
+            "stop": 65
+          },
+          "families": {
+            "trend_continuation": 103,
+            "breakout": 29
+          }
+        },
+        {
+          "decisions": 3885,
+          "accepted": 76,
+          "acceptance_rate": 0.019562419562419563,
+          "long": 43,
+          "short": 33,
+          "plans": 135,
+          "direction_labeled": 76,
+          "direction_hit_rate": 0.5657894736842105,
+          "mean_direction_signed_return_bps": 4.955662452764818,
+          "entry_labeled": 76,
+          "entry_hit_rate": 0.42105263157894735,
+          "mean_entry_signed_return_bps": 0.5728036395966669,
+          "mean_mfe_atr": 0.5460047858369398,
+          "mean_mae_atr": -0.4864399245120116,
+          "reject_counts": {
+            "direction_below_threshold": 2853,
+            "insufficient_data:pa_h1": 710,
+            "ambiguous_pa:M5": 282,
+            "entry_below_threshold": 217,
+            "insufficient_data:pa_m15_context": 171,
+            "insufficient_data:pa_m15_pattern": 171,
+            "insufficient_data:pa_m5_timing": 54,
+            "barbwire:M15": 17,
+            "ambiguous_pa:M15": 12,
+            "barbwire:M5": 9,
+            "plan:no_pullback_anchor": 8,
+            "barbwire:H1": 8,
+            "plan:low_reward_risk": 1,
+            "extreme_range:M5": 1
+          },
+          "plan_styles": {
+            "pa_primary": 68,
+            "confirmation_breakout": 67
+          },
+          "order_types": {
+            "market": 68,
+            "stop": 67
+          },
+          "families": {
+            "trend_continuation": 89,
+            "breakout": 46
+          }
+        }
+      ]
+    }
+  ],
+  "assessment": {
+    "weight_change_recommended": false,
+    "contradicting_variants": [],
+    "rule": "at least 30 labeled accepted decisions per comparable block; hit rate +2pp, mean signed return not worse and MAE/ATR not worse in at least 3 of 4 blocks",
+    "summary_zh": "没有达到修改默认权重的预注册反证门槛，保持已批准权重。"
+  },
+  "elapsed_seconds": 517.233
+}

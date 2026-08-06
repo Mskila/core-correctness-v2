@@ -1,0 +1,51 @@
+{
+  "direction_weights": {
+    "alpha_h1": 0.4,
+    "pa_h1": 0.25,
+    "alpha_m15": 0.2,
+    "pa_m15_context": 0.15
+  },
+  "entry_weights": {
+    "pa_m15_pattern": 0.45,
+    "pa_m5_timing": 0.3,
+    "alpha_m15": 0.25
+  },
+  "plans": [
+    {
+      "plan_id": "stage2-a3a79628ef6180e0",
+      "style": "pa_primary",
+      "order_type": "market",
+      "entry_price": 100.0,
+      "stop_loss": 98.8,
+      "take_profit_1": 103.0,
+      "take_profit_2": 106.0,
+      "take_profit_1_r": 2.5,
+      "take_profit_2_r": 5.0,
+      "executable": false
+    },
+    {
+      "plan_id": "stage2-d4794b9bf4dcacc5",
+      "style": "confirmation_breakout",
+      "order_type": "stop",
+      "entry_price": 100.51,
+      "stop_loss": 98.8,
+      "take_profit_1": 106.0,
+      "take_profit_2": null,
+      "take_profit_1_r": 3.21052632,
+      "take_profit_2_r": null,
+      "executable": false
+    },
+    {
+      "plan_id": "stage2-748941e8e95757f4",
+      "style": "pullback",
+      "order_type": "limit",
+      "entry_price": 99.4,
+      "stop_loss": 98.8,
+      "take_profit_1": 103.0,
+      "take_profit_2": 106.0,
+      "take_profit_1_r": 6.0,
+      "take_profit_2_r": 11.0,
+      "executable": false
+    }
+  ]
+}
