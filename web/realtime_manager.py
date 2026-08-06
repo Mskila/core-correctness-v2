@@ -365,6 +365,16 @@ class RealtimeManager:
         src = get_source(source)
         bars = src.fetch_bars(symbol, timeframe, required_count, drop_forming=True)
         bars = _ensure_closed_bars(bars, timeframe)
+        if bars and len(bars) < required_count:
+            # 数据源通常按终端时间排除形成中的 bar，而这里还会按服务端时间
+            # 再确认一次。两端时钟或交易时段边界有偏差时会少数根，按实际
+            # 缺口补拉一次，仍坚持完整预热窗口后才计算信号。
+            shortfall = required_count - len(bars)
+            retry_count = required_count + shortfall + 2
+            bars = src.fetch_bars(
+                symbol, timeframe, retry_count, drop_forming=True
+            )
+            bars = _ensure_closed_bars(bars, timeframe)
         self._bar_cache[key] = (now, bars)
         return bars
 

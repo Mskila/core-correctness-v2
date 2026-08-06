@@ -191,7 +191,9 @@ def test_realtime_fetches_formula_warmup_and_exact_count_reaches_evaluation(
     assert task.bars_used == 744
 
 
-def test_realtime_one_short_remains_insufficient(monkeypatch, tmp_path) -> None:
+def test_realtime_refetches_when_closed_bar_filter_leaves_warmup_short(
+    monkeypatch, tmp_path
+) -> None:
     source = _DemandSource(short_by=1)
     manager = realtime.RealtimeManager()
     task = _demand_task(monkeypatch, tmp_path, manager, source)
@@ -200,13 +202,21 @@ def test_realtime_one_short_remains_insufficient(monkeypatch, tmp_path) -> None:
 
     def evaluate(formula, raw):
         count = raw["close"].shape[1]
-        return {"state": "insufficient", "bars_used": count, "message": f"{count}/4"}
+        return {
+            "state": "ok" if count >= 4 else "insufficient",
+            "direction": "LONG",
+            "strength": 0.5,
+            "position": 0.5,
+            "factor_value": 0.75,
+            "bars_used": count,
+            "message": f"{count}/4",
+        }
 
     monkeypatch.setattr(realtime, "evaluate_signal", evaluate)
     manager._evaluate_task(task)
-    assert source.requests == [4]
-    assert task.state == "insufficient"
-    assert task.bars_used == 3
+    assert source.requests == [4, 7]
+    assert task.state == "ok"
+    assert task.bars_used == 6
 
 
 def test_realtime_bar_cache_refetches_for_larger_formula_demand(
