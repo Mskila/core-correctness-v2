@@ -1,0 +1,47 @@
+{
+  "source_commit": "d92ecd827fe671a589b7fdfdbba41e5e98081d87",
+  "fixture_groups": [
+    "bar_geometry",
+    "inside_ii_iii_ioi",
+    "atr14_ema20_incremental",
+    "micro_double_ema_gap_20gb",
+    "pivot_confirmation_and_radius",
+    "swing_structure_and_levels",
+    "direction_vote_thresholds",
+    "always_in_windows",
+    "channel_pullback_boundaries",
+    "barbwire_components",
+    "breakout_failure_retest",
+    "true_h1_h2_reset",
+    "wedge_mtr_double_final_flag",
+    "causal_measured_moves",
+    "four_strategy_families",
+    "prefix_invariance"
+  ],
+  "geometry": [
+    {
+      "id": "trend_bull",
+      "row": [10.0, 12.0, 9.0, 11.8],
+      "expected": {"bar.type": "trend_bull", "bar.body_ratio": 0.6, "bar.close_position": 0.9333333333333336}
+    },
+    {
+      "id": "trend_bear",
+      "row": [12.0, 13.0, 10.0, 10.2],
+      "expected": {"bar.type": "trend_bear", "bar.body_ratio": 0.6000000000000002, "bar.close_position": 0.06666666666666643}
+    },
+    {
+      "id": "doji",
+      "row": [10.0, 11.0, 9.0, 10.2],
+      "expected": {"bar.type": "doji", "bar.body_ratio": 0.09999999999999964, "bar.close_position": 0.5999999999999996}
+    },
+    {
+      "id": "flat",
+      "row": [10.0, 10.0, 10.0, 10.0],
+      "expected": {"bar.type": "flat", "bar.body_ratio": null, "bar.close_position": null}
+    }
+  ],
+  "indicator_ramp": {
+    "closes": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+    "expected": {"atr14_index_13": 2.0, "ema20_index_19": 10.5, "ema20_index_20": 11.5}
+  }
+}
