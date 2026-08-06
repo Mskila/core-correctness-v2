@@ -21,6 +21,62 @@
       "finished_at": "2026-07-14T07:23:03.906968+00:00",
       "seconds": 13926,
       "source": "log_backfill"
+    },
+    {
+      "log_path": "logs/train_XAUUSD_20260720_061045.log",
+      "started_at": "2026-07-20T06:10:45.443822+00:00",
+      "finished_at": "2026-07-20T06:56:05.053945+00:00",
+      "seconds": 2719,
+      "source": "web_job"
+    },
+    {
+      "log_path": "logs/train_XAUUSD_20260722_025728.log",
+      "started_at": "2026-07-22T02:57:28.666977+00:00",
+      "finished_at": "2026-07-22T02:57:50.005075+00:00",
+      "seconds": 21,
+      "source": "web_job"
+    },
+    {
+      "log_path": "logs/train_XAUUSD_20260722_032408.log",
+      "started_at": "2026-07-22T03:24:08.890289+00:00",
+      "finished_at": "2026-07-22T03:35:06.207743+00:00",
+      "seconds": 657,
+      "source": "web_job"
+    },
+    {
+      "log_path": "logs/train_XAUUSD_20260722_044822.log",
+      "started_at": "2026-07-22T04:48:22.142262+00:00",
+      "finished_at": "2026-07-22T04:50:50.732690+00:00",
+      "seconds": 148,
+      "source": "web_job"
+    },
+    {
+      "log_path": "logs/train_XAUUSD_20260722_070223.log",
+      "started_at": "2026-07-22T07:02:23.906427+00:00",
+      "finished_at": "2026-07-22T07:04:17.198702+00:00",
+      "seconds": 113,
+      "source": "web_job"
+    },
+    {
+      "log_path": "logs/train_XAUUSD_20260722_070537.log",
+      "started_at": "2026-07-22T07:05:37.985436+00:00",
+      "finished_at": "2026-07-22T07:12:19.753224+00:00",
+      "seconds": 401,
+      "source": "web_job"
+    },
+    {
+      "log_path": "logs/train_XAUUSD_20260722_071344.log",
+      "started_at": "2026-07-22T07:13:44.165009+00:00",
+      "finished_at": "2026-07-22T07:25:16.513601+00:00",
+      "seconds": 692,
+      "source": "web_job"
+    },
+    {
+      "log_path": "logs/train_XAUUSD_20260722_074350.log",
+      "started_at": "2026-07-22T07:43:50.199073+00:00",
+      "finished_at": "2026-07-22T07:45:53.566144+00:00",
+      "seconds": 123,
+      "source": "web_job"
     }
   ]
 }
