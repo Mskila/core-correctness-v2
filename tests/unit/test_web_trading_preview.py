@@ -27,8 +27,8 @@ class _FakePreviewManager:
 
     def status(self):
         return {
-            "stage": 4,
-            "read_only": True,
+            "stage": 5,
+            "read_only": False,
             "execution_enabled": False,
             "running": self.running,
             "latest_decision": None,
@@ -61,15 +61,56 @@ class _FakeAccountReader:
         }
 
 
+class _FakeExecutionController:
+    def __init__(self) -> None:
+        self.enabled = False
+
+    def status(self):
+        return {
+            "execution_enabled": self.enabled,
+            "management_enabled": True,
+            "management_running": True,
+            "blocker": "" if self.enabled else "manual_enable_required",
+            "last_error": "",
+            "account": None,
+            "state": {
+                "schema_version": "trading-execution-state-v1",
+                "last_processed_m15": None,
+                "config_hash": None,
+                "cooldown_until_m15": None,
+                "managed_trade": None,
+                "receipt_count": 0,
+            },
+            "recent_receipts": [],
+        }
+
+    def enable(self, config):
+        assert config.symbol == "XAUUSD"
+        self.enabled = True
+        return self.status()
+
+    def disable(self):
+        self.enabled = False
+        return self.status()
+
+    def start_management(self):
+        return self.status()
+
+    def stop_management(self):
+        return self.status()
+
+
 def _client(monkeypatch):
     manager = _FakePreviewManager()
+    execution = _FakeExecutionController()
     monkeypatch.setattr(web_app, "trading_preview_manager", manager)
     monkeypatch.setattr(web_app, "mt5_read_only_market", _FakeAccountReader())
-    return TestClient(web_app.app), manager
+    monkeypatch.setattr(web_app, "trading_execution_controller", execution)
+    return TestClient(web_app.app), manager, execution
 
 
-def test_trading_account_config_status_and_decisions_are_read_only(monkeypatch) -> None:
-    client, manager = _client(monkeypatch)
+def test_trading_account_config_status_and_decisions_expose_stage5_state(monkeypatch) -> None:
+    client, manager, _ = _client(monkeypatch)
 
     account = client.get("/api/trading/account")
     config = client.get("/api/trading/config")
@@ -78,6 +119,7 @@ def test_trading_account_config_status_and_decisions_are_read_only(monkeypatch) 
 
     assert account.status_code == 200
     assert account.json()["execution_enabled"] is False
+    assert account.json()["management_enabled"] is True
     assert config.status_code == 200
     assert config.json()["config"]["config_hash"] == manager.config.config_hash
     assert {row["id"] for row in config.json()["catalog"]["pa_families"]} == {
@@ -86,13 +128,15 @@ def test_trading_account_config_status_and_decisions_are_read_only(monkeypatch) 
         "reversal",
         "range",
     }
-    assert status.json()["read_only"] is True
+    assert status.json()["stage"] == 5
+    assert status.json()["read_only"] is False
     assert status.json()["execution_enabled"] is False
+    assert status.json()["execution"]["blocker"] == "manual_enable_required"
     assert decisions.json() == {"decisions": [{"decision_id": "decision-1", "limit": 7}]}
 
 
 def test_config_update_and_preview_start_stop_main_flow(monkeypatch) -> None:
-    client, manager = _client(monkeypatch)
+    client, manager, _ = _client(monkeypatch)
     payload = manager.config.to_payload()
     payload.pop("config_hash")
     payload["mode"] = "rules_codex"
@@ -112,8 +156,35 @@ def test_config_update_and_preview_start_stop_main_flow(monkeypatch) -> None:
     assert stopped.json()["running"] is False
 
 
+def test_manual_enable_starts_m15_loop_and_disable_only_blocks_new_entries(monkeypatch) -> None:
+    client, manager, execution = _client(monkeypatch)
+
+    enabled = client.post("/api/trading/enable")
+    disabled = client.post("/api/trading/disable")
+
+    assert enabled.status_code == 200
+    assert enabled.json()["execution_enabled"] is True
+    assert manager.running is True
+    assert disabled.status_code == 200
+    assert disabled.json()["execution_enabled"] is False
+    assert disabled.json()["execution"]["management_enabled"] is True
+    assert execution.enabled is False
+
+
+def test_stopping_preview_also_disables_new_entries(monkeypatch) -> None:
+    client, manager, execution = _client(monkeypatch)
+    client.post("/api/trading/enable")
+
+    stopped = client.post("/api/trading/preview/stop")
+
+    assert stopped.status_code == 200
+    assert stopped.json()["running"] is False
+    assert stopped.json()["execution_enabled"] is False
+    assert execution.enabled is False
+
+
 def test_config_rejects_zero_tp1_lots(monkeypatch) -> None:
-    client, manager = _client(monkeypatch)
+    client, manager, _ = _client(monkeypatch)
     payload = manager.config.identity_payload()
     payload["tp1_lots"] = 0.0
 

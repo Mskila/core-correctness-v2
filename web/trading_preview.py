@@ -39,6 +39,7 @@ from trading_core import (
 )
 from web.settings import load_settings, save_settings
 from web.strategy_file import strategy_path_for_symbol
+from web.trading_execution import trading_execution_controller
 from web.trading_mt5 import mt5_read_only_market
 
 
@@ -55,6 +56,11 @@ class PreviewEngine(Protocol):
         config: TradingConfigV1,
         decision_close_timestamp: int,
     ) -> TradeDecisionV1:
+        ...
+
+
+class DecisionConsumer(Protocol):
+    def process_decision(self, decision: TradeDecisionV1) -> dict[str, Any]:
         ...
 
 
@@ -332,11 +338,13 @@ class TradingPreviewManager:
         settings_loader: Callable[[], dict[str, Any]] = load_settings,
         settings_saver: Callable[[dict[str, Any]], dict[str, Any]] = save_settings,
         poll_seconds: float = _POLL_SECONDS,
+        decision_consumer: DecisionConsumer | None = None,
     ) -> None:
         self.engine = engine or TradingPreviewEngine()
         self._settings_loader = settings_loader
         self._settings_saver = settings_saver
         self._poll_seconds = poll_seconds
+        self._decision_consumer = decision_consumer
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -348,6 +356,7 @@ class TradingPreviewManager:
         self._last_m15_close: int | None = None
         self._last_error = ""
         self._decisions: deque[TradeDecisionV1] = deque(maxlen=100)
+        self._execution_results: dict[str, dict[str, Any]] = {}
 
     def load_persisted(self) -> None:
         with self._lock:
@@ -428,8 +437,24 @@ class TradingPreviewManager:
             self._active_config = config
         try:
             decision = self.engine.evaluate_at(config, decision_close)
+            execution_result = None
+            if self._decision_consumer is not None:
+                raw_execution = self._decision_consumer.process_decision(decision)
+                execution_result = {
+                    "action": raw_execution.get("action"),
+                    "execution_enabled": raw_execution.get("execution_enabled", False),
+                    "receipts": list(raw_execution.get("receipts") or ()),
+                }
             with self._lock:
                 self._decisions.append(decision)
+                if execution_result is not None:
+                    self._execution_results[decision.decision_id] = execution_result
+                    retained = {row.decision_id for row in self._decisions}
+                    self._execution_results = {
+                        key: value
+                        for key, value in self._execution_results.items()
+                        if key in retained
+                    }
                 self._last_error = ""
             return True
         except Exception as exc:  # noqa: BLE001 - exactly one failed attempt per closed M15
@@ -445,12 +470,61 @@ class TradingPreviewManager:
             raise ValueError("limit must be in [1, 100]")
         with self._lock:
             selected = list(self._decisions)[-limit:]
-        return [decision.to_payload() for decision in reversed(selected)]
+            results = dict(self._execution_results)
+        return [
+            self._decision_payload(decision, results.get(decision.decision_id))
+            for decision in reversed(selected)
+        ]
+
+    @staticmethod
+    def _decision_payload(
+        decision: TradeDecisionV1,
+        execution_result: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        payload = decision.to_payload()
+        if execution_result is None:
+            return payload
+        receipts = list(execution_result.get("receipts") or ())
+        confirmed = [receipt for receipt in receipts if receipt.get("confirmed")]
+        tickets = [
+            ticket
+            for receipt in confirmed
+            for ticket in (
+                receipt.get("position_ticket"),
+                receipt.get("order_ticket"),
+            )
+            if ticket is not None
+        ]
+        latest = receipts[-1] if receipts else {}
+        action = str(execution_result.get("action") or "execution_unknown")
+        payload["final_action"] = action
+        payload["execution"] = {
+            "enabled": bool(execution_result.get("execution_enabled")),
+            "action": action,
+            "confirmed": bool(confirmed) if receipts else action in {
+                "decision_rejected",
+                "execution_disabled",
+                "no_pyramiding",
+                "reverse_cooldown",
+            },
+            "tickets": tickets,
+            "ticket": tickets[-1] if tickets else None,
+            "retcode": latest.get("retcode"),
+            "receipts": receipts,
+        }
+        return payload
 
     def status(self) -> dict[str, Any]:
         self.load_persisted()
         with self._lock:
-            latest = self._decisions[-1].to_payload() if self._decisions else None
+            latest = (
+                self._decision_payload(
+                    self._decisions[-1],
+                    self._execution_results.get(self._decisions[-1].decision_id),
+                )
+                if self._decisions
+                else None
+            )
             active_hash = (
                 None if self._active_config is None else self._active_config.config_hash
             )
@@ -471,4 +545,7 @@ class TradingPreviewManager:
 
 
 trading_preview_engine = TradingPreviewEngine()
-trading_preview_manager = TradingPreviewManager(trading_preview_engine)
+trading_preview_manager = TradingPreviewManager(
+    trading_preview_engine,
+    decision_consumer=trading_execution_controller,
+)

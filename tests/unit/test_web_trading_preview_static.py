@@ -24,7 +24,7 @@ class _Ids(HTMLParser):
             self.text.append(data.strip())
 
 
-def test_realtime_page_exposes_stage4_account_config_and_preview_controls() -> None:
+def test_realtime_page_exposes_stage5_account_config_preview_and_manual_execution() -> None:
     parser = _Ids()
     parser.feed((ROOT / "web/static/index.html").read_text(encoding="utf-8"))
 
@@ -40,15 +40,19 @@ def test_realtime_page_exposes_stage4_account_config_and_preview_controls() -> N
         "tradingSaveConfigBtn",
         "tradingStartPreviewBtn",
         "tradingStopPreviewBtn",
+        "tradingEnableBtn",
+        "tradingDisableBtn",
         "tradingPreviewStatus",
+        "tradingExecutionStatus",
         "tradingDecisionPanel",
     }.issubset(parser.ids)
     content = " ".join(parser.text)
-    assert "只读决策预览" in content
-    assert "不会发送真实订单" in content
+    assert "MT5 决策与执行" in content
+    assert "新开仓在每次启动后默认关闭" in content
+    assert "手动启用" in content
 
 
-def test_stage4_javascript_uses_only_readonly_preview_routes() -> None:
+def test_stage5_javascript_requires_manual_enable_and_exposes_disable() -> None:
     source = (ROOT / "web/static/app.js").read_text(encoding="utf-8")
 
     assert 'fetchJSON("/api/trading/account"' in source
@@ -56,11 +60,13 @@ def test_stage4_javascript_uses_only_readonly_preview_routes() -> None:
     assert 'fetchJSON("/api/trading/status"' in source
     assert 'fetchJSON("/api/trading/preview/start"' in source
     assert 'fetchJSON("/api/trading/preview/stop"' in source
-    assert "/api/trading/enable" not in source
+    assert 'fetchJSON("/api/trading/enable"' in source
+    assert 'fetchJSON("/api/trading/disable"' in source
+    assert "window.confirm" in source
     assert "order_send" not in source
 
 
-def test_stage4_javascript_is_syntax_valid() -> None:
+def test_stage5_javascript_is_syntax_valid() -> None:
     completed = subprocess.run(
         ["node", "--check", "web/static/app.js"],
         cwd=ROOT,

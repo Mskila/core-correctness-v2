@@ -88,6 +88,7 @@ train_stdout.log
 train_stderr.log
 *.log
 logs/
+trading_state/
 
 # ── 本地数据缓存（体积大，机器相关）──────────────────────────────
 data/

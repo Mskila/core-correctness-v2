@@ -2342,6 +2342,20 @@ td:nth-child(2) { color: var(--accent); font-family: var(--mono); }
 .trading-preview-status .bad { color: var(--danger); }
 .trading-preview-status .warn { color: var(--warn); }
 
+.trading-execution-status {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(8, 13, 21, 0.48);
+    color: var(--text-muted);
+    font: 0.72rem/1.55 var(--mono);
+}
+
+.trading-execution-status .good { color: var(--success); }
+.trading-execution-status .bad { color: var(--danger); }
+.trading-execution-status .warn { color: var(--warn); }
+
 .trading-decision { margin-top: 14px; }
 
 .trading-decision-head {

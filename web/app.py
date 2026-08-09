@@ -53,6 +53,7 @@ from web.backtest_manager import backtest_manager
 from web.realtime_manager import realtime_manager
 from web.data_sources.factory import list_sources
 from web.trading_mt5 import mt5_read_only_market
+from web.trading_execution import trading_execution_controller
 from web.trading_preview import trading_preview_manager
 from strategy_manager.live_signal import min_exposure
 from trading_core import (
@@ -1043,10 +1044,16 @@ def _startup_realtime() -> None:
         trading_preview_manager.load_persisted()
     except Exception as exc:  # noqa: BLE001
         log_error("trading preview load_persisted failed", exc)
+    try:
+        trading_execution_controller.start_management()
+    except Exception as exc:  # noqa: BLE001
+        log_error("trading execution management startup failed", exc)
 
 
 @app.on_event("shutdown")
 def _shutdown_trading_preview() -> None:
+    trading_execution_controller.disable()
+    trading_execution_controller.stop_management()
     trading_preview_manager.stop()
 
 
@@ -1177,7 +1184,25 @@ def _trading_config_response() -> dict[str, Any]:
 
 @app.get("/api/trading/account")
 def api_trading_account() -> dict[str, Any]:
-    return mt5_read_only_market.account_snapshot()
+    snapshot = mt5_read_only_market.account_snapshot()
+    execution = trading_execution_controller.status()
+    original_message = str(snapshot.get("message") or "")
+    execution_message = (
+        "实盘新开仓已手动启用"
+        if execution["execution_enabled"]
+        else "实盘新开仓默认关闭；已有 AlphaMaster 仓位仍会继续管理"
+    )
+    return {
+        **snapshot,
+        "read_only": False,
+        "execution_enabled": execution["execution_enabled"],
+        "management_enabled": execution["management_enabled"],
+        "message": (
+            execution_message
+            if snapshot.get("connected")
+            else f"{original_message}；{execution_message}"
+        ),
+    }
 
 
 @app.get("/api/trading/config")
@@ -1206,7 +1231,15 @@ def api_trading_config_put(req: TradingConfigRequest) -> dict[str, Any]:
 
 @app.get("/api/trading/status")
 def api_trading_status() -> dict[str, Any]:
-    return trading_preview_manager.status()
+    preview = trading_preview_manager.status()
+    execution = trading_execution_controller.status()
+    return {
+        **preview,
+        "stage": 5,
+        "read_only": False,
+        "execution_enabled": execution["execution_enabled"],
+        "execution": execution,
+    }
 
 
 @app.get("/api/trading/decisions")
@@ -1216,12 +1249,37 @@ def api_trading_decisions(limit: int = Query(default=20, ge=1, le=100)) -> dict[
 
 @app.post("/api/trading/preview/start")
 def api_trading_preview_start() -> dict[str, Any]:
-    return {"ok": True, **trading_preview_manager.start()}
+    trading_preview_manager.start()
+    return {"ok": True, **api_trading_status()}
 
 
 @app.post("/api/trading/preview/stop")
 def api_trading_preview_stop() -> dict[str, Any]:
-    return {"ok": True, **trading_preview_manager.stop()}
+    if trading_execution_controller.status()["execution_enabled"]:
+        trading_execution_controller.disable()
+    trading_preview_manager.stop()
+    return {"ok": True, **api_trading_status()}
+
+
+@app.post("/api/trading/enable")
+def api_trading_enable() -> dict[str, Any]:
+    config = TradingConfigV1.from_payload(
+        trading_preview_manager.config_state()["config"]
+    )
+    execution = trading_execution_controller.enable(config)
+    if not execution["execution_enabled"]:
+        raise HTTPException(
+            409,
+            execution["last_error"] or execution["blocker"] or "实盘启用失败",
+        )
+    trading_preview_manager.start()
+    return {"ok": True, **api_trading_status()}
+
+
+@app.post("/api/trading/disable")
+def api_trading_disable() -> dict[str, Any]:
+    trading_execution_controller.disable()
+    return {"ok": True, **api_trading_status()}
 
 
 @app.get("/api/realtime/feishu")

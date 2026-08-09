@@ -116,3 +116,30 @@ def test_manager_falls_back_to_default_when_persisted_config_is_invalid() -> Non
 
     assert state["config"]["mode"] == "rules"
     assert state["config"]["symbol"] == "XAUUSD"
+
+
+def test_new_decision_is_forwarded_once_to_execution_consumer() -> None:
+    engine = _FakeEngine()
+    consumed: list[int] = []
+
+    class _Consumer:
+        def process_decision(self, decision):
+            consumed.append(decision.decision_close_timestamp)
+            return {"action": "execution_disabled"}
+
+    manager = TradingPreviewManager(
+        engine,
+        settings_loader=lambda: {},
+        settings_saver=lambda payload: payload,
+        poll_seconds=0.01,
+        decision_consumer=_Consumer(),
+    )
+
+    assert manager.run_once() is True
+    assert manager.run_once() is False
+    engine.close = 1_800
+    assert manager.run_once() is True
+    assert consumed == [900, 1_800]
+    latest = manager.decisions(limit=1)[0]
+    assert latest["final_action"] == "execution_disabled"
+    assert latest["execution"]["enabled"] is False

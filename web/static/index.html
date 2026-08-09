@@ -487,12 +487,12 @@
         <span class="hud-corner bl"></span><span class="hud-corner br"></span>
         <div class="panel-head">
           <div>
-            <h2>PA + Alpha 只读决策预览</h2>
+            <h2>PA + Alpha · MT5 决策与执行</h2>
             <p class="trading-readonly-note" id="tradingReadOnlyNotice">
-              阶段 4 只读取本地 MT5 和已收盘 K 线，每根 M15 最多判断一次；候选单不可执行，不会发送真实订单。
+              阶段 5 每根已收盘 M15 最多判断一次。新开仓在每次启动后默认关闭，必须核对账户并手动启用；自动化测试不会发送真实订单。
             </p>
           </div>
-          <span class="trading-stage-badge">READ ONLY · STAGE 4</span>
+          <span class="trading-stage-badge">MANUAL ENABLE · STAGE 5</span>
         </div>
 
         <div class="trading-account-head">
@@ -540,11 +540,17 @@
           <button type="button" class="btn btn-secondary" id="tradingSaveConfigBtn">保存配置（下一根 M15 生效）</button>
           <button type="button" class="btn btn-primary" id="tradingStartPreviewBtn">启动只读预览</button>
           <button type="button" class="btn btn-secondary" id="tradingStopPreviewBtn">停止预览</button>
+          <button type="button" class="btn btn-danger" id="tradingEnableBtn">核对账户并启用实盘</button>
+          <button type="button" class="btn btn-secondary" id="tradingDisableBtn">停用新开仓</button>
           <span class="hint" id="tradingConfigHint">尚未加载配置</span>
         </div>
 
         <div class="trading-preview-status" id="tradingPreviewStatus">
           <span>状态：未启动</span><span>最近 M15：—</span><span>决策数：0</span>
+        </div>
+
+        <div class="trading-execution-status" id="tradingExecutionStatus">
+          <div class="metric-empty">实盘新开仓默认关闭；已有 AlphaMaster 仓位管理状态正在加载。</div>
         </div>
 
         <div class="trading-decision" id="tradingDecisionPanel">

@@ -2020,6 +2020,7 @@ let rtCountdownTimer = null;
 let tradingPreviewInited = false;
 let tradingPreviewRunning = false;
 let tradingPreviewInFlight = false;
+let tradingExecutionEnabled = false;
 
 const RT_DIR = {
   LONG: { label: "↑ 预期上涨", cls: "rt-long", color: "#4ade80" },
@@ -2263,7 +2264,7 @@ function renderTradingDecision(decision) {
       入场 ${tradingFmtNumber(plan.entry_price, 3)} · SL ${tradingFmtNumber(plan.stop_loss, 3)}<br />
       TP1 ${tradingFmtNumber(plan.take_profit_1, 3)} (${tradingFmtNumber(plan.take_profit_1_r, 2)}R) · ${tradingFmtNumber(plan.tp1_lots, 3)} 手<br />
       TP2 ${tradingFmtNumber(plan.take_profit_2, 3)} (${tradingFmtNumber(plan.take_profit_2_r, 2)}R) · ${tradingFmtNumber(plan.tp2_lots, 3)} 手<br />
-      <span>不可执行 · 未经经纪商校验</span>
+      <span>候选方案 · 实际发送前由 MT5 重新校验</span>
     </div>`;
   }).join("");
   const approved = review.verdict === "approve";
@@ -2282,6 +2283,7 @@ function renderTradingDecision(decision) {
 
 function renderTradingPreviewStatus(status) {
   tradingPreviewRunning = !!status.running;
+  tradingExecutionEnabled = !!status.execution_enabled;
   const box = $("tradingPreviewStatus");
   if (box) {
     const state = status.processing
@@ -2299,7 +2301,75 @@ function renderTradingPreviewStatus(status) {
   }
   if ($("tradingStartPreviewBtn")) $("tradingStartPreviewBtn").disabled = !!status.running;
   if ($("tradingStopPreviewBtn")) $("tradingStopPreviewBtn").disabled = !status.running;
+  if ($("tradingEnableBtn")) $("tradingEnableBtn").disabled = tradingExecutionEnabled;
+  if ($("tradingDisableBtn")) $("tradingDisableBtn").disabled = !tradingExecutionEnabled;
+  const executionBox = $("tradingExecutionStatus");
+  if (executionBox) {
+    const execution = status.execution || {};
+    const state = execution.state || {};
+    const managed = state.managed_trade;
+    const receipts = execution.recent_receipts || [];
+    const enabled = execution.execution_enabled
+      ? '<span class="good">新开仓：已手动启用</span>'
+      : '<span class="warn">新开仓：关闭</span>';
+    const management = execution.management_enabled
+      ? '<span class="good">已有系统仓位管理：启用</span>'
+      : '<span class="bad">已有系统仓位管理：不可用</span>';
+    const blocker = execution.blocker
+      ? `<span>阻塞：${escHtml(execution.blocker)}</span>`
+      : "";
+    const error = execution.last_error
+      ? `<span class="bad">${escHtml(execution.last_error)}</span>`
+      : "";
+    const trade = managed
+      ? `<span>管理中：${escHtml(managed.side)} · ${escHtml(managed.plan_id)} · TP1 ${managed.tp1_done ? "已完成" : "等待"}</span>`
+      : "<span>管理中：无 AlphaMaster 仓位</span>";
+    const latestReceipt = receipts[0]
+      ? `<span>最近回执：${escHtml(latestReceipt.action)} / ${escHtml(latestReceipt.retcode)} / ${latestReceipt.confirmed ? "已查询确认" : "未确认"}</span>`
+      : "<span>最近回执：—</span>";
+    executionBox.innerHTML = `${enabled} · ${management}<br />${trade}<br />${latestReceipt}${blocker ? `<br />${blocker}` : ""}${error ? `<br />${error}` : ""}`;
+  }
   renderTradingDecision(status.latest_decision);
+}
+
+async function enableTradingExecution() {
+  const confirmed = window.confirm(
+    "将使用页面当前配置连接默认 MT5 终端，并允许后续合格 M15 决策发送真实订单。请确认账户、服务器和手数均正确。是否继续？"
+  );
+  if (!confirmed) return;
+  const button = $("tradingEnableBtn");
+  if (button) button.disabled = true;
+  try {
+    renderTradingPreviewStatus(
+      await fetchJSON("/api/trading/enable", { method: "POST" })
+    );
+    await refreshTradingAccount();
+  } catch (e) {
+    const hint = $("tradingConfigHint");
+    if (hint) {
+      hint.textContent = `实盘未启用：${e.message}`;
+      hint.classList.remove("good");
+      hint.classList.add("bad");
+    }
+    await refreshTradingPreview();
+  } finally {
+    if (button) button.disabled = tradingExecutionEnabled;
+  }
+}
+
+async function disableTradingExecution() {
+  try {
+    renderTradingPreviewStatus(
+      await fetchJSON("/api/trading/disable", { method: "POST" })
+    );
+    await refreshTradingAccount();
+  } catch (e) {
+    const hint = $("tradingConfigHint");
+    if (hint) {
+      hint.textContent = `停用失败：${e.message}`;
+      hint.classList.add("bad");
+    }
+  }
 }
 
 async function refreshTradingPreview() {
@@ -2915,6 +2985,8 @@ async function init() {
   if ($("tradingSaveConfigBtn")) $("tradingSaveConfigBtn").addEventListener("click", saveTradingConfig);
   if ($("tradingStartPreviewBtn")) $("tradingStartPreviewBtn").addEventListener("click", startTradingPreview);
   if ($("tradingStopPreviewBtn")) $("tradingStopPreviewBtn").addEventListener("click", stopTradingPreview);
+  if ($("tradingEnableBtn")) $("tradingEnableBtn").addEventListener("click", enableTradingExecution);
+  if ($("tradingDisableBtn")) $("tradingDisableBtn").addEventListener("click", disableTradingExecution);
   if ($("rtFeishuSaveBtn")) $("rtFeishuSaveBtn").addEventListener("click", saveRtFeishuSettings);
   if ($("rtFeishuTestBtn")) $("rtFeishuTestBtn").addEventListener("click", testRtFeishu);
   if ($("rtFeishuHelpBtn")) $("rtFeishuHelpBtn").addEventListener("click", openRtFeishuHelpModal);
