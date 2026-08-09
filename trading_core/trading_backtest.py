@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from .decision_reviewer import (
@@ -25,10 +26,15 @@ from .decision_reviewer import (
 )
 from model_core.walk_forward import formula_warmup_bars
 
-from .alpha_adapter import load_alpha_strategy
+from .alpha_adapter import (
+    evaluate_alpha_observation,
+    evaluate_alpha_observations_causal_prefix,
+    load_alpha_strategy,
+)
 from .live import TradingConfigV1
 from .models import (
     ClosedBarV1,
+    AlphaObservationV1,
     InstrumentConstraintsV1,
     LoadedAlphaStrategyV1,
     OrderPlanCandidateV1,
@@ -42,6 +48,33 @@ BACKTEST_REPORT_VERSION = "trading-backtest-report-v1"
 REVIEW_CACHE_VERSION = "decision-review-cache-v1"
 REVIEW_SCHEMA_VERSION = "decision-review-v1"
 REVIEW_PROMPT_CONTRACT_VERSION = "closed-world-review-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class _PrecomputedAlphaProvider:
+    observations: Mapping[tuple[str, int], AlphaObservationV1]
+    fallback_timeframes: frozenset[str]
+
+    def __call__(
+        self,
+        strategy: LoadedAlphaStrategyV1,
+        series: TimeframeSeriesV1,
+        *,
+        decision_close_timestamp: int,
+    ) -> AlphaObservationV1:
+        if strategy.timeframe in self.fallback_timeframes:
+            return evaluate_alpha_observation(
+                strategy,
+                series,
+                decision_close_timestamp=decision_close_timestamp,
+            )
+        observation = self.observations[(strategy.timeframe, decision_close_timestamp)]
+        if observation.strategy_fingerprint != strategy.strategy_fingerprint:
+            raise ValueError("precomputed Alpha strategy identity mismatch")
+        latest_close = bar_close_timestamp(series.bars[-1], series.timeframe)
+        if observation.bar_close_timestamp != latest_close:
+            raise ValueError("precomputed Alpha close does not match the causal series")
+        return observation
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,6 +755,63 @@ class TradingBacktestRunner:
         return window, series
 
     @staticmethod
+    def _precompute_alpha_provider(
+        *,
+        series: Mapping[str, TimeframeSeriesV1],
+        strategies: Mapping[str, LoadedAlphaStrategyV1],
+        decision_closes: tuple[int, ...],
+        stop_event: Event,
+    ) -> _PrecomputedAlphaProvider | None:
+        observations: dict[tuple[str, int], AlphaObservationV1] = {}
+        fallback_timeframes: set[str] = set()
+        for timeframe in ("H1", "M15", "M5"):
+            strategy = strategies.get(timeframe)
+            if strategy is None:
+                continue
+            if stop_event.is_set():
+                return None
+            source = series[timeframe]
+            bar_closes = tuple(
+                bar_close_timestamp(bar, timeframe) for bar in source.bars
+            )
+            cursor = -1
+            indices_by_decision: list[int] = []
+            for decision_close in decision_closes:
+                while (
+                    cursor + 1 < len(bar_closes)
+                    and bar_closes[cursor + 1] <= decision_close
+                ):
+                    cursor += 1
+                if cursor < 0:
+                    fallback_timeframes.add(timeframe)
+                    break
+                indices_by_decision.append(cursor)
+            if timeframe in fallback_timeframes:
+                continue
+            unique_indices = tuple(dict.fromkeys(indices_by_decision))
+            try:
+                values = evaluate_alpha_observations_causal_prefix(
+                    strategy,
+                    source,
+                    end_indices=unique_indices,
+                )
+            except Exception:  # noqa: BLE001 - preserve exact live warning fallback
+                fallback_timeframes.add(timeframe)
+                continue
+            if len(values) != len(unique_indices):
+                fallback_timeframes.add(timeframe)
+                continue
+            by_index = dict(zip(unique_indices, values, strict=True))
+            for decision_close, end_index in zip(
+                decision_closes, indices_by_decision, strict=True
+            ):
+                observations[(timeframe, decision_close)] = by_index[end_index]
+        return _PrecomputedAlphaProvider(
+            observations=MappingProxyType(observations),
+            fallback_timeframes=frozenset(fallback_timeframes),
+        )
+
+    @staticmethod
     def _selected_plan(decision: Any) -> OrderPlanCandidateV1 | None:
         selected = decision.review.selected_plan_id
         return next((plan for plan in decision.plans if plan.plan_id == selected), None)
@@ -784,6 +874,15 @@ class TradingBacktestRunner:
         reviewer_identity = self._reviewer_identity()
         report["reviewer_identity"] = reviewer_identity
 
+        alpha_provider = self._precompute_alpha_provider(
+            series=series,
+            strategies=frozen_strategies,
+            decision_closes=decision_closes,
+            stop_event=stop_event,
+        )
+        if alpha_provider is None:
+            return None
+
         m5_bars = tuple(
             (bar_close_timestamp(bar, "M5"), bar)
             for bar in series["M5"].bars
@@ -814,11 +913,19 @@ class TradingBacktestRunner:
                     raise ValueError(f"frozen strategy unavailable: {symbol} {timeframe}")
                 return frozen_strategies[timeframe]
 
-            engine = factory(
-                market=replay,
-                reviewer_factory=reviewer_factory,
-                strategy_loader=frozen_strategy_loader,
-            )
+            if self.preview_engine_factory is None:
+                engine = TradingPreviewEngine(
+                    market=replay,
+                    reviewer_factory=reviewer_factory,
+                    strategy_loader=frozen_strategy_loader,
+                    alpha_observation_provider=alpha_provider,
+                )
+            else:
+                engine = factory(
+                    market=replay,
+                    reviewer_factory=reviewer_factory,
+                    strategy_loader=frozen_strategy_loader,
+                )
             mode_config = replace(config, mode=mode)
             simulator = HistoricalExecutionSimulator(
                 mode_config, spread_points=self.spread_points

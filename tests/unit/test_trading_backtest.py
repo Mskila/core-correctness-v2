@@ -10,9 +10,11 @@ import pytest
 
 from trading_core import (
     APPROVED_SELECTED_PLAN,
+    AlphaObservationV1,
     ClosedBarV1,
     DecisionReviewV1,
     InstrumentConstraintsV1,
+    LoadedAlphaStrategyV1,
     OrderPlanCandidateV1,
     TimeframeSeriesV1,
     TradingConfigV1,
@@ -680,6 +682,147 @@ def test_runner_resolves_formula_warmup_before_fetch(monkeypatch, tmp_path) -> N
     assert warmups == {"H1": 2137, "M15": 2137, "M5": 384}
     assert identities["H1"]["strategy_fingerprint"] == "strategy-H1"
     assert frozen["H1"].strategy_fingerprint == "strategy-H1"
+
+
+def test_runner_precomputes_alpha_once_per_enabled_timeframe(monkeypatch, tmp_path) -> None:
+    import threading
+    import trading_core.trading_backtest as module
+
+    closes = (3_600, 4_500, 5_400)
+    series = {
+        timeframe: TimeframeSeriesV1(
+            "XAUUSD",
+            timeframe,
+            tuple(
+                _bar(close - duration, 99, 101)
+                for close in range(duration, 5_401, duration)
+            ),
+            0.01,
+        )
+        for timeframe, duration in (("H1", 3_600), ("M15", 900), ("M5", 300))
+    }
+    strategies = {
+        timeframe: LoadedAlphaStrategyV1(
+            symbol="XAUUSD",
+            timeframe=timeframe,
+            formula_tokens=(1,),
+            strategy_fingerprint=f"strategy-{timeframe}",
+            dataset_fingerprint=f"dataset-{timeframe}",
+            best_score=1.0,
+        )
+        for timeframe in ("H1", "M15")
+    }
+    calls: list[tuple[str, tuple[int, ...]]] = []
+    single_calls: list[str] = []
+
+    def fake_causal(strategy, source, *, end_indices):
+        calls.append((source.timeframe, end_indices))
+        return tuple(
+            AlphaObservationV1(
+                symbol=source.symbol,
+                timeframe=source.timeframe,
+                bar_close_timestamp=bar_close_timestamp(
+                    source.bars[index], source.timeframe
+                ),
+                strategy_fingerprint=strategy.strategy_fingerprint,
+                position=0.25,
+                strength=0.25,
+                factor_value=1.0,
+                bars_used=1,
+            )
+            for index in end_indices
+        )
+
+    monkeypatch.setattr(module, "evaluate_alpha_observations_causal_prefix", fake_causal)
+    monkeypatch.setattr(
+        module,
+        "evaluate_alpha_observation",
+        lambda *args, **kwargs: single_calls.append("unexpected"),
+    )
+    runner = TradingBacktestRunner(market=object(), output_dir=tmp_path)
+
+    provider = runner._precompute_alpha_provider(
+        series=series,
+        strategies=strategies,
+        decision_closes=closes,
+        stop_event=threading.Event(),
+    )
+
+    assert provider is not None
+    assert calls == [("H1", (0,)), ("M15", (3, 4, 5))]
+    served = 0
+    for timeframe in ("H1", "M15"):
+        observations = [
+            provider(
+                strategies[timeframe],
+                replace(
+                    series[timeframe],
+                    bars=tuple(
+                        bar
+                        for bar in series[timeframe].bars
+                        if bar_close_timestamp(bar, timeframe) <= close
+                    ),
+                ),
+                decision_close_timestamp=close,
+            )
+            for close in closes
+        ]
+        assert all(observation.timeframe == timeframe for observation in observations)
+        served += len(observations)
+    assert served == len(closes) * len(strategies)
+    assert single_calls == []
+
+
+def test_runner_alpha_precompute_failure_falls_back_to_exact_live_path(
+    monkeypatch, tmp_path
+) -> None:
+    import threading
+    import trading_core.trading_backtest as module
+
+    source = TimeframeSeriesV1(
+        "XAUUSD",
+        "M15",
+        tuple(_bar(close - 900, 99, 101) for close in (900, 1_800)),
+        0.01,
+    )
+    strategy = LoadedAlphaStrategyV1(
+        symbol="XAUUSD",
+        timeframe="M15",
+        formula_tokens=(1,),
+        strategy_fingerprint="strategy-M15",
+        dataset_fingerprint="dataset-M15",
+        best_score=1.0,
+    )
+    batch_calls: list[str] = []
+    live_calls: list[int] = []
+
+    def failed_batch(*args, **kwargs):
+        batch_calls.append("M15")
+        raise ValueError("batch failed")
+
+    def failed_live(strategy, series, *, decision_close_timestamp):
+        live_calls.append(decision_close_timestamp)
+        raise ValueError("exact live failure")
+
+    monkeypatch.setattr(module, "evaluate_alpha_observations_causal_prefix", failed_batch)
+    monkeypatch.setattr(module, "evaluate_alpha_observation", failed_live)
+    runner = TradingBacktestRunner(market=object(), output_dir=tmp_path)
+    provider = runner._precompute_alpha_provider(
+        series={"H1": source, "M15": source, "M5": source},
+        strategies={"M15": strategy},
+        decision_closes=(900, 1_800),
+        stop_event=threading.Event(),
+    )
+
+    assert provider is not None
+    with pytest.raises(ValueError, match="exact live failure"):
+        provider(
+            strategy,
+            replace(source, bars=source.bars[:1]),
+            decision_close_timestamp=900,
+        )
+    assert batch_calls == ["M15"]
+    assert live_calls == [900]
 
 
 def test_runner_end_to_end_reuses_one_engine_and_never_exposes_future(monkeypatch, tmp_path) -> None:

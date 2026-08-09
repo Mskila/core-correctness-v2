@@ -15,6 +15,7 @@ from trading_core import (
     ALPHA_H1,
     ALPHA_M15,
     M5_ALPHA,
+    AlphaObservationV1,
     CandidateFreshnessStateV1,
     CodexDecisionReviewer,
     DecisionReviewer,
@@ -124,11 +125,13 @@ class TradingPreviewEngine:
         strategy_resolver: Callable[[str, str], Path] = _default_strategy_resolver,
         reviewer_factory: Callable[[str], DecisionReviewer] | None = None,
         strategy_loader: Callable[[str, str], LoadedAlphaStrategyV1] | None = None,
+        alpha_observation_provider: Callable[..., AlphaObservationV1] | None = None,
     ) -> None:
         self.market = market
         self.strategy_resolver = strategy_resolver
         self.reviewer_factory = reviewer_factory or self._default_reviewer
         self.strategy_loader = strategy_loader
+        self.alpha_observation_provider = alpha_observation_provider
         self._reviewers: dict[str, DecisionReviewer] = {}
         self._m15_freshness = CandidateFreshnessStateV1()
         self._m5_freshness = CandidateFreshnessStateV1()
@@ -219,7 +222,10 @@ class TradingPreviewEngine:
             if strategy is None:
                 return None
             try:
-                return evaluate_alpha_observation(
+                provider = (
+                    self.alpha_observation_provider or evaluate_alpha_observation
+                )
+                return provider(
                     strategy,
                     series,
                     decision_close_timestamp=decision_close_timestamp,
