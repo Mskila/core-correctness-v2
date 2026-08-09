@@ -115,7 +115,11 @@ def align_decision_frame(
     aligned_m5 = _aligned(m5, decision_close_timestamp)
     if aligned_m15.last_close_timestamp != decision_close_timestamp:
         raise ValueError("M15 does not contain the exact decision close")
-    if aligned_m5.last_close_timestamp != decision_close_timestamp:
+    m15_interval_start = decision_close_timestamp - TIMEFRAME_SECONDS["M15"]
+    if (
+        aligned_m5.last_close_timestamp != decision_close_timestamp
+        and aligned_m5.last_close_timestamp <= m15_interval_start
+    ):
         raise ValueError("M5 does not contain the exact decision close")
     return AlignedDecisionFrameV1(
         symbol=symbol,

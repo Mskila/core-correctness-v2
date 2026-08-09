@@ -63,7 +63,7 @@ def test_alignment_uses_bar_close_time_and_excludes_future_tail() -> None:
     assert extended == frame
 
 
-def test_alignment_requires_exact_closed_m15_and_m5_boundary() -> None:
+def test_alignment_requires_exact_m15_and_current_m5_boundary() -> None:
     with pytest.raises(ValueError, match="M15.*decision close"):
         align_decision_frame(
             symbol="XAUUSD",
@@ -79,8 +79,48 @@ def test_alignment_requires_exact_closed_m15_and_m5_boundary() -> None:
             decision_close_timestamp=4_500,
             h1=_series("H1", 0),
             m15=_series("M15", 3_600),
-            m5=_series("M5", 3_900),
+            m5=_series("M5", 3_300),
         )
+
+
+def test_alignment_accepts_partial_session_m5_close_inside_m15_interval() -> None:
+    decision_close = 4_500
+
+    frame = align_decision_frame(
+        symbol="XAUUSD",
+        decision_close_timestamp=decision_close,
+        h1=_series("H1", 0),
+        m15=_series("M15", 3_600),
+        m5=_series("M5", 3_900),
+    )
+
+    assert [bar.timestamp for bar in frame.m5.bars] == [3_900]
+    assert frame.m5.last_close_timestamp == 4_200
+
+
+def test_alignment_rejects_no_m5_data() -> None:
+    with pytest.raises(ValueError, match="M5 has no closed bars"):
+        align_decision_frame(
+            symbol="XAUUSD",
+            decision_close_timestamp=4_500,
+            h1=_series("H1", 0),
+            m15=_series("M15", 3_600),
+            m5=_series("M5"),
+        )
+
+
+def test_partial_session_alignment_excludes_future_m5_tail() -> None:
+    decision_close = 4_500
+    frame = align_decision_frame(
+        symbol="XAUUSD",
+        decision_close_timestamp=decision_close,
+        h1=_series("H1", 0, 3_600),
+        m15=_series("M15", 3_600, 4_500),
+        m5=_series("M5", 3_900, 4_500),
+    )
+
+    assert [bar.timestamp for bar in frame.m5.bars] == [3_900]
+    assert frame.m5.last_close_timestamp == 4_200
 
 
 def test_pa_continuity_bridges_only_recorded_short_market_closure() -> None:
