@@ -235,9 +235,17 @@ class HistoricalExecutionSimulator:
         self.pa_family_distribution: dict[str, int] = {}
 
     def _new_trade(self, plan: OrderPlanCandidateV1, close: int, filled: bool) -> _Trade:
+        if self.config.tp2_lots > 0 and (
+            plan.take_profit_2 is None
+            or plan.take_profit_2_r is None
+            or plan.take_profit_2_r <= 0
+        ):
+            raise ValueError("configured TP2 volume requires a complete TP2 target and R")
         legs = [_Leg("tp1", self.config.tp1_lots, plan.take_profit_1, plan.stop_loss)]
-        if self.config.tp2_lots > 0 and plan.take_profit_2 is not None:
-            legs.append(_Leg("tp2", self.config.tp2_lots, plan.take_profit_2, plan.stop_loss))
+        if self.config.tp2_lots > 0:
+            legs.append(
+                _Leg("tp2", self.config.tp2_lots, float(plan.take_profit_2), plan.stop_loss)
+            )
         return _Trade(plan, close, filled, plan.order_type != "stop_limit", legs)
 
     def submit(
@@ -283,8 +291,14 @@ class HistoricalExecutionSimulator:
             self._expire_pending()
 
     @staticmethod
-    def _touch(bar: ClosedBarV1, price: float) -> bool:
-        return bar.low <= price <= bar.high
+    def _stop_hit(plan: OrderPlanCandidateV1, bar: ClosedBarV1, stop: float) -> bool:
+        return bar.low <= stop if plan.side == "long" else bar.high >= stop
+
+    @staticmethod
+    def _target_hit(
+        plan: OrderPlanCandidateV1, bar: ClosedBarV1, target: float
+    ) -> bool:
+        return bar.high >= target if plan.side == "long" else bar.low <= target
 
     def _pending_fills(self, trade: _Trade, bar: ClosedBarV1) -> bool:
         plan = trade.plan
@@ -327,7 +341,7 @@ class HistoricalExecutionSimulator:
         if not active:
             return
         stop = active[0].stop
-        if self._touch(bar, stop):
+        if self._stop_hit(plan, bar, stop):
             self.counts["sl"] += 1
             for leg in active:
                 leg.result_r = self._r_at(plan, stop)
@@ -335,7 +349,7 @@ class HistoricalExecutionSimulator:
             self.position = None
             return
         tp1 = next((leg for leg in active if leg.name == "tp1"), None)
-        if tp1 is not None and self._touch(bar, tp1.target):
+        if tp1 is not None and self._target_hit(plan, bar, tp1.target):
             tp1.result_r = plan.take_profit_1_r
             self.counts["tp1"] += 1
             self._record_leg(active_trade, tp1, "tp1")
@@ -346,7 +360,7 @@ class HistoricalExecutionSimulator:
                         if plan.side == "long"
                         else plan.entry_price - self.spread_points
                     )
-                    if self._touch(bar, leg.stop):
+                    if self._stop_hit(plan, bar, leg.stop):
                         leg.result_r = self._r_at(plan, leg.stop)
                         self.counts["sl"] += 1
                         self._record_leg(active_trade, leg, "sl")
@@ -354,7 +368,7 @@ class HistoricalExecutionSimulator:
             (leg for leg in active_trade.legs if leg.name == "tp2" and leg.result_r is None),
             None,
         )
-        if tp2 is not None and self._touch(bar, tp2.target):
+        if tp2 is not None and self._target_hit(plan, bar, tp2.target):
             tp2.result_r = float(plan.take_profit_2_r)
             self.counts["tp2"] += 1
             self._record_leg(active_trade, tp2, "tp2")
@@ -395,19 +409,28 @@ class HistoricalExecutionSimulator:
         self.position = None
 
     def snapshot(self) -> dict[str, Any]:
-        contributions_by_trade: dict[tuple[int, str], float] = {}
+        contributions_by_trade: dict[tuple[int, str], dict[str, Any]] = {}
         for row in self.results:
             key = (int(row["decision_close"]), str(row["plan_id"]))
-            contributions_by_trade[key] = contributions_by_trade.get(key, 0.0) + float(
-                row["r_contribution"]
+            trade = contributions_by_trade.setdefault(
+                key,
+                {
+                    "decision_close": key[0],
+                    "plan_id": key[1],
+                    "side": str(row["side"]),
+                    "r": 0.0,
+                },
             )
-        values = list(contributions_by_trade.values())
+            trade["r"] = float(trade["r"]) + float(row["r_contribution"])
+        realized_trades = [contributions_by_trade[key] for key in sorted(contributions_by_trade)]
+        values = [float(trade["r"]) for trade in realized_trades]
         return {
             **self.counts,
             "side_distribution": dict(self.side_distribution),
             "order_type_distribution": dict(self.order_type_distribution),
             "pa_family_distribution": dict(self.pa_family_distribution),
             "realized_legs": list(self.results),
+            "realized_trades": realized_trades,
             "basic_r": {
                 "total": sum(values),
                 "average": sum(values) / len(values) if values else 0.0,
@@ -563,6 +586,7 @@ class TradingBacktestRunner:
             "reverse_exit": 0,
             "stop_limit_triggered": 0,
             "realized_legs": [],
+            "realized_trades": [],
             "basic_r": {"total": 0.0, "average": 0.0, "wins": 0, "losses": 0, "flat": 0},
             "open_at_end": 0,
         }
@@ -574,7 +598,9 @@ class TradingBacktestRunner:
             CODEX_REVIEW_MODEL,
             CODEX_SDK_VERSION,
             CODEX_SERVICE_TIER,
+            OpenAICodexRuntime,
         )
+        from .decision_reviewer import CodexDecisionReviewer
 
         return {
             "sdk_version": CODEX_SDK_VERSION,
@@ -584,6 +610,13 @@ class TradingBacktestRunner:
             "review_schema_version": REVIEW_SCHEMA_VERSION,
             "cache_schema_version": REVIEW_CACHE_VERSION,
             "prompt_contract_version": REVIEW_PROMPT_CONTRACT_VERSION,
+            "reviewer_implementation": (
+                f"{CodexDecisionReviewer.__module__}."
+                f"{CodexDecisionReviewer.__qualname__}"
+            ),
+            "runtime_implementation": (
+                f"{OpenAICodexRuntime.__module__}.{OpenAICodexRuntime.__qualname__}"
+            ),
         }
 
     @classmethod

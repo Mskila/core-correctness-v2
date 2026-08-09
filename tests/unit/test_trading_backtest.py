@@ -152,6 +152,31 @@ def test_cached_reviewer_rejects_identity_mismatch(tmp_path, decision_request) -
         asyncio.run(changed.review(decision_request))
 
 
+@pytest.mark.parametrize(
+    "changed_key", ["reviewer_implementation", "runtime_implementation"]
+)
+def test_cached_reviewer_rejects_concrete_implementation_change(
+    tmp_path, decision_request, changed_key
+) -> None:
+    cache_path = tmp_path / "reviews.json"
+    identity = {
+        "reviewer_implementation": "package.CodexDecisionReviewerV1",
+        "runtime_implementation": "package.OpenAICodexRuntimeV1",
+    }
+    asyncio.run(
+        CachedDecisionReviewer(
+            _Reviewer(), cache_path, reviewer_identity=identity
+        ).review(decision_request)
+    )
+    changed = {**identity, changed_key: f"changed.{changed_key}"}
+    with pytest.raises(ValueError, match="reviewer identity"):
+        asyncio.run(
+            CachedDecisionReviewer(
+                _Reviewer(), cache_path, reviewer_identity=changed
+            ).review(decision_request)
+        )
+
+
 def test_cached_hybrid_non_candidate_never_calls_underlying(tmp_path, decision_request) -> None:
     reviewer = _Reviewer()
     # Rebuild because decision_id binds the complete canonical request.
@@ -186,6 +211,93 @@ def test_market_fill_and_adverse_first_same_m5_bar() -> None:
     assert result["sl"] == 1
     assert result["tp1"] == 0
     assert result["basic_r"]["total"] == -1.0
+
+
+@pytest.mark.parametrize(
+    ("side", "bar"),
+    [
+        ("long", _bar(900, 89.0, 92.0, 90.0)),
+        ("short", _bar(900, 108.0, 111.0, 110.0)),
+    ],
+)
+def test_gap_through_stop_exits_at_stated_stop_for_both_sides(side, bar) -> None:
+    sim = HistoricalExecutionSimulator(TradingConfigV1.default(), spread_points=0.0)
+    sim.submit(_plan(side=side), decision_close=900)
+    sim.process_bar(bar, close_timestamp=1200)
+    result = sim.finish()
+    assert result["sl"] == 1
+    assert result["open_at_end"] == 0
+    assert result["basic_r"]["total"] == -1.0
+
+
+@pytest.mark.parametrize(
+    ("side", "bar"),
+    [
+        ("long", _bar(900, 103.0, 106.0, 104.0)),
+        ("short", _bar(900, 94.0, 97.0, 96.0)),
+    ],
+)
+def test_gap_through_target_exits_at_stated_target_for_both_sides(side, bar) -> None:
+    sim = HistoricalExecutionSimulator(TradingConfigV1.default(), spread_points=0.0)
+    sim.submit(_plan(side=side), decision_close=900)
+    sim.process_bar(bar, close_timestamp=1200)
+    result = sim.finish()
+    assert result["tp1"] == 1
+    assert result["sl"] == 0
+    assert result["open_at_end"] == 0
+    assert result["basic_r"]["total"] == 1.0
+
+
+def test_gap_bar_touching_stop_and_target_remains_adverse_first() -> None:
+    sim = HistoricalExecutionSimulator(TradingConfigV1.default(), spread_points=0.0)
+    sim.submit(_plan(), decision_close=900)
+    sim.process_bar(_bar(900, 89.0, 106.0, 100.0), close_timestamp=1200)
+    result = sim.finish()
+    assert result["sl"] == 1
+    assert result["tp1"] == 0
+    assert result["basic_r"]["total"] == -1.0
+
+
+def test_post_tp1_break_even_gap_is_detected_adverse_first() -> None:
+    config = replace(TradingConfigV1.default(), tp1_lots=0.01, tp2_lots=0.01)
+    sim = HistoricalExecutionSimulator(config, spread_points=0.2)
+    sim.submit(_plan(), decision_close=900)
+    sim.process_bar(_bar(900, 100.3, 102.5, 101.0), close_timestamp=1200)
+    sim.process_bar(_bar(1200, 95.0, 99.0, 97.0), close_timestamp=1500)
+    result = sim.finish()
+    assert result["tp1"] == 1
+    assert result["sl"] == 1
+    assert [row["exit"] for row in result["realized_legs"]] == ["tp1", "sl"]
+
+
+@pytest.mark.parametrize(
+    ("side", "tp1_bar", "tp2_gap_bar"),
+    [
+        (
+            "long",
+            _bar(900, 100.1, 103.0, 101.0),
+            _bar(1200, 105.0, 107.0, 106.0),
+        ),
+        (
+            "short",
+            _bar(900, 97.5, 99.5, 99.0),
+            _bar(1200, 92.0, 95.0, 94.0),
+        ),
+    ],
+)
+def test_tp2_gap_through_after_tp1_exits_at_stated_target(
+    side, tp1_bar, tp2_gap_bar
+) -> None:
+    config = replace(TradingConfigV1.default(), tp1_lots=0.01, tp2_lots=0.01)
+    sim = HistoricalExecutionSimulator(config, spread_points=0.0)
+    sim.submit(_plan(side=side), decision_close=900)
+    sim.process_bar(tp1_bar, close_timestamp=1200)
+    sim.process_bar(tp2_gap_bar, close_timestamp=1500)
+    result = sim.finish()
+    assert result["tp1"] == 1
+    assert result["tp2"] == 1
+    assert result["sl"] == 0
+    assert result["basic_r"]["total"] == 1.5
 
 
 @pytest.mark.parametrize(
@@ -306,6 +418,63 @@ def test_two_leg_stop_is_one_exit_event_with_two_leg_results() -> None:
     assert result["basic_r"]["total"] == -1.0
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"take_profit_2": None},
+        {"take_profit_2_r": None},
+    ],
+)
+def test_configured_tp2_requires_complete_plan_before_counters_mutate(changes) -> None:
+    config = replace(TradingConfigV1.default(), tp1_lots=0.01, tp2_lots=0.02)
+    incomplete = replace(_plan(), **changes)
+    sim = HistoricalExecutionSimulator(config, spread_points=0.0)
+    with pytest.raises(ValueError, match="TP2"):
+        sim.submit(incomplete, decision_close=900)
+    result = sim.snapshot()
+    assert result["placed"] == 0
+    assert result["filled"] == 0
+    assert sim.position is None and sim.pending is None
+
+
+def test_missing_tp2_is_valid_when_tp2_volume_is_zero() -> None:
+    incomplete = replace(_plan(), take_profit_2=None, take_profit_2_r=None)
+    sim = HistoricalExecutionSimulator(TradingConfigV1.default(), spread_points=0.0)
+    assert sim.submit(incomplete, decision_close=900) == "placed"
+    assert sim.snapshot()["filled"] == 1
+
+
+def test_realized_trades_keep_same_plan_id_at_distinct_decision_closes() -> None:
+    sim = HistoricalExecutionSimulator(TradingConfigV1.default(), spread_points=0.0)
+    plan = _plan()
+    sim.submit(plan, decision_close=900)
+    sim.process_bar(_bar(900, 100.0, 103.0, 101.0), close_timestamp=1200)
+    sim.submit(plan, decision_close=1800)
+    sim.process_bar(_bar(1800, 100.0, 103.0, 101.0), close_timestamp=2100)
+    result = sim.finish()
+    assert result["realized_trades"] == [
+        {
+            "decision_close": 900,
+            "plan_id": plan.plan_id,
+            "side": "long",
+            "r": 1.0,
+        },
+        {
+            "decision_close": 1800,
+            "plan_id": plan.plan_id,
+            "side": "long",
+            "r": 1.0,
+        },
+    ]
+    assert result["basic_r"] == {
+        "total": 2.0,
+        "average": 1.0,
+        "wins": 2,
+        "losses": 0,
+        "flat": 0,
+    }
+
+
 def test_report_has_required_identity_and_atomic_latest(tmp_path) -> None:
     report = {
         "schema_version": "trading-backtest-report-v1",
@@ -362,6 +531,7 @@ def test_runner_builds_complete_mode_report_with_identity(monkeypatch, tmp_path)
         "sl",
         "reverse_exit",
         "realized_legs",
+        "realized_trades",
         "basic_r",
         "open_at_end",
     }
@@ -381,7 +551,15 @@ def test_runner_builds_complete_mode_report_with_identity(monkeypatch, tmp_path)
         "review_schema_version",
         "cache_schema_version",
         "prompt_contract_version",
+        "reviewer_implementation",
+        "runtime_implementation",
     } <= set(report["reviewer_identity"])
+    assert report["reviewer_identity"]["reviewer_implementation"].endswith(
+        ".CodexDecisionReviewer"
+    )
+    assert report["reviewer_identity"]["runtime_implementation"].endswith(
+        ".OpenAICodexRuntime"
+    )
     assert "config_hash" in report["config"]
     assert report["modes"]["rules"]["config"]["mode"] == "rules"
     assert report["modes"]["rules_codex"]["config"]["mode"] == "rules_codex"
