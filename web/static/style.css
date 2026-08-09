@@ -2352,6 +2352,11 @@ td:nth-child(2) { color: var(--accent); font-family: var(--mono); }
     font: 0.72rem/1.55 var(--mono);
 }
 
+.trading-backtest-box { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.trading-backtest-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+.trading-backtest-mode { padding: 12px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); line-height: 1.7; }
+.trading-backtest-mode strong { color: var(--accent); }
+
 .trading-execution-status .good { color: var(--success); }
 .trading-execution-status .bad { color: var(--danger); }
 .trading-execution-status .warn { color: var(--warn); }

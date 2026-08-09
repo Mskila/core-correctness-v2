@@ -123,10 +123,13 @@ class TradingPreviewEngine:
         *,
         strategy_resolver: Callable[[str, str], Path] = _default_strategy_resolver,
         reviewer_factory: Callable[[str], DecisionReviewer] | None = None,
+        strategy_loader: Callable[[str, str], LoadedAlphaStrategyV1] | None = None,
     ) -> None:
         self.market = market
         self.strategy_resolver = strategy_resolver
         self.reviewer_factory = reviewer_factory or self._default_reviewer
+        self.strategy_loader = strategy_loader
+        self._reviewers: dict[str, DecisionReviewer] = {}
         self._m15_freshness = CandidateFreshnessStateV1()
         self._m5_freshness = CandidateFreshnessStateV1()
 
@@ -158,12 +161,17 @@ class TradingPreviewEngine:
         warnings: list[str] = []
         for timeframe in requested:
             try:
-                path = self.strategy_resolver(config.symbol, timeframe)
-                strategies[timeframe] = load_alpha_strategy(
-                    path,
-                    expected_symbol=config.symbol,
-                    expected_timeframe=timeframe,
-                )
+                if self.strategy_loader is not None:
+                    strategies[timeframe] = self.strategy_loader(
+                        config.symbol, timeframe
+                    )
+                else:
+                    path = self.strategy_resolver(config.symbol, timeframe)
+                    strategies[timeframe] = load_alpha_strategy(
+                        path,
+                        expected_symbol=config.symbol,
+                        expected_timeframe=timeframe,
+                    )
             except Exception as exc:  # noqa: BLE001 - missing input becomes no-trade evidence
                 warnings.append(f"alpha_{timeframe.lower()}:{exc}")
         return strategies, warnings
@@ -284,7 +292,10 @@ class TradingPreviewEngine:
                 constraints=self.market.instrument_constraints(config.symbol),
             )
         request = build_decision_review_request(inputs, signal, generation)
-        reviewer = self.reviewer_factory(config.mode)
+        reviewer = self._reviewers.get(config.mode)
+        if reviewer is None:
+            reviewer = self.reviewer_factory(config.mode)
+            self._reviewers[config.mode] = reviewer
         review = asyncio.run(reviewer.review(request))
         evidence = (
             *_candidate_evidence("H1", h1_pa),

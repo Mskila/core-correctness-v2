@@ -2021,6 +2021,8 @@ let tradingPreviewInited = false;
 let tradingPreviewRunning = false;
 let tradingPreviewInFlight = false;
 let tradingExecutionEnabled = false;
+let tradingBacktestActive = false;
+let tradingBacktestInFlight = false;
 
 const RT_DIR = {
   LONG: { label: "↑ 预期上涨", cls: "rt-long", color: "#4ade80" },
@@ -2429,6 +2431,72 @@ async function stopTradingPreview() {
   }
 }
 
+function renderTradingBacktestReport(report) {
+  const box = $("tradingBacktestResults");
+  if (!box || !report) return;
+  const windowInfo = report.data?.window || {};
+  const rows = Object.entries(report.modes || {}).map(([mode, value]) => {
+    const codex = value.codex || {};
+    const r = value.basic_r || {};
+    const sides = value.side_distribution || {};
+    const types = value.order_type_distribution || {};
+    const families = value.pa_family_distribution || {};
+    return `<div class="trading-backtest-mode">
+      <strong>${escHtml(mode)}</strong><br />
+      M15 ${Number(value.checked_m15 || 0)} · 原始触发 ${Number(value.raw_trigger_points || 0)} · 合格候选 ${Number(value.qualified_candidate_points || 0)}<br />
+      Codex 批准/拒绝/失败 ${Number(codex.approved || 0)}/${Number(codex.rejected || 0)}/${Number(codex.failures || 0)} · 缓存命中/未命中 ${Number(codex.cache_hits || 0)}/${Number(codex.cache_misses || 0)}<br />
+      计划/成交/未成/到期 ${Number(value.placed || 0)}/${Number(value.filled || 0)}/${Number(value.unfilled || 0)}/${Number(value.expired_cancelled || 0)} · 多/空 ${Number(sides.long || 0)}/${Number(sides.short || 0)}<br />
+      TP1/TP2/SL/反向退出 ${Number(value.tp1 || 0)}/${Number(value.tp2 || 0)}/${Number(value.sl || 0)}/${Number(value.reverse_exit || 0)} · 未平 ${Number(value.open_at_end || 0)}<br />
+      R 合计 ${tradingFmtNumber(r.total, 2)} · 平均 ${tradingFmtNumber(r.average, 2)} · 胜/负 ${Number(r.wins || 0)}/${Number(r.losses || 0)}<br />
+      订单类型 ${escHtml(JSON.stringify(types))} · PA 家族 ${escHtml(JSON.stringify(families))}
+    </div>`;
+  }).join("");
+  box.innerHTML = `<div class="trading-review-box">数据窗口（UTC）：${escHtml(tradingFmtTime(windowInfo.start_close))} — ${escHtml(tradingFmtTime(windowInfo.end_close))}<br />报告：${escHtml(report.report_path || report.latest_report_path || "—")}</div>${rows}`;
+}
+
+function renderTradingBacktestStatus(status) {
+  tradingBacktestActive = !!status.active;
+  const box = $("tradingBacktestStatus");
+  if (box) {
+    const percent = Math.round(Number(status.progress || 0) * 100);
+    box.innerHTML = `<span>状态：${escHtml(status.state || "idle")}</span><span>模式：${escHtml(status.current_mode || "—")}</span><span>进度：${percent}% (${Number(status.completed || 0)}/${Number(status.total || 0)})</span><span>M15：${escHtml(tradingFmtTime(status.current_m15))}</span>${status.error ? `<span class="bad">${escHtml(status.error)}</span>` : ""}`;
+  }
+  if ($("tradingBacktestStartBtn")) $("tradingBacktestStartBtn").disabled = tradingBacktestActive;
+  if ($("tradingBacktestStopBtn")) $("tradingBacktestStopBtn").disabled = !tradingBacktestActive;
+}
+
+async function refreshTradingBacktest() {
+  if (tradingBacktestInFlight) return;
+  tradingBacktestInFlight = true;
+  try {
+    const status = await fetchJSON("/api/trading/backtest/status", { silent: true });
+    renderTradingBacktestStatus(status);
+    if (status.state === "completed") {
+      renderTradingBacktestReport(await fetchJSON("/api/trading/backtest/report", { silent: true }));
+    }
+  } catch (_) {
+    /* local service may be stopping */
+  } finally {
+    tradingBacktestInFlight = false;
+  }
+}
+
+async function startTradingBacktest() {
+  try {
+    renderTradingBacktestStatus(await fetchJSON("/api/trading/backtest/start", { method: "POST" }));
+  } catch (e) {
+    renderTradingBacktestStatus({ state: "failed", error: e.message });
+  }
+}
+
+async function stopTradingBacktest() {
+  try {
+    renderTradingBacktestStatus(await fetchJSON("/api/trading/backtest/stop", { method: "POST" }));
+  } catch (e) {
+    renderTradingBacktestStatus({ state: "failed", error: e.message });
+  }
+}
+
 async function initTradingPreviewOnce() {
   if (tradingPreviewInited) return;
   tradingPreviewInited = true;
@@ -2443,6 +2511,7 @@ async function initTradingPreviewOnce() {
     }
   }
   await refreshTradingPreview();
+  await refreshTradingBacktest();
 }
 
 function ensureRtCountdownTimer() {
@@ -2927,6 +2996,7 @@ function startPolling() {
     if (currentPage === "backtest" || btActive) refreshBacktest();
     if (currentPage === "realtime" || rtEngineRunning) refreshRealtime();
     if (currentPage === "realtime" || tradingPreviewRunning) refreshTradingPreview();
+    if (currentPage === "realtime" || tradingBacktestActive) refreshTradingBacktest();
   }, 4000);
 }
 
@@ -3002,6 +3072,8 @@ async function init() {
   if ($("tradingStopPreviewBtn")) $("tradingStopPreviewBtn").addEventListener("click", stopTradingPreview);
   if ($("tradingEnableBtn")) $("tradingEnableBtn").addEventListener("click", enableTradingExecution);
   if ($("tradingDisableBtn")) $("tradingDisableBtn").addEventListener("click", disableTradingExecution);
+  if ($("tradingBacktestStartBtn")) $("tradingBacktestStartBtn").addEventListener("click", startTradingBacktest);
+  if ($("tradingBacktestStopBtn")) $("tradingBacktestStopBtn").addEventListener("click", stopTradingBacktest);
   if ($("rtFeishuSaveBtn")) $("rtFeishuSaveBtn").addEventListener("click", saveRtFeishuSettings);
   if ($("rtFeishuTestBtn")) $("rtFeishuTestBtn").addEventListener("click", testRtFeishu);
   if ($("rtFeishuHelpBtn")) $("rtFeishuHelpBtn").addEventListener("click", openRtFeishuHelpModal);

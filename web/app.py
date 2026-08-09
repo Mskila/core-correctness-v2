@@ -55,6 +55,7 @@ from web.data_sources.factory import list_sources
 from web.trading_mt5 import mt5_read_only_market
 from web.trading_execution import trading_execution_controller
 from web.trading_preview import trading_preview_manager
+from web.trading_backtest import trading_backtest_manager
 from strategy_manager.live_signal import min_exposure
 from trading_core import (
     DIRECTION_MODULE_IDS,
@@ -1052,6 +1053,7 @@ def _startup_realtime() -> None:
 
 @app.on_event("shutdown")
 def _shutdown_trading_preview() -> None:
+    trading_backtest_manager.stop()
     trading_execution_controller.disable()
     trading_execution_controller.stop_management()
     trading_preview_manager.stop()
@@ -1281,6 +1283,39 @@ def api_trading_enable() -> dict[str, Any]:
 def api_trading_disable() -> dict[str, Any]:
     trading_execution_controller.disable()
     return {"ok": True, **api_trading_status()}
+
+
+@app.post("/api/trading/backtest/start")
+def api_trading_backtest_start() -> dict[str, Any]:
+    """Start both research modes from the currently saved trading config."""
+
+    try:
+        config = TradingConfigV1.from_payload(
+            trading_preview_manager.config_state()["config"]
+        )
+        return {"ok": True, **trading_backtest_manager.start(config)}
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/trading/backtest/status")
+def api_trading_backtest_status() -> dict[str, Any]:
+    return trading_backtest_manager.status()
+
+
+@app.get("/api/trading/backtest/report")
+def api_trading_backtest_report() -> dict[str, Any]:
+    try:
+        return trading_backtest_manager.report()
+    except RuntimeError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/trading/backtest/stop")
+def api_trading_backtest_stop() -> dict[str, Any]:
+    return {"ok": True, **trading_backtest_manager.stop()}
 
 
 @app.get("/api/realtime/feishu")
