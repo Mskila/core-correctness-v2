@@ -121,7 +121,9 @@ class TradingExecutionController:
         positions: tuple[BrokerPositionV1, ...],
         orders: tuple[BrokerOrderV1, ...],
     ) -> bool:
-        return any(row.magic != ALPHAMASTER_MAGIC for row in (*positions, *orders))
+        return any(row.magic != ALPHAMASTER_MAGIC for row in positions) or any(
+            row.magic != ALPHAMASTER_MAGIC for row in orders
+        )
 
     def _persist(self) -> None:
         self.store.save(self._state)
@@ -658,12 +660,15 @@ class TradingExecutionController:
                 if tp1_hit is not True:
                     self._state = replace(self._state, managed_trade=managed)
                     return "tp1_close_unverified"
+                take_profit_2 = managed.take_profit_2
+                if take_profit_2 is None:
+                    raise ValueError("managed TP2 position requires take_profit_2")
                 tick = self.adapter.tick(tp2.symbol)
                 break_even = self._break_even(managed, tick)
                 receipt = self.adapter.modify_position(
                     tp2,
                     stop_loss=break_even,
-                    take_profit=float(managed.take_profit_2),
+                    take_profit=float(take_profit_2),
                 )
                 self._record_receipt(receipt)
                 if not receipt.confirmed:

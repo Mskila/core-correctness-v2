@@ -279,8 +279,11 @@ class HistoricalExecutionSimulator:
         self._validate_plan(plan)
         legs = [_Leg("tp1", self.config.tp1_lots, plan.take_profit_1, plan.stop_loss)]
         if self.config.tp2_lots > 0:
+            take_profit_2 = plan.take_profit_2
+            if take_profit_2 is None:
+                raise ValueError("configured TP2 volume requires a complete TP2 target and R")
             legs.append(
-                _Leg("tp2", self.config.tp2_lots, float(plan.take_profit_2), plan.stop_loss)
+                _Leg("tp2", self.config.tp2_lots, float(take_profit_2), plan.stop_loss)
             )
         return _Trade(plan, close, filled, plan.order_type != "stop_limit", legs)
 
@@ -340,20 +343,30 @@ class HistoricalExecutionSimulator:
     def _pending_fills(self, trade: _Trade, bar: ClosedBarV1) -> bool:
         plan = trade.plan
         if plan.order_type == "limit":
-            limit = float(plan.limit_price)
+            limit_price = plan.limit_price
+            if limit_price is None:
+                raise ValueError("limit plan requires limit_price")
+            limit = float(limit_price)
             return bar.low <= limit if plan.side == "long" else bar.high >= limit
         if plan.order_type == "stop":
-            trigger = float(plan.trigger_price)
+            trigger_price = plan.trigger_price
+            if trigger_price is None:
+                raise ValueError("stop plan requires trigger_price")
+            trigger = float(trigger_price)
             return bar.high >= trigger if plan.side == "long" else bar.low <= trigger
         if plan.order_type == "stop_limit":
-            trigger = float(plan.trigger_price)
+            trigger_price = plan.trigger_price
+            limit_price = plan.limit_price
+            if trigger_price is None or limit_price is None:
+                raise ValueError("stop_limit plan requires trigger_price and limit_price")
+            trigger = float(trigger_price)
             trigger_hit = (
                 bar.high >= trigger if plan.side == "long" else bar.low <= trigger
             )
             if not trade.triggered and trigger_hit:
                 trade.triggered = True
                 self.counts["stop_limit_triggered"] += 1
-            limit = float(plan.limit_price)
+            limit = float(limit_price)
             # If both levels occur in one M5 bar, assume trigger then limit fill;
             # protection is subsequently resolved adverse-first on that bar.
             limit_hit = bar.low <= limit if plan.side == "long" else bar.high >= limit
@@ -406,7 +419,10 @@ class HistoricalExecutionSimulator:
             None,
         )
         if tp2 is not None and self._target_hit(plan, bar, tp2.target):
-            tp2.result_r = float(plan.take_profit_2_r)
+            take_profit_2_r = plan.take_profit_2_r
+            if take_profit_2_r is None:
+                raise ValueError("configured TP2 volume requires a complete TP2 target and R")
+            tp2.result_r = float(take_profit_2_r)
             self.counts["tp2"] += 1
             self._record_leg(active_trade, tp2, "tp2")
         if all(leg.result_r is not None for leg in active_trade.legs):

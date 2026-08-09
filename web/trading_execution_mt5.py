@@ -314,9 +314,11 @@ class MT5ExecutionAdapter:
                 mt5.ORDER_TYPE_BUY_STOP if plan.side == "long" else mt5.ORDER_TYPE_SELL_STOP
             )
         else:
-            if plan.trigger_price is None or plan.limit_price is None:
+            trigger_price = plan.trigger_price
+            limit_price = plan.limit_price
+            if trigger_price is None or limit_price is None:
                 raise ValueError("stop_limit plan requires trigger_price and limit_price")
-            entry = float(plan.trigger_price)
+            entry = float(trigger_price)
             action = mt5.TRADE_ACTION_PENDING
             order_type = (
                 mt5.ORDER_TYPE_BUY_STOP_LIMIT
@@ -366,7 +368,10 @@ class MT5ExecutionAdapter:
             ),
         }
         if plan.order_type == "stop_limit":
-            request["stoplimit"] = self._normalized_price(float(plan.limit_price), digits=digits)
+            limit_price = plan.limit_price
+            if limit_price is None:
+                raise ValueError("stop_limit plan requires trigger_price and limit_price")
+            request["stoplimit"] = self._normalized_price(float(limit_price), digits=digits)
         return request
 
     @staticmethod
