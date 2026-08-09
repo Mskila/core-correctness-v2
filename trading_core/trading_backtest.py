@@ -234,13 +234,16 @@ class HistoricalExecutionSimulator:
         }
         self.pa_family_distribution: dict[str, int] = {}
 
-    def _new_trade(self, plan: OrderPlanCandidateV1, close: int, filled: bool) -> _Trade:
+    def _validate_plan(self, plan: OrderPlanCandidateV1) -> None:
         if self.config.tp2_lots > 0 and (
             plan.take_profit_2 is None
             or plan.take_profit_2_r is None
             or plan.take_profit_2_r <= 0
         ):
             raise ValueError("configured TP2 volume requires a complete TP2 target and R")
+
+    def _new_trade(self, plan: OrderPlanCandidateV1, close: int, filled: bool) -> _Trade:
+        self._validate_plan(plan)
         legs = [_Leg("tp1", self.config.tp1_lots, plan.take_profit_1, plan.stop_loss)]
         if self.config.tp2_lots > 0:
             legs.append(
@@ -255,6 +258,7 @@ class HistoricalExecutionSimulator:
         decision_close: int,
         market_price: float | None = None,
     ) -> str:
+        self._validate_plan(plan)
         if self.cooldown_until is not None and decision_close < self.cooldown_until:
             return "reverse_cooldown"
         if self.position is not None:

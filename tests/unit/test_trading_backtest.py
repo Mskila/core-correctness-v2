@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -442,6 +443,90 @@ def test_missing_tp2_is_valid_when_tp2_volume_is_zero() -> None:
     sim = HistoricalExecutionSimulator(TradingConfigV1.default(), spread_points=0.0)
     assert sim.submit(incomplete, decision_close=900) == "placed"
     assert sim.snapshot()["filled"] == 1
+
+
+def test_invalid_tp2_cannot_mutate_existing_opposite_position() -> None:
+    config = replace(TradingConfigV1.default(), tp1_lots=0.01, tp2_lots=0.02)
+    sim = HistoricalExecutionSimulator(config, spread_points=0.0)
+    sim.submit(_plan(side="long"), decision_close=900)
+    snapshot_before = copy.deepcopy(sim.snapshot())
+    position_before = sim.position
+    pending_before = sim.pending
+    cooldown_before = sim.cooldown_until
+    invalid = replace(
+        _plan(side="short"), take_profit_2=None, take_profit_2_r=None
+    )
+
+    with pytest.raises(ValueError, match="TP2"):
+        sim.submit(invalid, decision_close=1800, market_price=101.0)
+
+    assert sim.snapshot() == snapshot_before
+    assert sim.position is position_before
+    assert sim.pending is pending_before
+    assert sim.cooldown_until == cooldown_before
+
+
+def test_invalid_tp2_cannot_expire_or_replace_existing_pending_order() -> None:
+    config = replace(TradingConfigV1.default(), tp1_lots=0.01, tp2_lots=0.02)
+    sim = HistoricalExecutionSimulator(config, spread_points=0.0)
+    sim.submit(_plan("limit", entry=90.0, limit=90.0), decision_close=900)
+    snapshot_before = copy.deepcopy(sim.snapshot())
+    position_before = sim.position
+    pending_before = sim.pending
+    cooldown_before = sim.cooldown_until
+    invalid = replace(_plan(), take_profit_2=None, take_profit_2_r=None)
+
+    with pytest.raises(ValueError, match="TP2"):
+        sim.submit(invalid, decision_close=1800)
+
+    assert sim.snapshot() == snapshot_before
+    assert sim.position is position_before
+    assert sim.pending is pending_before
+    assert sim.cooldown_until == cooldown_before
+
+
+def test_invalid_tp2_cannot_bypass_validation_via_no_pyramiding() -> None:
+    config = replace(TradingConfigV1.default(), tp1_lots=0.01, tp2_lots=0.02)
+    sim = HistoricalExecutionSimulator(config, spread_points=0.0)
+    sim.submit(_plan(side="long"), decision_close=900)
+    snapshot_before = copy.deepcopy(sim.snapshot())
+    position_before = sim.position
+    invalid = replace(
+        _plan(side="long"), take_profit_2=None, take_profit_2_r=None
+    )
+
+    with pytest.raises(ValueError, match="TP2"):
+        sim.submit(invalid, decision_close=1800)
+
+    assert sim.snapshot() == snapshot_before
+    assert sim.position is position_before
+    assert sim.pending is None
+    assert sim.cooldown_until is None
+
+
+def test_invalid_tp2_cannot_bypass_validation_via_reverse_cooldown() -> None:
+    config = replace(TradingConfigV1.default(), tp1_lots=0.01, tp2_lots=0.02)
+    sim = HistoricalExecutionSimulator(config, spread_points=0.0)
+    sim.submit(_plan(side="long"), decision_close=900)
+    assert (
+        sim.submit(_plan(side="short"), decision_close=1800, market_price=101.0)
+        == "reverse_exit"
+    )
+    snapshot_before = copy.deepcopy(sim.snapshot())
+    position_before = sim.position
+    pending_before = sim.pending
+    cooldown_before = sim.cooldown_until
+    invalid = replace(
+        _plan(side="short"), take_profit_2=None, take_profit_2_r=None
+    )
+
+    with pytest.raises(ValueError, match="TP2"):
+        sim.submit(invalid, decision_close=1800)
+
+    assert sim.snapshot() == snapshot_before
+    assert sim.position is position_before
+    assert sim.pending is pending_before
+    assert sim.cooldown_until == cooldown_before
 
 
 def test_realized_trades_keep_same_plan_id_at_distinct_decision_closes() -> None:
