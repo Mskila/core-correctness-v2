@@ -24,6 +24,8 @@ _DEFAULT = {
     "feishu_enabled": False,
     "feishu_webhook_url": "",
     "feishu_secret": "",
+    # PA + Alpha 只读交易预览；由 TradingConfigV1 再做严格校验。
+    "trading_config": {},
 }
 
 
@@ -96,6 +98,8 @@ def load_settings() -> dict:
     out["feishu_enabled"] = bool(out.get("feishu_enabled", False))
     out["feishu_webhook_url"] = str(out.get("feishu_webhook_url") or "").strip()
     out["feishu_secret"] = str(out.get("feishu_secret") or "").strip()
+    trading_config = out.get("trading_config")
+    out["trading_config"] = dict(trading_config) if isinstance(trading_config, dict) else {}
     return out
 
 
@@ -156,6 +160,11 @@ def save_settings(data: dict) -> dict:
         current["feishu_webhook_url"] = str(data["feishu_webhook_url"] or "").strip()
     if "feishu_secret" in data:
         current["feishu_secret"] = str(data["feishu_secret"] or "").strip()
+    if "trading_config" in data:
+        trading_config = data["trading_config"]
+        current["trading_config"] = (
+            dict(trading_config) if isinstance(trading_config, dict) else {}
+        )
     SETTINGS_PATH.write_text(
         json.dumps(current, indent=2, ensure_ascii=False),
         encoding="utf-8",

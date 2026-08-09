@@ -22,6 +22,11 @@ _PRESETS = [
     "US30.cash", "US100.cash", "US500.cash", "US2000.cash", "JP225.cash",
 ]
 
+# MetaTrader5 exposes one process-wide terminal session.  All read-only calls
+# share this lock so the account panel and K-line preview cannot interleave
+# initialization/copy operations.
+MT5_API_LOCK = threading.RLock()
+
 
 class MT5Source(DataSource):
     kind = "mt5"
@@ -29,7 +34,7 @@ class MT5Source(DataSource):
 
     def __init__(self) -> None:
         self._connected = False
-        self._lock = threading.Lock()
+        self._lock = MT5_API_LOCK
 
     def available(self) -> tuple[bool, str]:
         try:

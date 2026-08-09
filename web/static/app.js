@@ -2017,6 +2017,9 @@ let rtImportedStrategy = null; // {path, name}
 let rtGridSig = "";
 let rtServerSkew = 0; // server_time - local_now（秒）
 let rtCountdownTimer = null;
+let tradingPreviewInited = false;
+let tradingPreviewRunning = false;
+let tradingPreviewInFlight = false;
 
 const RT_DIR = {
   LONG: { label: "↑ 预期上涨", cls: "rt-long", color: "#4ade80" },
@@ -2071,6 +2074,290 @@ function rtFmtCountdown(sec) {
   if (h < 48) return `${h}小时${rm}分`;
   const d = Math.floor(h / 24);
   return `${d}天${h % 24}小时`;
+}
+
+function tradingFmtNumber(value, digits = 3) {
+  const number = Number(value);
+  if (value == null || !Number.isFinite(number)) return "—";
+  return number.toFixed(digits);
+}
+
+function tradingFmtTime(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return "—";
+  return new Date(number * 1000).toLocaleString();
+}
+
+function renderTradingAccount(account) {
+  const grid = $("tradingAccountGrid");
+  if (!grid) return;
+  if (!account || !account.connected) {
+    grid.innerHTML = `<div class="metric-empty">MT5 未连接：${escHtml(account?.message || "未知状态")}</div>`;
+    return;
+  }
+  const accountKind = {
+    real: "真实账户",
+    demo: "模拟账户",
+    contest: "竞赛账户",
+    unknown: "未知",
+  }[account.account_kind] || account.account_kind;
+  const positionMode = {
+    hedging: "Hedging",
+    netting: "Netting",
+    unknown: "未知",
+  }[account.position_mode] || account.position_mode;
+  const items = [
+    ["账号", account.login ?? "—", ""],
+    ["服务器", account.server || "—", ""],
+    ["账户类型", accountKind, account.account_kind === "real" ? "bad" : ""],
+    ["持仓模式", positionMode, ""],
+    ["交易权限", account.trade_allowed ? "允许" : "未允许", account.trade_allowed ? "good" : "bad"],
+    ["EA 权限", account.trade_expert ? "允许" : "未允许", account.trade_expert ? "good" : "bad"],
+    ["余额", tradingFmtNumber(account.balance, 2), ""],
+    ["净值", tradingFmtNumber(account.equity, 2), ""],
+  ];
+  grid.innerHTML = items
+    .map(([label, value, cls]) => `<div class="trading-account-item ${cls}"><span>${escHtml(label)}</span><b title="${escHtml(value)}">${escHtml(value)}</b></div>`)
+    .join("");
+}
+
+async function refreshTradingAccount() {
+  const grid = $("tradingAccountGrid");
+  if (grid) grid.innerHTML = '<div class="metric-empty">正在读取 MT5 账户信息…</div>';
+  try {
+    renderTradingAccount(await fetchJSON("/api/trading/account", { silent: true }));
+  } catch (e) {
+    renderTradingAccount({ connected: false, message: e.message });
+  }
+}
+
+function renderTradingChecks(containerId, rows, selected) {
+  const container = $(containerId);
+  if (!container) return;
+  const active = new Set(selected || []);
+  container.innerHTML = (rows || [])
+    .map((row) => `<label class="trading-check-item"><input type="checkbox" value="${escHtml(row.id)}"${active.has(row.id) ? " checked" : ""} /><span>${escHtml(row.label)}</span></label>`)
+    .join("");
+}
+
+function applyTradingConfig(data) {
+  const config = data?.config || {};
+  const catalog = data?.catalog || {};
+  if ($("tradingModeSelect")) $("tradingModeSelect").value = config.mode || "rules";
+  if ($("tradingTp1Lots")) $("tradingTp1Lots").value = config.tp1_lots ?? 0.01;
+  if ($("tradingTp2Lots")) $("tradingTp2Lots").value = config.tp2_lots ?? 0;
+  renderTradingChecks(
+    "tradingDirectionModules",
+    catalog.direction_modules,
+    config.direction_module_ids
+  );
+  renderTradingChecks(
+    "tradingEntryModules",
+    catalog.entry_modules,
+    config.entry_module_ids
+  );
+  renderTradingChecks(
+    "tradingPaFamilies",
+    catalog.pa_families,
+    config.pa_family_ids
+  );
+  const hint = $("tradingConfigHint");
+  if (hint) {
+    hint.textContent = data.pending_next_m15
+      ? `配置 ${String(config.config_hash || "").slice(0, 10)}… 将在下一根 M15 生效`
+      : `当前配置 ${String(config.config_hash || "").slice(0, 10)}…`;
+    hint.classList.remove("bad");
+    hint.classList.add("good");
+  }
+}
+
+function tradingCheckedValues(containerId) {
+  const container = $(containerId);
+  if (!container) return [];
+  return Array.from(container.querySelectorAll('input[type="checkbox"]:checked')).map(
+    (input) => input.value
+  );
+}
+
+function collectTradingConfigPayload() {
+  const tp1 = Number($("tradingTp1Lots")?.value);
+  const tp2 = Number($("tradingTp2Lots")?.value);
+  if (!Number.isFinite(tp1) || tp1 <= 0) throw new Error("TP1 手数必须大于 0");
+  if (!Number.isFinite(tp2) || tp2 < 0) throw new Error("TP2 手数不能小于 0");
+  const direction = tradingCheckedValues("tradingDirectionModules");
+  const entry = tradingCheckedValues("tradingEntryModules");
+  const families = tradingCheckedValues("tradingPaFamilies");
+  if (!direction.length) throw new Error("至少勾选一个方向模块");
+  if (!entry.length) throw new Error("至少勾选一个入场模块");
+  if (!families.length) throw new Error("至少勾选一个 PA 策略家族");
+  return {
+    config_version: "trading-config-v1",
+    symbol: "XAUUSD",
+    mode: $("tradingModeSelect")?.value || "rules",
+    direction_module_ids: direction,
+    entry_module_ids: entry,
+    pa_family_ids: families,
+    tp1_lots: tp1,
+    tp2_lots: tp2,
+  };
+}
+
+async function saveTradingConfig() {
+  const hint = $("tradingConfigHint");
+  const btn = $("tradingSaveConfigBtn");
+  if (btn) btn.disabled = true;
+  try {
+    const data = await fetchJSON("/api/trading/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectTradingConfigPayload()),
+    });
+    applyTradingConfig(data);
+  } catch (e) {
+    if (hint) {
+      hint.textContent = `配置未保存：${e.message}`;
+      hint.classList.remove("good");
+      hint.classList.add("bad");
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderTradingDecision(decision) {
+  const panel = $("tradingDecisionPanel");
+  if (!panel) return;
+  if (!decision) {
+    panel.innerHTML = '<div class="metric-empty">尚无 M15 决策。启动预览后等待最新已收盘 M15。</div>';
+    return;
+  }
+  const scores = decision.scores || {};
+  const alpha = scores.alpha || {};
+  const pa = scores.pa || {};
+  const review = decision.review || {};
+  const selectedId = review.selected_plan_id;
+  const scoreItems = [
+    ["方向融合", tradingFmtNumber(scores.direction)],
+    ["入场融合", tradingFmtNumber(scores.entry)],
+    ["H1 Alpha", tradingFmtNumber(alpha.H1)],
+    ["M15 Alpha", tradingFmtNumber(alpha.M15)],
+    ["M5 Alpha", tradingFmtNumber(alpha.M5)],
+    ["H1 PA", tradingFmtNumber(pa.H1)],
+    ["M15 PA", tradingFmtNumber(pa.M15)],
+    ["M5 PA", tradingFmtNumber(pa.M5)],
+  ];
+  const evidence = (decision.pa_evidence || []).length
+    ? decision.pa_evidence.map(escHtml).join(" · ")
+    : "本周期无新 PA 形态证据";
+  const rejectReasons = [
+    ...(decision.fusion?.reject_reasons || []),
+    ...(decision.plan_reject_reasons || []),
+  ];
+  const warnings = decision.input_warnings || [];
+  const plans = (decision.plans || []).map((plan) => {
+    const selected = plan.plan_id === selectedId;
+    const sideClass = plan.side === "long" ? "long" : "short";
+    return `<div class="trading-plan${selected ? " selected" : ""}">
+      <strong>${escHtml(plan.style)}${selected ? " · 已选" : ""}</strong><br />
+      <span class="${sideClass}">${escHtml(plan.side)} · ${escHtml(plan.order_type)}</span><br />
+      入场 ${tradingFmtNumber(plan.entry_price, 3)} · SL ${tradingFmtNumber(plan.stop_loss, 3)}<br />
+      TP1 ${tradingFmtNumber(plan.take_profit_1, 3)} (${tradingFmtNumber(plan.take_profit_1_r, 2)}R) · ${tradingFmtNumber(plan.tp1_lots, 3)} 手<br />
+      TP2 ${tradingFmtNumber(plan.take_profit_2, 3)} (${tradingFmtNumber(plan.take_profit_2_r, 2)}R) · ${tradingFmtNumber(plan.tp2_lots, 3)} 手<br />
+      <span>不可执行 · 未经经纪商校验</span>
+    </div>`;
+  }).join("");
+  const approved = review.verdict === "approve";
+  panel.innerHTML = `
+    <div class="trading-decision-head">
+      <h3>${escHtml(decision.symbol)} · M15 ${escHtml(tradingFmtTime(decision.decision_close_timestamp))}</h3>
+      <span class="trading-verdict ${approved ? "approve" : "reject"}">${approved ? "预览通过" : "本周期不交易"}</span>
+    </div>
+    <div class="trading-score-grid">${scoreItems.map(([label, value]) => `<div class="trading-score-item"><span>${escHtml(label)}</span><b>${escHtml(value)}</b></div>`).join("")}</div>
+    <div class="trading-evidence"><strong>PA 证据：</strong>${evidence}</div>
+    ${rejectReasons.length ? `<div class="trading-warning-box"><strong>规则拒绝：</strong>${rejectReasons.map(escHtml).join(" · ")}</div>` : ""}
+    ${warnings.length ? `<div class="trading-warning-box"><strong>输入提示：</strong>${warnings.map(escHtml).join(" · ")}</div>` : ""}
+    <div class="trading-plan-grid">${plans || '<div class="metric-empty">没有生成合格候选订单。</div>'}</div>
+    <div class="trading-review-box"><b>${escHtml(review.reason_code || "—")}</b> · ${escHtml(review.summary_zh || "尚无审查结论")}</div>`;
+}
+
+function renderTradingPreviewStatus(status) {
+  tradingPreviewRunning = !!status.running;
+  const box = $("tradingPreviewStatus");
+  if (box) {
+    const state = status.processing
+      ? '<span class="warn">状态：正在计算</span>'
+      : status.running
+        ? '<span class="good">状态：只读预览运行中</span>'
+        : "<span>状态：已停止</span>";
+    const pending = status.pending_next_m15
+      ? '<span class="warn">配置：等待下一根 M15 生效</span>'
+      : "<span>配置：已生效</span>";
+    const error = status.last_error
+      ? `<span class="bad">错误：${escHtml(status.last_error)}</span>`
+      : "";
+    box.innerHTML = `${state}<span>最近 M15：${escHtml(tradingFmtTime(status.last_m15_close))}</span><span>决策数：${Number(status.decision_count || 0)}</span>${pending}${error}`;
+  }
+  if ($("tradingStartPreviewBtn")) $("tradingStartPreviewBtn").disabled = !!status.running;
+  if ($("tradingStopPreviewBtn")) $("tradingStopPreviewBtn").disabled = !status.running;
+  renderTradingDecision(status.latest_decision);
+}
+
+async function refreshTradingPreview() {
+  if (tradingPreviewInFlight) return;
+  tradingPreviewInFlight = true;
+  try {
+    renderTradingPreviewStatus(
+      await fetchJSON("/api/trading/status", { silent: true })
+    );
+  } catch (_) {
+    /* ordinary page polling remains quiet when the local service is stopping */
+  } finally {
+    tradingPreviewInFlight = false;
+  }
+}
+
+async function startTradingPreview() {
+  try {
+    renderTradingPreviewStatus(
+      await fetchJSON("/api/trading/preview/start", { method: "POST" })
+    );
+  } catch (e) {
+    const hint = $("tradingConfigHint");
+    if (hint) {
+      hint.textContent = `预览启动失败：${e.message}`;
+      hint.classList.add("bad");
+    }
+  }
+}
+
+async function stopTradingPreview() {
+  try {
+    renderTradingPreviewStatus(
+      await fetchJSON("/api/trading/preview/stop", { method: "POST" })
+    );
+  } catch (e) {
+    const hint = $("tradingConfigHint");
+    if (hint) {
+      hint.textContent = `预览停止失败：${e.message}`;
+      hint.classList.add("bad");
+    }
+  }
+}
+
+async function initTradingPreviewOnce() {
+  if (tradingPreviewInited) return;
+  tradingPreviewInited = true;
+  await refreshTradingAccount();
+  try {
+    applyTradingConfig(await fetchJSON("/api/trading/config", { silent: true }));
+  } catch (e) {
+    const hint = $("tradingConfigHint");
+    if (hint) {
+      hint.textContent = `配置加载失败：${e.message}`;
+      hint.classList.add("bad");
+    }
+  }
+  await refreshTradingPreview();
 }
 
 function ensureRtCountdownTimer() {
@@ -2132,6 +2419,7 @@ async function initRealtimeOnce() {
   }
   await loadRtStrategies();
   await loadRtFeishuSettings();
+  await initTradingPreviewOnce();
 }
 
 async function loadRtFeishuSettings() {
@@ -2553,6 +2841,7 @@ function startPolling() {
     refreshOverview();
     if (currentPage === "backtest" || btActive) refreshBacktest();
     if (currentPage === "realtime" || rtEngineRunning) refreshRealtime();
+    if (currentPage === "realtime" || tradingPreviewRunning) refreshTradingPreview();
   }, 4000);
 }
 
@@ -2622,6 +2911,10 @@ async function init() {
   if ($("rtStrategySelect")) $("rtStrategySelect").addEventListener("change", onRtStrategyChange);
   if ($("rtBrowseStrategyBtn")) $("rtBrowseStrategyBtn").addEventListener("click", rtBrowseStrategy);
   if ($("rtAddBtn")) $("rtAddBtn").addEventListener("click", rtAddWatch);
+  if ($("tradingRefreshAccountBtn")) $("tradingRefreshAccountBtn").addEventListener("click", refreshTradingAccount);
+  if ($("tradingSaveConfigBtn")) $("tradingSaveConfigBtn").addEventListener("click", saveTradingConfig);
+  if ($("tradingStartPreviewBtn")) $("tradingStartPreviewBtn").addEventListener("click", startTradingPreview);
+  if ($("tradingStopPreviewBtn")) $("tradingStopPreviewBtn").addEventListener("click", stopTradingPreview);
   if ($("rtFeishuSaveBtn")) $("rtFeishuSaveBtn").addEventListener("click", saveRtFeishuSettings);
   if ($("rtFeishuTestBtn")) $("rtFeishuTestBtn").addEventListener("click", testRtFeishu);
   if ($("rtFeishuHelpBtn")) $("rtFeishuHelpBtn").addEventListener("click", openRtFeishuHelpModal);

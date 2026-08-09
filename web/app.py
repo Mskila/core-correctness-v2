@@ -52,7 +52,16 @@ from web.training_package import build_training_export_zip, import_training_pack
 from web.backtest_manager import backtest_manager
 from web.realtime_manager import realtime_manager
 from web.data_sources.factory import list_sources
+from web.trading_mt5 import mt5_read_only_market
+from web.trading_preview import trading_preview_manager
 from strategy_manager.live_signal import min_exposure
+from trading_core import (
+    DIRECTION_MODULE_IDS,
+    ENTRY_MODULE_IDS,
+    PA_FAMILY_IDS,
+    TRADING_MODES,
+    TradingConfigV1,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 BACKTEST_OUTPUT_DIR = ROOT / "backtest_output"
@@ -152,6 +161,17 @@ class FeishuSettingsRequest(BaseModel):
 class FeishuTestRequest(BaseModel):
     webhook_url: str | None = None
     secret: str | None = None
+
+
+class TradingConfigRequest(BaseModel):
+    mode: str
+    direction_module_ids: list[str]
+    entry_module_ids: list[str]
+    pa_family_ids: list[str]
+    tp1_lots: float
+    tp2_lots: float
+    symbol: str = "XAUUSD"
+    config_version: str = "trading-config-v1"
 
 
 @app.middleware("http")
@@ -1019,6 +1039,15 @@ def _startup_realtime() -> None:
         realtime_manager.load_persisted()
     except Exception as exc:  # noqa: BLE001
         log_error("realtime load_persisted failed", exc)
+    try:
+        trading_preview_manager.load_persisted()
+    except Exception as exc:  # noqa: BLE001
+        log_error("trading preview load_persisted failed", exc)
+
+
+@app.on_event("shutdown")
+def _shutdown_trading_preview() -> None:
+    trading_preview_manager.stop()
 
 
 @app.get("/api/realtime/sources")
@@ -1096,6 +1125,103 @@ def api_realtime_start() -> dict[str, Any]:
 def api_realtime_stop() -> dict[str, Any]:
     realtime_manager.stop()
     return {"ok": True, "running": False}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PA + Alpha 只读交易预览 API（阶段 4：绝不发送订单）
+# ─────────────────────────────────────────────────────────────────────
+
+
+_TRADING_MODULE_LABELS = {
+    "alpha_h1": "H1 Alpha 因子",
+    "pa_h1": "H1 PA 结构",
+    "alpha_m15": "M15 Alpha 因子",
+    "pa_m15_context": "M15 PA 环境",
+    "pa_m15_pattern": "M15 PA 形态",
+    "pa_m5_timing": "M5 PA 时机",
+    "alpha_m5": "M5 Alpha 因子（默认关闭）",
+}
+_TRADING_FAMILY_LABELS = {
+    "trend_continuation": "趋势延续",
+    "breakout": "突破/回踩",
+    "reversal": "反转",
+    "range": "区间交易",
+}
+
+
+def _trading_config_response() -> dict[str, Any]:
+    state = trading_preview_manager.config_state()
+    return {
+        **state,
+        "catalog": {
+            "modes": [
+                {"id": "rules", "label": "规则模式"},
+                {"id": "rules_codex", "label": "规则 + Codex 审查"},
+            ],
+            "direction_modules": [
+                {"id": module, "label": _TRADING_MODULE_LABELS[module]}
+                for module in DIRECTION_MODULE_IDS
+            ],
+            "entry_modules": [
+                {"id": module, "label": _TRADING_MODULE_LABELS[module]}
+                for module in ENTRY_MODULE_IDS
+            ],
+            "pa_families": [
+                {"id": family, "label": _TRADING_FAMILY_LABELS[family]}
+                for family in PA_FAMILY_IDS
+            ],
+            "supported_modes": list(TRADING_MODES),
+        },
+    }
+
+
+@app.get("/api/trading/account")
+def api_trading_account() -> dict[str, Any]:
+    return mt5_read_only_market.account_snapshot()
+
+
+@app.get("/api/trading/config")
+def api_trading_config_get() -> dict[str, Any]:
+    return _trading_config_response()
+
+
+@app.put("/api/trading/config")
+def api_trading_config_put(req: TradingConfigRequest) -> dict[str, Any]:
+    try:
+        config = TradingConfigV1(
+            mode=req.mode,
+            direction_module_ids=tuple(req.direction_module_ids),
+            entry_module_ids=tuple(req.entry_module_ids),
+            pa_family_ids=tuple(req.pa_family_ids),
+            tp1_lots=req.tp1_lots,
+            tp2_lots=req.tp2_lots,
+            symbol=req.symbol,
+            config_version=req.config_version,
+        )
+        trading_preview_manager.update_config(config)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, **_trading_config_response()}
+
+
+@app.get("/api/trading/status")
+def api_trading_status() -> dict[str, Any]:
+    return trading_preview_manager.status()
+
+
+@app.get("/api/trading/decisions")
+def api_trading_decisions(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+    return {"decisions": trading_preview_manager.decisions(limit=limit)}
+
+
+@app.post("/api/trading/preview/start")
+def api_trading_preview_start() -> dict[str, Any]:
+    return {"ok": True, **trading_preview_manager.start()}
+
+
+@app.post("/api/trading/preview/stop")
+def api_trading_preview_stop() -> dict[str, Any]:
+    return {"ok": True, **trading_preview_manager.stop()}
 
 
 @app.get("/api/realtime/feishu")

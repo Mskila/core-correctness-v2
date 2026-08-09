@@ -482,6 +482,76 @@
         <small class="field-hint" id="rtStrategyPicked">因子来源：从已保存策略下拉选择，或「导入策略」选本地 JSON。信号取最后已收盘 bar。</small>
       </section>
 
+      <section class="panel trading-preview-panel" id="tradingPreviewPanel">
+        <span class="hud-corner tl"></span><span class="hud-corner tr"></span>
+        <span class="hud-corner bl"></span><span class="hud-corner br"></span>
+        <div class="panel-head">
+          <div>
+            <h2>PA + Alpha 只读决策预览</h2>
+            <p class="trading-readonly-note" id="tradingReadOnlyNotice">
+              阶段 4 只读取本地 MT5 和已收盘 K 线，每根 M15 最多判断一次；候选单不可执行，不会发送真实订单。
+            </p>
+          </div>
+          <span class="trading-stage-badge">READ ONLY · STAGE 4</span>
+        </div>
+
+        <div class="trading-account-head">
+          <h3>当前 MT5 账户</h3>
+          <button type="button" class="btn btn-secondary btn-compact" id="tradingRefreshAccountBtn">刷新账户</button>
+        </div>
+        <div class="trading-account-grid" id="tradingAccountGrid">
+          <div class="metric-empty">正在读取 MT5 账户信息…</div>
+        </div>
+
+        <div class="trading-config-grid">
+          <label class="rt-field">
+            <span>决策模式</span>
+            <select id="tradingModeSelect">
+              <option value="rules">规则模式</option>
+              <option value="rules_codex">规则 + Codex 审查</option>
+            </select>
+          </label>
+          <label class="rt-field">
+            <span>TP1 手数（必须 &gt; 0）</span>
+            <input type="number" id="tradingTp1Lots" min="0.001" step="0.001" value="0.01" />
+          </label>
+          <label class="rt-field">
+            <span>TP2 手数（可为 0）</span>
+            <input type="number" id="tradingTp2Lots" min="0" step="0.001" value="0" />
+          </label>
+        </div>
+
+        <div class="trading-module-columns">
+          <fieldset class="trading-check-group">
+            <legend>方向权重模块</legend>
+            <div id="tradingDirectionModules" class="trading-check-list"></div>
+          </fieldset>
+          <fieldset class="trading-check-group">
+            <legend>入场权重模块</legend>
+            <div id="tradingEntryModules" class="trading-check-list"></div>
+          </fieldset>
+          <fieldset class="trading-check-group">
+            <legend>启用的 PA 策略家族</legend>
+            <div id="tradingPaFamilies" class="trading-check-list"></div>
+          </fieldset>
+        </div>
+
+        <div class="trading-preview-actions">
+          <button type="button" class="btn btn-secondary" id="tradingSaveConfigBtn">保存配置（下一根 M15 生效）</button>
+          <button type="button" class="btn btn-primary" id="tradingStartPreviewBtn">启动只读预览</button>
+          <button type="button" class="btn btn-secondary" id="tradingStopPreviewBtn">停止预览</button>
+          <span class="hint" id="tradingConfigHint">尚未加载配置</span>
+        </div>
+
+        <div class="trading-preview-status" id="tradingPreviewStatus">
+          <span>状态：未启动</span><span>最近 M15：—</span><span>决策数：0</span>
+        </div>
+
+        <div class="trading-decision" id="tradingDecisionPanel">
+          <div class="metric-empty">启动只读预览后，这里显示多周期评分、PA 证据、候选订单和审查结论。</div>
+        </div>
+      </section>
+
       <section class="panel rt-radar-panel">
         <span class="hud-corner tl"></span><span class="hud-corner tr"></span>
         <span class="hud-corner bl"></span><span class="hud-corner br"></span>
