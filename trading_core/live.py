@@ -20,6 +20,7 @@ from .fusion import (
 )
 from .models import ModuleSelectionV1, OrderPlanCandidateV1
 from .decision_reviewer import DecisionReviewV1
+from .time_alignment import TIMEFRAME_SECONDS
 
 
 TRADING_CONFIG_VERSION = "trading-config-v1"
@@ -240,8 +241,15 @@ class TradeDecisionV1:
             raise ValueError("decision close must be an integer Unix second")
         if self.m15_close_timestamp != self.decision_close_timestamp:
             raise ValueError("M15 close must equal the decision close")
-        if self.m5_close_timestamp != self.decision_close_timestamp:
-            raise ValueError("M5 close must equal the decision close")
+        m15_interval_start = (
+            self.decision_close_timestamp - TIMEFRAME_SECONDS["M15"]
+        )
+        if not (
+            m15_interval_start
+            < self.m5_close_timestamp
+            <= self.decision_close_timestamp
+        ):
+            raise ValueError("M5 close must be inside the current M15 interval")
         if self.h1_close_timestamp > self.decision_close_timestamp:
             raise ValueError("H1 close cannot be later than the decision close")
         if self.review.decision_id != self.decision_id:

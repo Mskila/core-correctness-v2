@@ -35,6 +35,38 @@ def _plan() -> OrderPlanCandidateV1:
     )
 
 
+def _decision(*, m5_close_timestamp: int) -> TradeDecisionV1:
+    return TradeDecisionV1(
+        decision_id="decision-boundary",
+        symbol="XAUUSD",
+        decision_close_timestamp=1_800,
+        h1_close_timestamp=0,
+        m15_close_timestamp=1_800,
+        m5_close_timestamp=m5_close_timestamp,
+        config=TradingConfigV1.default(),
+        alpha_scores=(),
+        pa_scores=(),
+        pa_evidence=(),
+        input_warnings=(),
+        direction_score=None,
+        entry_score=None,
+        side=None,
+        fusion_accepted=False,
+        fusion_reject_reasons=("no_signal",),
+        plan_reject_reasons=(),
+        plans=(),
+        review=DecisionReviewV1(
+            decision_id="decision-boundary",
+            verdict="reject",
+            selected_plan_id=None,
+            reason_code="reject_no_suitable_plan",
+            summary_zh="无交易信号。",
+        ),
+        final_action="preview_rejected",
+        created_at=1.0,
+    )
+
+
 def test_default_config_has_canonical_hash_and_m5_alpha_disabled() -> None:
     config = TradingConfigV1.default()
     reordered = TradingConfigV1(
@@ -75,6 +107,20 @@ def test_config_payload_rejects_a_mismatched_identity_hash() -> None:
 
     with pytest.raises(ValueError, match="hash"):
         TradingConfigV1.from_payload(payload)
+
+
+def test_decision_accepts_exact_and_partial_session_m5_boundaries() -> None:
+    exact = _decision(m5_close_timestamp=1_800)
+    partial = _decision(m5_close_timestamp=1_500)
+
+    assert exact.m5_close_timestamp == exact.decision_close_timestamp
+    assert partial.m5_close_timestamp == 1_500
+
+
+@pytest.mark.parametrize("m5_close_timestamp", [900, 2_100])
+def test_decision_rejects_stale_or_future_m5_close(m5_close_timestamp: int) -> None:
+    with pytest.raises(ValueError, match="M5 close"):
+        _decision(m5_close_timestamp=m5_close_timestamp)
 
 
 def test_stage4_decision_exposes_lots_but_remains_non_executable() -> None:
