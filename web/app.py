@@ -1255,8 +1255,9 @@ def api_trading_preview_start() -> dict[str, Any]:
 
 @app.post("/api/trading/preview/stop")
 def api_trading_preview_stop() -> dict[str, Any]:
-    if trading_execution_controller.status()["execution_enabled"]:
-        trading_execution_controller.disable()
+    # Always run the disable path: entries may already be off while persisted
+    # AlphaMaster pending orders still need an explicit cancellation attempt.
+    trading_execution_controller.disable()
     trading_preview_manager.stop()
     return {"ok": True, **api_trading_status()}
 

@@ -283,6 +283,45 @@ def test_netting_merges_volume_then_partially_closes_tp1_and_moves_to_break_even
     assert adapter.modified[-1][1] == 2400.1
 
 
+def test_netting_persists_tp1_before_break_even_retry_after_restart(tmp_path) -> None:
+    class _FirstModifyFails(_FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__("netting")
+            self.fail_modify = True
+
+        def modify_position(self, position, *, stop_loss, take_profit):
+            if self.fail_modify:
+                self.fail_modify = False
+                raise RuntimeError("temporary modify failure")
+            return super().modify_position(
+                position,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
+
+    adapter = _FirstModifyFails()
+    controller = _controller(tmp_path, adapter)
+    decision = _decision(900)
+    controller.enable(decision.config)
+    controller.process_decision(decision)
+
+    failed = controller.manage_once()
+    persisted = controller.store.load().managed_trade
+
+    assert failed["action"] == "position_management_failed"
+    assert len(adapter.closed) == 1
+    assert persisted is not None
+    assert persisted.tp1_done is True
+    assert persisted.break_even_applied is False
+
+    restarted = _controller(tmp_path, adapter)
+    retried = restarted.manage_once()
+
+    assert retried["action"] == "protection_restored"
+    assert len(adapter.closed) == 1
+    assert restarted.store.load().managed_trade.break_even_applied is True
+
+
 def test_hedging_tp1_disappearance_moves_only_tp2_to_break_even(tmp_path) -> None:
     adapter = _FakeAdapter("hedging")
     controller = _controller(tmp_path, adapter)
@@ -326,6 +365,34 @@ def test_manual_disable_cancels_system_pending_orders_but_keeps_management_on(tm
     assert disabled["execution_enabled"] is False
     assert disabled["management_enabled"] is True
     assert adapter.cancelled == [101, 102]
+    assert adapter.orders_rows == []
+
+
+def test_manual_disable_cancels_orphan_system_pending_while_runtime_is_already_off(
+    tmp_path,
+) -> None:
+    adapter = _FakeAdapter("hedging")
+    adapter.orders_rows.append(
+        BrokerOrderV1(
+            ticket=77,
+            symbol="XAUUSD",
+            side="long",
+            magic=20250101,
+            volume=0.01,
+            price_open=2401.0,
+            stop_loss=2398.0,
+            take_profit=2404.0,
+            order_type="stop",
+            comment="AM5:orphan",
+        )
+    )
+    controller = _controller(tmp_path, adapter)
+
+    disabled = controller.disable()
+
+    assert disabled["execution_enabled"] is False
+    assert disabled["management_enabled"] is True
+    assert adapter.cancelled == [77]
     assert adapter.orders_rows == []
 
 

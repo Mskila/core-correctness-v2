@@ -143,3 +143,44 @@ def test_new_decision_is_forwarded_once_to_execution_consumer() -> None:
     latest = manager.decisions(limit=1)[0]
     assert latest["final_action"] == "execution_disabled"
     assert latest["execution"]["enabled"] is False
+
+
+def test_mixed_leg_receipts_are_not_projected_as_globally_confirmed() -> None:
+    engine = _FakeEngine()
+
+    class _Consumer:
+        def process_decision(self, decision):
+            return {
+                "action": "opening_partial",
+                "execution_enabled": False,
+                "receipts": [
+                    {
+                        "action": "place",
+                        "confirmed": True,
+                        "position_ticket": 101,
+                        "order_ticket": None,
+                        "retcode": 10009,
+                    },
+                    {
+                        "action": "place",
+                        "confirmed": False,
+                        "position_ticket": None,
+                        "order_ticket": 102,
+                        "retcode": 10008,
+                    },
+                ],
+            }
+
+    manager = TradingPreviewManager(
+        engine,
+        settings_loader=lambda: {},
+        settings_saver=lambda payload: payload,
+        decision_consumer=_Consumer(),
+    )
+
+    assert manager.run_once() is True
+    execution = manager.decisions(limit=1)[0]["execution"]
+
+    assert execution["action"] == "opening_partial"
+    assert execution["confirmed"] is False
+    assert execution["tickets"] == [101]

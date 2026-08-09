@@ -177,28 +177,27 @@ class TradingExecutionController:
 
     def disable(self) -> dict[str, Any]:
         with self._lock:
-            was_enabled = self._execution_enabled
             self._execution_enabled = False
             self._blocker = "manual_enable_required"
+            self._last_error = ""
             self._operation_receipts = []
-            managed_pending = bool(
-                self._state.managed_trade and self._state.managed_trade.pending_tickets
-            )
-            if was_enabled or managed_pending:
-                try:
-                    orders = self.adapter.orders("XAUUSD")
-                    cancelled = self._cancel_system_orders(orders)
-                    remaining_orders = self._system_orders(self.adapter.orders("XAUUSD"))
-                    positions = self._system_positions(self.adapter.positions("XAUUSD"))
-                    if cancelled and not remaining_orders and not positions:
-                        self._state = replace(self._state, managed_trade=None)
-                    if not cancelled or remaining_orders:
-                        self._blocker = "pending_cancel_unconfirmed"
-                        self._last_error = "停用时系统挂单撤销未被 MT5 查询确认"
-                except Exception as exc:  # noqa: BLE001 - entries remain disabled
-                    self._blocker = "pending_cancel_failed"
-                    self._last_error = str(exc)
-                self._persist()
+            # Query every time, including after restart or an earlier failed
+            # send: broker-side AlphaMaster pending orders can outlive the
+            # local enabled flag or be absent from the last persisted state.
+            try:
+                orders = self.adapter.orders("XAUUSD")
+                cancelled = self._cancel_system_orders(orders)
+                remaining_orders = self._system_orders(self.adapter.orders("XAUUSD"))
+                positions = self._system_positions(self.adapter.positions("XAUUSD"))
+                if cancelled and not remaining_orders and not positions:
+                    self._state = replace(self._state, managed_trade=None)
+                if not cancelled or remaining_orders:
+                    self._blocker = "pending_cancel_unconfirmed"
+                    self._last_error = "停用时系统挂单撤销未被 MT5 查询确认"
+            except Exception as exc:  # noqa: BLE001 - entries remain disabled
+                self._blocker = "pending_cancel_failed"
+                self._last_error = str(exc)
+            self._persist()
             return self.status()
 
     def start_management(self) -> dict[str, Any]:
@@ -571,7 +570,18 @@ class TradingExecutionController:
                     self._state = replace(self._state, managed_trade=None)
                     return "managed_trade_closed"
                 position = remaining[0]
-                break_even = self._break_even(managed, tick)
+                updated = replace(
+                    updated,
+                    position_tickets=(position.ticket,),
+                    pending_tickets=(),
+                    tp1_done=True,
+                )
+                # The partial close is irreversible.  Persist it before the
+                # separate broker request that moves the remaining protection,
+                # so a restart cannot close TP1 volume a second time.
+                self._state = replace(self._state, managed_trade=updated)
+                self._persist()
+                break_even = self._break_even(updated, tick)
                 modified = self.adapter.modify_position(
                     position,
                     stop_loss=break_even,
@@ -589,7 +599,7 @@ class TradingExecutionController:
                 self._state = replace(self._state, managed_trade=updated)
                 return "tp1_break_even"
         expected_stop = managed.stop_loss
-        if managed.break_even_applied:
+        if managed.tp1_done or managed.break_even_applied:
             expected_stop = self._break_even(managed, self.adapter.tick(position.symbol))
         tolerance = self._environment.point if self._environment is not None else 1e-9
         if (
@@ -604,6 +614,8 @@ class TradingExecutionController:
             self._record_receipt(receipt)
             if not receipt.confirmed:
                 raise RuntimeError("netting protection restore was not confirmed")
+            if managed.tp1_done:
+                updated = replace(updated, break_even_applied=True)
             action = "protection_restored"
         else:
             action = "position_managed"

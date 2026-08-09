@@ -66,6 +66,16 @@ def test_stage5_javascript_requires_manual_enable_and_exposes_disable() -> None:
     assert "order_send" not in source
 
 
+def test_stage5_decision_card_renders_its_execution_confirmation_and_receipts() -> None:
+    source = (ROOT / "web/static/app.js").read_text(encoding="utf-8")
+
+    assert "decision.execution" in source
+    assert "执行动作" in source
+    assert "查询确认" in source
+    assert "订单票据" in source
+    assert "执行回执" in source
+
+
 def test_stage5_javascript_is_syntax_valid() -> None:
     completed = subprocess.run(
         ["node", "--check", "web/static/app.js"],

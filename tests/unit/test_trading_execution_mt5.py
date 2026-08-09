@@ -131,10 +131,33 @@ class _FakeMT5:
 
     def order_check(self, request):
         self.calls.append(("check", dict(request)))
-        return Row(0, "check ok", 0, 0, request["volume"], request["price"])
+        return Row(
+            0,
+            "check ok",
+            0,
+            0,
+            request.get("volume", 0.0),
+            request.get("price", 0.0),
+        )
 
     def order_send(self, request):
         self.calls.append(("send", dict(request)))
+        if request["action"] == self.TRADE_ACTION_SLTP:
+            self.positions = [
+                row._replace(sl=request["sl"], tp=request["tp"])
+                if row.ticket == request["position"]
+                else row
+                for row in self.positions
+            ]
+            position = next(row for row in self.positions if row.ticket == request["position"])
+            return Row(
+                self.TRADE_RETCODE_DONE,
+                "modified",
+                position.ticket,
+                0,
+                position.volume,
+                position.price_open,
+            )
         if request["action"] == self.TRADE_ACTION_PENDING:
             self.orders = [
                 Order(701, request["symbol"], request["type"], request["magic"],
@@ -225,3 +248,41 @@ def test_tp1_close_requires_take_profit_reason_from_mt5_history() -> None:
     assert adapter.position_closed_by_take_profit(501) is False
     mt5.history_rows.append(type("Deal", (), {"reason": mt5.DEAL_REASON_TP})())
     assert adapter.position_closed_by_take_profit(501) is True
+
+
+def test_modify_position_requires_both_stop_loss_and_take_profit_query_confirmation() -> None:
+    class _SlOnlyMT5(_FakeMT5):
+        def order_send(self, request):
+            if request["action"] != self.TRADE_ACTION_SLTP:
+                return super().order_send(request)
+            self.calls.append(("send", dict(request)))
+            self.positions = [
+                row._replace(sl=request["sl"])
+                if row.ticket == request["position"]
+                else row
+                for row in self.positions
+            ]
+            position = next(row for row in self.positions if row.ticket == request["position"])
+            return Row(
+                self.TRADE_RETCODE_DONE,
+                "modified",
+                position.ticket,
+                0,
+                position.volume,
+                position.price_open,
+            )
+
+    mt5 = _SlOnlyMT5()
+    mt5.positions = [
+        Position(501, "XAUUSD", mt5.ORDER_TYPE_BUY, 20250101, 0.01, 2400.0, 2398.0, 2403.0, "AM5:tp2")
+    ]
+    adapter = MT5ExecutionAdapter(mt5=mt5)
+
+    receipt = adapter.modify_position(
+        adapter.positions("XAUUSD")[0],
+        stop_loss=2400.1,
+        take_profit=2404.0,
+    )
+
+    assert receipt.accepted is True
+    assert receipt.confirmed is False

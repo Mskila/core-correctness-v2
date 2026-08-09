@@ -486,6 +486,9 @@ class TradingPreviewManager:
             return payload
         receipts = list(execution_result.get("receipts") or ())
         confirmed = [receipt for receipt in receipts if receipt.get("confirmed")]
+        all_receipts_confirmed = bool(receipts) and all(
+            receipt.get("confirmed") is True for receipt in receipts
+        )
         tickets = [
             ticket
             for receipt in confirmed
@@ -501,7 +504,7 @@ class TradingPreviewManager:
         payload["execution"] = {
             "enabled": bool(execution_result.get("execution_enabled")),
             "action": action,
-            "confirmed": bool(confirmed) if receipts else action in {
+            "confirmed": all_receipts_confirmed if receipts else action in {
                 "decision_rejected",
                 "execution_disabled",
                 "no_pyramiding",

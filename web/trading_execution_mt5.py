@@ -616,11 +616,20 @@ class MT5ExecutionAdapter:
             result, accepted = self._simple_send(mt5=mt5, action="modify", request=request)
             rows = mt5.positions_get(ticket=position.ticket) if accepted else ()
             first = next(iter(rows or ()), None)
-            confirmed = first is not None and math.isclose(
-                float(_value(first, "sl", 0.0)),
-                request["sl"],
-                rel_tol=0.0,
-                abs_tol=environment.point * 0.5,
+            confirmed = (
+                first is not None
+                and math.isclose(
+                    float(_value(first, "sl", 0.0)),
+                    request["sl"],
+                    rel_tol=0.0,
+                    abs_tol=environment.point * 0.5,
+                )
+                and math.isclose(
+                    float(_value(first, "tp", 0.0)),
+                    request["tp"],
+                    rel_tol=0.0,
+                    abs_tol=environment.point * 0.5,
+                )
             )
             return self._result_receipt(
                 action="modify",

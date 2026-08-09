@@ -2236,6 +2236,7 @@ function renderTradingDecision(decision) {
   const alpha = scores.alpha || {};
   const pa = scores.pa || {};
   const review = decision.review || {};
+  const execution = decision.execution || {};
   const selectedId = review.selected_plan_id;
   const scoreItems = [
     ["方向融合", tradingFmtNumber(scores.direction)],
@@ -2268,6 +2269,19 @@ function renderTradingDecision(decision) {
     </div>`;
   }).join("");
   const approved = review.verdict === "approve";
+  const executionReceipts = execution.receipts || [];
+  const executionTickets = execution.tickets || (execution.ticket != null ? [execution.ticket] : []);
+  const executionReceiptRows = executionReceipts.length
+    ? executionReceipts.map((receipt) => `${escHtml(receipt.action || "—")} / retcode ${escHtml(receipt.retcode ?? "—")} / ${receipt.confirmed ? "已查询确认" : "未确认"}`).join("<br />")
+    : "无";
+  const executionDetails = `
+    <div class="trading-review-box">
+      <b>执行动作：</b>${escHtml(decision.final_action || execution.action || "—")} ·
+      <b>查询确认：</b>${execution.confirmed ? "是" : "否"} ·
+      <b>订单票据：</b>${executionTickets.length ? executionTickets.map(escHtml).join(", ") : "无"} ·
+      <b>retcode：</b>${escHtml(execution.retcode ?? "—")}<br />
+      <b>执行回执：</b>${executionReceiptRows}
+    </div>`;
   panel.innerHTML = `
     <div class="trading-decision-head">
       <h3>${escHtml(decision.symbol)} · M15 ${escHtml(tradingFmtTime(decision.decision_close_timestamp))}</h3>
@@ -2278,7 +2292,8 @@ function renderTradingDecision(decision) {
     ${rejectReasons.length ? `<div class="trading-warning-box"><strong>规则拒绝：</strong>${rejectReasons.map(escHtml).join(" · ")}</div>` : ""}
     ${warnings.length ? `<div class="trading-warning-box"><strong>输入提示：</strong>${warnings.map(escHtml).join(" · ")}</div>` : ""}
     <div class="trading-plan-grid">${plans || '<div class="metric-empty">没有生成合格候选订单。</div>'}</div>
-    <div class="trading-review-box"><b>${escHtml(review.reason_code || "—")}</b> · ${escHtml(review.summary_zh || "尚无审查结论")}</div>`;
+    <div class="trading-review-box"><b>${escHtml(review.reason_code || "—")}</b> · ${escHtml(review.summary_zh || "尚无审查结论")}</div>
+    ${executionDetails}`;
 }
 
 function renderTradingPreviewStatus(status) {

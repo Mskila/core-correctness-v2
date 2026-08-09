@@ -64,6 +64,7 @@ class _FakeAccountReader:
 class _FakeExecutionController:
     def __init__(self) -> None:
         self.enabled = False
+        self.disable_calls = 0
 
     def status(self):
         return {
@@ -90,6 +91,7 @@ class _FakeExecutionController:
         return self.status()
 
     def disable(self):
+        self.disable_calls += 1
         self.enabled = False
         return self.status()
 
@@ -181,6 +183,18 @@ def test_stopping_preview_also_disables_new_entries(monkeypatch) -> None:
     assert stopped.json()["running"] is False
     assert stopped.json()["execution_enabled"] is False
     assert execution.enabled is False
+
+
+def test_stopping_preview_runs_pending_cancellation_even_when_entries_are_off(
+    monkeypatch,
+) -> None:
+    client, manager, execution = _client(monkeypatch)
+
+    stopped = client.post("/api/trading/preview/stop")
+
+    assert stopped.status_code == 200
+    assert stopped.json()["running"] is False
+    assert execution.disable_calls == 1
 
 
 def test_config_rejects_zero_tp1_lots(monkeypatch) -> None:
